@@ -1,0 +1,79 @@
+{
+  "generated": "2026-09-22",
+  "note": "Direct dependencies only. Transitive licenses are not fully expanded. JARVIG itself is UNLICENSED.",
+  "jarvigLicense": "UNLICENSED",
+  "dependencies": [
+    {
+      "name": "typescript",
+      "version": "5.9.3",
+      "license": "Apache-2.0",
+      "scope": "development",
+      "purpose": "TypeScript project build"
+    },
+    {
+      "name": "vitest",
+      "version": "3.2.7",
+      "license": "MIT",
+      "scope": "development",
+      "purpose": "Unit and integration tests"
+    },
+    {
+      "name": "tsx",
+      "version": "4.23.15",
+      "license": "MIT",
+      "scope": "development",
+      "purpose": "Development runner for TypeScript hosts"
+    },
+    {
+      "name": "@types/node",
+      "version": "22.20.4",
+      "license": "MIT",
+      "scope": "development",
+      "purpose": "Node.js type declarations"
+    },
+    {
+      "name": "koffi",
+      "version": "2.16.3",
+      "license": "MIT",
+      "scope": "host",
+      "purpose": "Node hosts call the native core C ABI. Not an engine dependency."
+    },
+    {
+      "name": "wgpu",
+      "version": "24.0.5",
+      "license": "MIT OR Apache-2.0",
+      "scope": "native-backend",
+      "purpose": "Private backend crate jarvig_rhi_wgpu only."
+    },
+    {
+      "name": "winit",
+      "version": "0.30.13",
+      "license": "Apache-2.0",
+      "scope": "native-platform",
+      "purpose": "Window and event loop in jarvig_platform only."
+    },
+    {
+      "name": "raw-window-handle",
+      "version": "0.6.2",
+      "license": "MIT OR Apache-2.0 OR Zlib",
+      "scope": "native-platform",
+      "purpose": "OS window handle passed into the wgpu backend."
+    },
+    {
+      "name": "pollster",
+      "version": "0.4.0",
+      "license": "Apache-2.0 OR MIT",
+      "scope": "native-backend",
+      "purpose": "Block on wgpu device creation inside the backend."
+    }
+  ],
+  "upstreamsNotVendored": [
+    {
+      "name": "playcanvas",
+      "remote": "upstream-playcanvas",
+      "url": "https://github.com/playcanvas/engine",
+      "license": "MIT",
+      "presentInTree": false
+    }
+  ]
+}

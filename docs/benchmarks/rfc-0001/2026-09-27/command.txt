@@ -1,0 +1,4 @@
+cargo test --offline --manifest-path native/Cargo.toml -p jarvig_core --lib meshlet_hierarchy
+cargo test --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor rfc_runtime
+cargo run --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor -- --rfc0001
+cargo run --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor -- --rfc0001-runtime

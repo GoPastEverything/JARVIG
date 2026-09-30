@@ -1,0 +1,20 @@
+{
+  "name": "@jarvig/editor-shell",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@jarvig/core": "workspace:*",
+    "@jarvig/ecs": "workspace:*",
+    "@jarvig/render": "workspace:*",
+    "@jarvig/world": "workspace:*"
+  }
+}

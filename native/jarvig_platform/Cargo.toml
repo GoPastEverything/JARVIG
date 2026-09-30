@@ -1,0 +1,11 @@
+[package]
+name = "jarvig_platform"
+version = "0.0.1"
+edition = "2021"
+description = "Native window and event loop. Not a renderer."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+winit = "0.30"
+raw-window-handle = "0.6"

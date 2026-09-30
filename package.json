@@ -1,0 +1,31 @@
+{
+  "name": "jarvig",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "JARVIG — one engine, multiple hosts. Phase 0 foundation.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "node tools/validation/check-boundaries.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "build": "tsc -b --pretty false",
+    "smoke": "node apps/hub/dist/main.js && node apps/editor/dist/main.js --once && node hosts/client/dist/main.js --once && node hosts/dedicated-server/dist/main.js --once && node tools/cli/dist/main.js info && node tools/cli/dist/main.js project validate tests/fixtures/minimal.project.json && node samples/minimal/dist/main.js",
+    "dev:editor": "tsx apps/editor/src/main.ts",
+    "dev:client": "tsx hosts/client/src/main.ts --once",
+    "dev:server": "tsx hosts/dedicated-server/src/main.ts --once",
+    "dev:hub": "tsx apps/hub/src/main.ts",
+    "cli": "tsx tools/cli/src/main.ts",
+    "sample:minimal": "tsx samples/minimal/src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

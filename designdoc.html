@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AAA Engine Platform — Project Start & Technical Framework v0.2</title>
+<style>
+:root{--bg:#090d13;--panel:#111824;--panel2:#172131;--text:#e8eef8;--muted:#9aabc0;--line:#2a374a;--blue:#67a7ff;--mint:#7fe4bd;--warn:#ffd37a;--bad:#ff8190;--code:#080c12}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:linear-gradient(#070a0f,#0a0f17);color:var(--text);font:15px/1.62 Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}.layout{display:grid;grid-template-columns:285px minmax(0,1fr);min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:#080c12;padding:20px 14px}.brand{padding:4px 8px 16px;border-bottom:1px solid var(--line);margin-bottom:12px}.eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:.14em;color:var(--mint);font-weight:800}.brand h1{font-size:17px;line-height:1.25;margin:6px 0}.brand small{color:var(--muted)}nav .g{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#71829a;font-weight:800;padding:10px 8px 4px}nav a{display:block;padding:5px 8px;border-radius:6px;color:#cbd5e3;text-decoration:none;font-size:12.5px}nav a:hover{background:var(--panel);color:#fff}main{max-width:1500px;width:100%;padding:42px clamp(24px,5vw,76px) 80px}.hero{border:1px solid var(--line);border-radius:18px;padding:34px;background:radial-gradient(circle at 85% 10%,rgba(103,167,255,.15),transparent 34%),linear-gradient(135deg,#101824,#0f141d)}.hero h1{font-size:clamp(32px,4vw,54px);line-height:1.04;margin:4px 0 12px}.hero p{font-size:18px;color:#becbdb;max-width:1000px}.meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 10px;background:#0b1119;color:#c6d3e5;font-size:12px}.pill b{color:white}section{margin:46px 0;scroll-margin-top:18px}h2{font-size:28px;margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{font-size:19px;margin:26px 0 8px}h4{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--mint);margin:22px 0 7px}p{margin:8px 0 14px}.lead{font-size:18px;color:#ccd6e5}.muted{color:var(--muted)}a{color:var(--blue)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:13px}.card,.callout,.phase{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:15px}.card h3{margin-top:2px;font-size:16px}.kicker{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--mint);font-weight:800}.callout{border-left:4px solid var(--blue);border-radius:0 10px 10px 0}.callout.warn{border-left-color:var(--warn)}.callout.bad{border-left-color:var(--bad)}.callout.good{border-left-color:var(--mint)}table{width:100%;border-collapse:collapse;margin:15px 0;background:var(--panel);border:1px solid var(--line)}th,td{padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#b8c5d7;background:var(--panel2)}tr:last-child td{border-bottom:0}pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;color:#dce6f3;line-height:1.48}code{font-family:"Cascadia Code",Consolas,monospace;font-size:12.7px}.diagram{border:1px solid var(--line);border-radius:12px;background:#0a1018;padding:16px;overflow:auto;margin:16px 0}.row{display:flex;gap:10px;align-items:stretch;min-width:800px}.node{flex:1;border:1px solid #365474;border-radius:9px;padding:11px;background:#111a27;text-align:center}.node b{display:block}.small{font-size:11px;color:var(--muted)}.arrow{display:flex;align-items:center;font-size:22px;color:var(--blue)}ul,ol{padding-left:22px}li{margin:4px 0}.check{list-style:none;padding-left:0}.check li{position:relative;padding-left:24px}.check li:before{content:"□";position:absolute;left:2px;color:var(--mint);font-size:17px}.timeline{display:grid;gap:9px}.phase{display:grid;grid-template-columns:90px 1fr}.phase .id{font-weight:900;color:var(--mint)}.phase h3{margin:0 0 5px;font-size:16px}.tag{display:inline-block;border:1px solid #2e4667;background:#142035;color:#c5dcff;border-radius:5px;padding:1px 6px;font-size:11px;margin:1px}.footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted)}
+@media(max-width:980px){.layout{display:block}aside{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line)}nav{columns:2}main{padding:26px 18px}.row{min-width:720px}}@media print{aside{display:none}.layout{display:block}body,main{background:#fff;color:#111}main{max-width:none;padding:0}.hero,.card,.callout,.phase,.diagram,table,pre{background:#fff;color:#111;border-color:#bbb}.muted,.small{color:#555}}
+</style></head><body><div class="layout"><aside><div class="brand"><div class="eyebrow">Canonical Engineering Brief</div><h1>AAA Engine Platform</h1><small>Project start + technical framework v0.2</small></div><nav>
+<div class="g">Foundation</div><a href="#charter">1. Charter</a><a href="#principles">2. Principles</a><a href="#legal">3. License Boundary</a><a href="#topology">4. Product Topology</a><a href="#repo">5. Repository</a>
+<div class="g">Architecture</div><a href="#runtime">6. Runtime Core</a><a href="#world">7. World / Coordinates</a><a href="#ecs">8. ECS</a><a href="#editor">9. Editor / PIE</a><a href="#serialization">10. Serialization</a>
+<div class="g">Content / Graphics</div><a href="#assets">11. Asset Pipeline</a><a href="#renderer">12. Renderer</a><a href="#virtualgeo">13. Virtual Geometry R&D</a><a href="#vfx">14. VFX</a><a href="#terrain">15. Terrain / Planets</a>
+<div class="g">Simulation</div><a href="#physics">16. Physics</a><a href="#animation">17. Animation</a><a href="#ai">18. AI / Navigation</a><a href="#audio">19. Audio</a><a href="#network">20. Networking</a>
+<div class="g">Platform</div><a href="#scripting">21. Scripting / Plugins</a><a href="#build">22. Build / Cook</a><a href="#observability">23. Profiling</a><a href="#security">24. Security</a>
+<div class="g">Studio Process</div><a href="#scm">25. Source Control</a><a href="#testing">26. Tests / Gates</a><a href="#budgets">27. Budgets</a><a href="#milestones">28. Milestones</a><a href="#slice">29. Vertical Slice</a>
+<div class="g">AI / CLI</div><a href="#agents">30. GPT + Grok Protocol</a><a href="#bootstrap">31. Bootstrap</a><a href="#templates">32. ADR / RFC</a><a href="#backlog">33. First Backlog</a><a href="#sources">34. References</a>
+</nav></aside><main>
+<header class="hero"><div class="eyebrow">Working codename: TBD</div><h1>AAA Engine Platform<br>Project Start &amp; Technical Framework</h1><p>A portable, implementation-oriented engineering bible for building a new editor-first engine from a PlayCanvas-derived runtime, designed for real-time authoring, FPS/vehicle gameplay, seamless large worlds, multiplayer, UE-class PBR/material authoring, and a measured virtualized-geometry research program.</p><div class="meta"><span class="pill"><b>Status:</b> Architecture Draft</span><span class="pill"><b>Version:</b> 0.2</span><span class="pill"><b>Date:</b> 2026-09-22</span><span class="pill"><b>Primary rule:</b> Editor contains the real engine</span></div></header>
+
+<section id="charter"><h2>1. Project Charter</h2><p class="lead">Build one engine platform with several hosts—Hub, Editor, Game Client, Dedicated Server and CLI tools—where the editor is a first-class host of the exact runtime systems used by the shipped game.</p><div class="grid"><div class="card"><div class="kicker">Authoring</div><h3>Live engine, not a mock viewport</h3><p>The editor viewport renders the actual runtime world. Play-In-Editor creates a controlled simulation world with rollback.</p></div><div class="card"><div class="kicker">Scale</div><h3>Large world from day one</h3><p>Hierarchical reference frames, partitioning, streaming and relevance are foundational contracts.</p></div><div class="card"><div class="kicker">Rendering</div><h3>GPU-driven baseline</h3><p>WebGPU-first architecture, indirect work submission, visibility-driven resource residency and later representation virtualization.</p></div><div class="card"><div class="kicker">Studio</div><h3>CLI-parity and documented decisions</h3><p>Critical editor operations have a CLI/API path; architecture changes require ADRs/RFCs so humans and AI agents do not drift.</p></div></div>
+<h3>1.1 Success criteria</h3><ul class="check"><li>Create/open a project in the Hub and author it entirely in the Editor.</li><li>Play, pause, step, eject, possess and stop PIE while preserving the authoring world.</li><li>Build client and headless dedicated server from the same project.</li><li>Traverse a world larger than resident memory without blocking content IO.</li><li>Walk inside a moving ship/vehicle while physics remains stable and FPS-precise.</li><li>Network that scenario with server authority and relevance-based replication.</li><li>Reproduce all derived content through deterministic command-line tools.</li><li>Benchmark experimental rendering systems against fixed baselines before promotion.</li></ul>
+<h3>1.2 Explicit non-goals for the first phase</h3><p>No marketplace, no finished cinematic suite, no full server mesh, no attempt to duplicate every Unreal feature, and no claim that experimental microgeometry is superior to Nanite before objective testing.</p></section>
+
+<section id="principles"><h2>2. Engineering Principles</h2><table><tr><th>Rule</th><th>Meaning</th></tr><tr><td><b>Dependency direction</b></td><td>Editor and tools may depend on engine modules. Engine modules never depend on editor modules.</td></tr><tr><td><b>One world contract</b></td><td>Editor, PIE, client, server and tests share scene/component semantics.</td></tr><tr><td><b>Data oriented</b></td><td>Prefer explicit component data + systems over deep object inheritance.</td></tr><tr><td><b>CLI parity</b></td><td>Build, import, cook, validate, package and critical world operations must be automatable.</td></tr><tr><td><b>Derived data is reproducible</b></td><td>Baked content always has traceable source/settings/tool versions.</td></tr><tr><td><b>Streaming is universal</b></td><td>Geometry, textures, entities, nav, audio, physics proxies and network state all expose residency/relevance boundaries.</td></tr><tr><td><b>Research stays research</b></td><td>Novel systems stay feature-flagged until measurements justify production use.</td></tr><tr><td><b>Debuggability over cleverness</b></td><td>Capture/replay, deterministic seeds and named profiler scopes are first-class.</td></tr></table></section>
+
+<section id="legal"><h2>3. Source &amp; License Boundary</h2><div class="callout warn"><b>Hard boundary:</b> PlayCanvas is an appropriate open-source foundation. The linked CRYENGINE Community Edition repository says its contributed files are MIT licensed, but CryEngine itself remains under Crytek’s separate license. Do not merge CryEngine source into the core merely because the community patch repository is MIT.</div><div class="diagram"><div class="row"><div class="node"><b>Zone A — Core</b><span class="small">our code + approved redistributable OSS</span></div><div class="arrow">→</div><div class="node"><b>Zone B — Adapters</b><span class="small">optional isolated third-party bridges</span></div><div class="arrow">→</div><div class="node"><b>Zone C — Reference</b><span class="small">public docs, papers, clean-room behavior study</span></div></div></div><pre><code>/LICENSES/THIRD_PARTY_NOTICES.md
+/LICENSES/dependency-manifest.json
+/docs/legal/CRYENGINE_BOUNDARY.md
+/docs/legal/CLEAN_ROOM_GUIDELINES.md</code></pre></section>
+
+<section id="topology"><h2>4. Product Topology</h2><div class="diagram"><div class="row"><div class="node"><b>Project Hub</b><span class="small">projects · engine versions · SDKs</span></div><div class="arrow">→</div><div class="node"><b>Editor Host</b><span class="small">UI + tooling + embedded runtime</span></div><div class="arrow">→</div><div class="node"><b>Engine Core</b><span class="small">world · renderer · simulation · assets</span></div></div><div style="height:10px"></div><div class="row"><div class="node"><b>Game Client</b></div><div class="node"><b>Dedicated Server</b></div><div class="node"><b>Cooker / CLI</b></div><div class="node"><b>Automation Host</b></div></div></div><pre><code>editor/* -----------+
+tools/* ------------|----&gt; engine/*
+hosts/client -------|
+hosts/server -------+
+
+engine/* MUST NOT import editor/*.</code></pre></section>
+
+<section id="repo"><h2>5. Recommended Monorepo</h2><p>Start TypeScript-first to move quickly with the PlayCanvas lineage. Introduce Rust/C++/WASM only behind measured interfaces where profiling proves value.</p><pre><code>engine-platform/
+├─ AGENTS.md
+├─ ARCHITECTURE.md
+├─ apps/
+│  ├─ hub/
+│  └─ editor/
+├─ engine/
+│  ├─ core/          # lifecycle, clocks, jobs, events, IDs
+│  ├─ math/          # spatial types, transforms
+│  ├─ ecs/           # entities, components, systems
+│  ├─ world/         # scenes, frames, partition, layers
+│  ├─ render/        # WebGPU-first renderer
+│  ├─ materials/     # material IR, instances, shading models, texture bindings
+│  ├─ render-virtual/# meshlets + geometry experiments
+│  ├─ assets/        # asset registry, handles, streaming
+│  ├─ physics/
+│  ├─ animation/
+│  ├─ audio/
+│  ├─ ai/
+│  ├─ net/
+│  ├─ input/
+│  ├─ scripting/
+│  └─ debug/
+├─ editor/
+│  ├─ shell/
+│  ├─ viewport/
+│  ├─ inspector/
+│  ├─ outliner/
+│  ├─ content-browser/
+│  ├─ material-editor/ # graph, instances, preview, diagnostics
+│  ├─ material-library/# searchable PBR/surface library browser
+│  ├─ graph/
+│  ├─ world-partition/
+│  ├─ profiler/
+│  └─ transactions/
+├─ tools/
+│  ├─ cli/
+│  ├─ importer/
+│  ├─ cooker/
+│  ├─ shaderc/
+│  ├─ materialc/      # graph→IR→target shader compilation/cook
+│  ├─ worldc/
+│  └─ asset-audit/
+├─ hosts/
+│  ├─ game-web/
+│  ├─ game-desktop/
+│  ├─ dedicated-server/
+│  └─ test-runner/
+├─ packages/
+│  ├─ project-schema/
+│  ├─ scene-schema/
+│  ├─ protocol-editor-runtime/
+│  └─ plugin-sdk/
+├─ samples/
+│  ├─ minimal/
+│  ├─ fps-vertical-slice/
+│  └─ streaming-stress/
+├─ tests/{unit,integration,golden,perf,multiplayer}/
+└─ docs/{architecture,adr,rfc,subsystems,workflows,performance,status,legal}/</code></pre></section>
+
+<section id="runtime"><h2>6. Runtime Core</h2><h3>6.1 Frame lifecycle</h3><pre><code>Host.pollEvents
+ → Input.sample
+ → Clock.advance
+   → FixedSimulationSteps (0..N)
+      → Net.receive/reconcile
+      → scripts/gameplay/AI
+      → Physics.step
+      → transform propagation
+   → VariableUpdate
+      → animation/audio/presentation
+   → World.streamingUpdate
+   → Render.prepare
+   → Render.execute
+   → Telemetry.commitFrame</code></pre><h3>6.2 Work scheduling</h3><table><tr><th>Lane</th><th>Use</th></tr><tr><td>Main</td><td>host events, transaction commit, final presentation state</td></tr><tr><td>Workers</td><td>asset decode, partition build, navigation, compression, heavy CPU preprocessing</td></tr><tr><td>GPU compute</td><td>visibility, skinning, particles, cluster selection, procedural detail</td></tr><tr><td>Server workers</td><td>AI batches, persistence serialization, cell simulation where ownership allows</td></tr></table></section>
+
+<section id="world"><h2>7. World Model &amp; Hierarchical Coordinates</h2><p class="lead">Do not use one enormous float32 coordinate space. The authoritative model is a tree of reference frames; renderer and physics operate in local precision domains.</p><div class="diagram"><div class="row"><div class="node"><b>Star-System Frame</b></div><div class="arrow">→</div><div class="node"><b>Planet Frame</b></div><div class="arrow">→</div><div class="node"><b>Ship Frame</b></div><div class="arrow">→</div><div class="node"><b>Interior Frame</b></div></div></div><pre><code>interface FrameTransform64 {
+  frameId: FrameId;
+  parentFrameId: FrameId | null;
+  position: Float64Vec3;
+  rotation: Float64Quat;
+}
+
+interface LocalTransform32 {
+  position: Float32Vec3;
+  rotation: Float32Quat;
+  scale: Float32Vec3;
+}</code></pre><h3>7.1 World partition record</h3><pre><code>WorldCell {
+  id, frameId, bounds,
+  entities[], dependencies[],
+  renderPages[], texturePages[],
+  physicsProxy, navChunks[], audioZones[],
+  gameplayTags[], residentCostEstimate
+}</code></pre><h3>7.2 Streaming priority</h3><pre><code>priority = f(distance, cameraDirection, playerVelocity,
+             vehicleVelocity, portalVisibility,
+             gameplayImportance, networkRelevance,
+             memoryPressure)</code></pre></section>
+
+<section id="ecs"><h2>8. ECS &amp; Scene Model</h2><p>Retain the useful PlayCanvas entity/component/system concept while separating stable identity/hierarchy from hot component storage.</p><table><tr><th>Layer</th><th>Contract</th></tr><tr><td>Entity ID</td><td>stable UUID/128-bit identity and hierarchy</td></tr><tr><td>Component schema</td><td>versioned serializable fields + editor/replication metadata</td></tr><tr><td>Storage</td><td>dense/archetype/SoA where useful</td></tr><tr><td>System</td><td>queries data and schedules work</td></tr><tr><td>Prefab</td><td>template graph + explicit overrides</td></tr><tr><td>Runtime-only state</td><td>ephemeral simulation data excluded from saves unless promoted</td></tr></table><pre><code>@component({ version: 1, replicated: true })
+class Health {
+  @field({ min: 0 }) current = 100;
+  @field({ min: 1 }) max = 100;
+}</code></pre></section>
+
+<section id="editor"><h2>9. Editor / Play-In-Editor Architecture</h2><div class="diagram"><div class="row"><div class="node"><b>Editor UI</b><span class="small">outliner · inspector · graphs</span></div><div class="arrow">→</div><div class="node"><b>Command / Transaction Bus</b><span class="small">undo · redo · multi-edit</span></div><div class="arrow">→</div><div class="node"><b>Authoring World</b></div><div class="arrow">→</div><div class="node"><b>Embedded Runtime</b></div></div></div><h3>9.1 PIE state machine</h3><pre><code>EDITING
+ → Play
+   → snapshot/COW authoring state
+     → SIMULATION WORLD
+       → RUNNING
+         ↔ pause / step / eject / possess
+       → Stop
+         → discard runtime mutations (default)
+         → optionally apply explicitly selected runtime changes
+ → EDITING</code></pre><ul><li>Every editor mutation is a command/transaction.</li><li>Panels never mutate arbitrary runtime objects directly.</li><li>Gizmo drags coalesce into one logical undo record.</li><li>Runtime state carries origin tags so accidental save-back is impossible.</li><li>Editor features call public engine APIs—the game does not call editor APIs.</li></ul></section>
+
+<section id="serialization"><h2>10. Serialization &amp; Project Format</h2><pre><code>{
+  "$schema": "./schemas/project-v1.json",
+  "name": "FPSVerticalSlice",
+  "engine": "0.1.x",
+  "projectId": "uuid",
+  "defaultWorld": "assets/worlds/main.world.json",
+  "targets": ["webgpu-web", "windows-desktop", "dedicated-server"],
+  "settings": { "fixedHz": 60, "renderBackend": "webgpu", "largeWorldCoordinates": true }
+}</code></pre><p>Authoring data should initially be human-diffable; cooked runtime data may be compact binary. Large worlds should shard data (for example one-file-per-entity or cell) so moving one object does not rewrite the entire map.</p><h3>10.1 Migration rule</h3><pre><code>load(version N) → validate → migrate N→N+1 ... → current
+→ produce migration report → never silently downgrade</code></pre></section>
+
+<section id="assets"><h2>11. Asset Pipeline &amp; Derived Data Cache</h2><div class="diagram"><div class="row"><div class="node"><b>Source</b><span class="small">glTF · images · audio</span></div><div class="arrow">→</div><div class="node"><b>Import Graph</b><span class="small">normalize · validate · dependencies</span></div><div class="arrow">→</div><div class="node"><b>Derived Data</b><span class="small">meshlets · texture pages · collision · shaders</span></div><div class="arrow">→</div><div class="node"><b>Cooked Target</b></div></div></div><pre><code>DerivedKey = HASH(sourceBytes,
+                  importSettings,
+                  importerVersion,
+                  engineFormatVersion,
+                  targetPlatform,
+                  featureFlags)</code></pre><ul><li>Runtime code uses typed asset handles, not editor file paths.</li><li>Handles expose unresolved/loading/resident/evicted/failed states.</li><li>Streaming manager owns memory budgets.</li><li>Server cooks omit unneeded render/audio payloads.</li><li>Dependency graph is inspectable in the editor and CLI.</li><li>Material and texture imports preserve source color space, channel meaning, physical scale/texel density and reproducible conversion settings.</li><li>PBR texture-set auto-detection is allowed only when the detected convention is shown and can be overridden; never silently reinterpret packed channels.</li><li>Derived texture outputs are platform-specific (for example BCn/ASTC/ETC/Basis/KTX2 families) while the authored material remains platform-agnostic.</li></ul><p><span class="tag">glTF / GLB</span><span class="tag">KTX2 / Basis</span><span class="tag">PNG / JPEG / HDR / EXR</span><span class="tag">MaterialX planned</span><span class="tag">WAV / OGG</span><span class="tag">PLY / splats experimental</span></p></section>
+
+<section id="renderer"><h2>12. Renderer Architecture</h2><p class="lead">WebGPU is the architectural target; WebGL2 can remain a compatibility backend. The CPU should describe scene state and work graphs, not issue tens of thousands of individual draws.</p><pre><code>World extraction
+ → GPU Scene Database
+ → frustum/layer filtering
+ → HZB occlusion
+ → instance + cluster selection (compute)
+ → streaming feedback
+ → indirect command generation
+ → depth / visibility / GBuffer path
+ → lighting / shadows / GI
+ → transparency / VFX
+ → post
+ → UI / debug</code></pre><table><tr><th>Subsystem</th><th>Purpose</th></tr><tr><td>RenderDevice</td><td>buffers, textures, pipelines, queues, sync</td></tr><tr><td>RenderGraph</td><td>pass dependencies and transient resource lifetimes</td></tr><tr><td>GPUScene</td><td>compact GPU-readable transforms/materials/instances</td></tr><tr><td>VisibilitySystem</td><td>frustum, HZB, occlusion, cluster selection</td></tr><tr><td>MaterialGraph</td><td>authorable graph compiled to shader variants</td></tr><tr><td>VirtualResourceManager</td><td>geometry/texture page residency and feedback</td></tr></table><h3>12.1 Promotion sequence</h3><ol><li>Correct PBR baseline + render graph.</li><li>GPU scene and indirect rendering.</li><li>HZB/compute visibility.</li><li>Meshlet/cluster hierarchy.</li><li>Virtual geometry paging.</li><li>Virtual textures.</li><li>Advanced GI/reflections.</li><li>Experimental representation virtualization.</li></ol></section>
+
+<section id="materials"><h2>12A. Materials, PBR &amp; Surface Authoring</h2><p class="lead">Materials are a first-class authored asset system, not a collection of hard-coded shaders. The goal is UE-class flexibility: artists can build reusable master materials, derive lightweight instances, import complete PBR libraries, layer surfaces, drive parameters at runtime and inspect the exact shader/texture cost before shipping.</p><div class="callout good"><b>Canonical shading baseline:</b> physically based metallic/roughness rendering with linear-light math, explicit color-space metadata, image-based lighting, physically meaningful normals and consistent tangent-space rules. Advanced shading models extend this baseline rather than creating unrelated pipelines.</div>
+<h3>12A.1 Authoring hierarchy</h3><div class="diagram"><div class="row"><div class="node"><b>Material Functions</b><span class="small">reusable graph logic</span></div><div class="arrow">→</div><div class="node"><b>Master Material</b><span class="small">graph + exposed parameters</span></div><div class="arrow">→</div><div class="node"><b>Material Instance</b><span class="small">cheap parameter overrides</span></div><div class="arrow">→</div><div class="node"><b>Runtime Instance</b><span class="small">gameplay-driven values</span></div></div></div><ul><li><b>Material Graph:</b> node-based graph with typed pins, comments, subgraphs, preview nodes and compile diagnostics.</li><li><b>Material Functions:</b> reusable versioned graph assets; edits propagate to dependents through explicit dependency invalidation.</li><li><b>Master Materials:</b> define supported features and exposed parameters for a family such as painted metal, terrain, skin or glass.</li><li><b>Material Instances:</b> parent/child inheritance with scalar, vector, texture, enum and limited static feature overrides without rebuilding the entire authoring graph.</li><li><b>Runtime Material Instances:</b> transient or persistent parameter blocks for damage, wetness, team colors, burn state, holograms and animation.</li><li><b>Material Parameter Collections:</b> world/global parameter sets for time, weather, wind, biome values, shared gameplay states and render features.</li></ul>
+<h3>12A.2 PBR texture-set contract</h3><table><tr><th>Semantic</th><th>Rules</th></tr><tr><td>Base Color / Albedo</td><td>sRGB authored color; no baked lighting/specular. Alpha meaning is explicit.</td></tr><tr><td>Normal</td><td>Linear data; tangent convention recorded at import. Y/green-channel inversion is metadata/conversion, never guesswork at runtime.</td></tr><tr><td>Roughness</td><td>Linear 0–1. Gloss/smoothness imports are converted reproducibly to the canonical roughness convention.</td></tr><tr><td>Metallic</td><td>Linear 0–1; dielectric/metal workflow is canonical baseline.</td></tr><tr><td>Ambient Occlusion</td><td>Linear; optional and treated as local/micro occlusion, not replacement for real lighting.</td></tr><tr><td>Emissive</td><td>Color-space aware with HDR intensity multiplier; capable of physically bright values.</td></tr><tr><td>Height / Displacement</td><td>Signed/unsigned scale and units recorded. May feed parallax, tessellation where supported, terrain, or virtual microgeometry paths.</td></tr><tr><td>Opacity / Transmission</td><td>Explicit blend/shading mode. Masked, translucent and transmissive paths are distinct.</td></tr><tr><td>Clearcoat / Anisotropy / SSS</td><td>Optional extended channels enabled only by compatible shading models.</td></tr></table>
+<h3>12A.3 Packed maps and external libraries</h3><p>The import layer must accept common artist-library conventions without making the runtime depend on any one vendor or DCC. A texture-set wizard maps discovered files/channels into canonical semantics and saves the mapping as import metadata.</p><pre><code>PBR Texture Set Import
+ source files
+   ├─ *_BaseColor / *_Albedo
+   ├─ *_Normal
+   ├─ *_Roughness or *_Gloss
+   ├─ *_Metallic
+   ├─ *_AO
+   ├─ *_Height / *_Displacement
+   └─ packed map (ORM / RMA / MRA / custom)
+        ↓ explicit channel-map recipe
+ Canonical Surface Inputs
+        ↓ target cook
+ virtual texture pages / compressed GPU textures</code></pre><ul><li>Configurable packed-channel recipes; ORM is not assumed to mean every external library uses ORM.</li><li>UDIM/tiled texture sets treated as one logical texture asset with independently streamable tiles/pages.</li><li>High-resolution source textures stay out of runtime packages; cooks generate platform-appropriate mips/pages/compression.</li><li>Texture arrays, atlases and bindless/indexed texture indirection may be used internally without changing authoring semantics.</li><li>MaterialX import/export is a planned interoperability layer after the native graph/IR is stable; USD Shade can be evaluated later through an RFC.</li></ul>
+<h3>12A.4 Surface models</h3><table><tr><th>Tier</th><th>Models</th></tr><tr><td>Baseline production</td><td>Default lit metallic/roughness, unlit, masked, transparent/transmissive, decal.</td></tr><tr><td>Advanced production</td><td>Clearcoat, anisotropic metal, subsurface/skin, thin surface, cloth/fabric, foliage/two-sided.</td></tr><tr><td>Specialized / research</td><td>Hair, eye, water, volumetric surface, spectral/dispersion approximations and custom shading plugins.</td></tr></table><p>Each shading model has a documented GBuffer/forward requirement, lighting contract, fallback behavior and platform support matrix. Unsupported models degrade deliberately rather than silently compiling a broken approximation.</p>
+<h3>12A.5 Layered materials and masks</h3><ul><li>Reusable <b>Material Layer</b> assets and separate <b>Layer Blend</b> assets.</li><li>Per-pixel blends driven by authored masks, vertex color, height blends, slope, curvature, object/world position or procedural fields.</li><li>World-aligned/triplanar projection for terrain, architecture and large props.</li><li>Detail normals, macro/micro variation and stochastic/aperiodic texture sampling hooks.</li><li>Decals and mesh decals integrate through the same surface attribute model.</li><li>Runtime Virtual Surface pages may cache expensive terrain/layer composition where measurement shows a benefit.</li></ul>
+<h3>12A.6 Material IR and compiler</h3><pre><code>Material Graph Asset
+      ↓ validate + typecheck
+Canonical Material IR
+      ↓ optimize / constant fold / dead-node elimination
+Feature &amp; Shading-Model Analysis
+      ↓ permutation policy
+Backend Codegen
+  ├ WGSL / WebGPU
+  └ compatibility backend(s)
+      ↓ pipeline cache / shader cache / reflection metadata
+Cooked Material + Instance parameter layouts</code></pre><p>The authored graph never directly stores backend shader source as its meaning. A stable intermediate representation lets the engine change renderer backends, optimize graphs and test compiler output without destroying artist assets.</p><div class="callout warn"><b>Permutation rule:</b> static switches are intentionally scarce. Every static option multiplies shader variants; the compiler records variant count, compile time, instruction/resource estimates and reasons. Dynamic branching or data-driven parameters are preferred when they are cheaper overall.</div>
+<h3>12A.7 Material Editor UX</h3><div class="grid"><div class="card"><div class="kicker">Graph</div><h3>Live node editor</h3><p>Typed nodes, search palette, function calls, reroute nodes, comments, preview pins, compile errors and shader-cost overlays.</p></div><div class="card"><div class="kicker">Preview</div><h3>Real engine lighting</h3><p>Sphere/plane/cube/custom mesh preview using selectable HDR environments, direct lights and exposure controls.</p></div><div class="card"><div class="kicker">Instances</div><h3>Artist-first parameter UI</h3><p>Groups, ranges, units, tooltips, thumbnails, presets and live viewport updates without changing the master graph.</p></div><div class="card"><div class="kicker">Diagnostics</div><h3>Know the cost</h3><p>Texture residency, samplers, graph complexity, variants, passes, overdraw, transparency and estimated GPU cost are visible before cook.</p></div></div>
+<h3>12A.8 Material Library Browser</h3><ul><li>Searchable by tags, physical class, source, resolution, texel scale, shading model and license/provenance.</li><li>Thumbnail/turntable previews generated from the real renderer.</li><li>Drag/drop a material or instance onto a mesh slot in the viewport/outliner.</li><li>Batch-create instances from imported texture sets.</li><li>Favorites, collections, project/global libraries and duplicate/dependency inspection.</li><li>Asset provenance records original package/source, author/license fields, hashes and import recipe.</li></ul>
+<h3>12A.9 Texture streaming and virtual texturing</h3><pre><code>Material visibility
+   ↓ required material instances
+   ↓ required texture/UDIM pages
+GPU feedback + predictive streaming
+   ↓
+VirtualResourceManager
+   ├ resident mip/page set
+   ├ memory budgets
+   ├ fallback mip/tile
+   └ eviction priority</code></pre><ul><li>Streaming Virtual Textures: disk-cooked pages requested on demand.</li><li>Runtime Virtual Surfaces: GPU-generated/cached pages for expensive layered/procedural surfaces where appropriate.</li><li>Per-texture residency/debug view, mip bias, anisotropy and page-fault counters.</li><li>Material instances reference logical textures; residency mechanics stay hidden behind the resource manager.</li></ul>
+<h3>12A.10 Geometry integration</h3><p>Materials and virtual geometry are designed together. A material can expose displacement/micro-surface descriptors to the virtual-geometry path without forcing every surface to generate geometry. The renderer chooses among normal/detail mapping, parallax, explicit displacement or transient procedural microgeometry based on feature support, screen-space error and budget.</p><pre><code>Surface Asset
+ ├ PBR macro attributes
+ ├ texture/UDIM set
+ ├ layer stack
+ ├ detail/material functions
+ └ optional microgeometry descriptor
+          ↓
+Representation Policy
+ normal map | parallax | displaced meshlet | procedural microgeometry</code></pre>
+<h3>12A.11 CLI/API parity</h3><pre><code>engine material import ./Rock_Cliff_4K/ --recipe auto-review
+engine material validate Assets/Materials/RockCliff.mat
+engine material instance create RockCliff --set roughness=0.72
+engine material compile RockCliff --target webgpu
+engine material stats RockCliff --variants --textures --instructions
+engine material library audit --missing-license --oversized --unused
+engine texture inspect RockCliff_Normal --mips --colorspace --streaming</code></pre><p>Command names are provisional, but every important editor material operation must have a scriptable API/CLI equivalent for build farms and AI agents.</p>
+<h3>12A.12 Validation &amp; promotion gates</h3><ul class="check"><li>Golden PBR spheres match reference scenes within defined image tolerances.</li><li>Color-space and normal-orientation test fixtures catch import mistakes.</li><li>Material instances alter parameters without recompiling unrelated graph structure.</li><li>Graph/function dependency edits invalidate exactly the affected derived data.</li><li>Static permutation budget is enforced in CI.</li><li>Texture streaming remains bounded under high-resolution PBR-library stress scenes.</li><li>Material/texture asset loss or eviction always has a deterministic fallback.</li><li>Cook output contains no editor-only source imagery or graph metadata unless explicitly requested.</li></ul></section>
+
+<section id="virtualgeo"><h2>13. Virtual Geometry / “Beyond Nanite” R&amp;D</h2><div class="callout"><b>Research discipline:</b> First establish a defensible virtualized-triangle baseline. “Better than Nanite” is a hypothesis, not an architectural assumption.</div><h3>13.1 Baseline</h3><ul><li>Offline meshlet/cluster decomposition.</li><li>Hierarchical geometric-error metric.</li><li>Compressed bounded pages.</li><li>GPU LOD/cluster selection.</li><li>Resident parent fallback when child pages are missing.</li><li>Streaming feedback for higher-detail pages.</li></ul><h3>13.2 Procedural microgeometry experiment</h3><p>The optional procedural detail/aperiodic concept is considered as a <em>detail distribution mechanism</em>, not a universal mesh topology. Combine candidates such as blue-noise distributions, stochastic fields, Wang-like tiling, aperiodic rules, SDFs and deterministic seeds.</p><pre><code>Surface Descriptor
+ ├ macro material
+ ├ stochastic / aperiodic rule set
+ ├ displacement or SDF field
+ ├ feature-density curves
+ ├ scale domain
+ └ deterministic seed
+      ↓ GPU compute
+ transient microdetail only where resolvable</code></pre><h3>13.3 Representation virtualization</h3><table><tr><th>Condition</th><th>Representation</th></tr><tr><td>Very far</td><td>proxy / analytical primitive / coarse splat</td></tr><tr><td>Far-mid</td><td>HLOD / coarse cluster hierarchy</td></tr><tr><td>Near</td><td>virtualized triangle meshlets</td></tr><tr><td>Extreme near</td><td>procedural microgeometry/detail fields</td></tr><tr><td>Captured soft/volumetric surface</td><td>Gaussian/surfel path where advantageous</td></tr></table><h3>13.4 Required metrics</h3><ul><li>GPU frame time at matched quality.</li><li>screen-space geometric error.</li><li>VRAM/resident memory.</li><li>storage size and streaming bandwidth.</li><li>page fault rate and latency sensitivity.</li><li>cook time.</li><li>temporal stability.</li><li>authoring complexity.</li></ul><div class="callout good"><b>Production gate:</b> experimental systems remain optional until they show a repeatable win and have a graceful fallback.</div></section>
+
+<section id="vfx"><h2>14. VFX / Particle System</h2><p>VFX is a dedicated GPU simulation/graph system—not a substitute for geometry virtualization.</p><ul><li>GPU emitter/simulation buffers.</li><li>sprite, ribbon, mesh, volume and decal renderers.</li><li>event chaining and collision interfaces.</li><li>deterministic seed modes for replay/tests.</li><li>budget classes for critical vs cosmetic effects.</li><li>graph compiler to GPU passes/kernels.</li></ul></section>
+
+<section id="terrain"><h2>15. Terrain &amp; Planetary Scale</h2><ul><li>Clipmap/quadtree or equivalent continuous terrain LOD.</li><li>Virtual texture/material pages separate from world entity cells.</li><li>Road/river/decal layers composited independently.</li><li>Procedural scatter stays data-driven until gameplay interaction requires entities.</li></ul><div class="callout warn"><b>Sequence:</b> validate moving local frames + large terrestrial test world before attempting a full planet. Planetary scale must exercise existing contracts, not create a second world system.</div></section>
+
+<section id="physics"><h2>16. Physics</h2><p>Physics is behind an engine abstraction so the backend may evolve from a browser/WASM solution toward other native options without rewriting gameplay contracts.</p><pre><code>Physics Universe
+ ├ Planet / ground scene
+ ├ Vehicle or ship exterior scene
+ ├ Ship interior local scene
+ └ Local interaction islands
+
+Cross-frame transfer:
+ detect boundary → capture world velocity → transform into destination frame
+ → insert body → preserve momentum within tested tolerances</code></pre><ul><li>fixed timestep + interpolation.</li><li>character controller independent from render FPS.</li><li>continuous collision modes for fast bodies.</li><li>constraints/joints.</li><li>contact/island debug tools.</li><li>server-authoritative path.</li><li>replayable physics tests.</li></ul></section>
+
+<section id="animation"><h2>17. Animation</h2><ol><li>Skeleton + clip playback.</li><li>Blend/state graph.</li><li>Root-motion contract.</li><li>IK/aim/look constraints.</li><li>Animation events.</li><li>Network-friendly state/pose compression.</li><li>Motion matching only when vertical-slice needs justify it.</li></ol><p>Use a reusable editor graph framework for Material, Animation, VFX and AI—but each graph must own its compiler/runtime semantics.</p></section>
+
+<section id="ai"><h2>18. AI &amp; Navigation</h2><ul><li>Decision/perception separate from navigation.</li><li>Nav chunks partition and stream with the world.</li><li>Local/dynamic nav supports moving interiors.</li><li>Behavior tree, utility or GOAP can share an action/task layer.</li><li>Editor debug overlays expose perception, decisions, blackboard, paths and cost.</li></ul></section>
+
+<section id="audio"><h2>19. Audio</h2><ul><li>3D emitters/listeners use frame-aware transforms.</li><li>Zones, occlusion and environmental sends.</li><li>Streaming ambience/music.</li><li>Gameplay audio events are decoupled from sample playback.</li><li>Server cooks retain only gameplay-relevant metadata.</li></ul></section>
+
+<section id="network"><h2>20. Networking &amp; Replication</h2><div class="callout warn"><b>Multiplayer is not a late feature.</b> Add it while the vertical slice is still small so authority, prediction, IDs and relevance are correct.</div><pre><code>Client input
+ → local prediction for owned predictable systems
+ → server validates + simulates authority
+ → relevance filter
+ → snapshot/delta replication
+ → interpolation / reconciliation</code></pre><p>Replication schema fields should declare modes such as <span class="tag">authority-only</span><span class="tag">owner-predicted</span><span class="tag">snapshot</span><span class="tag">reliable-event</span><span class="tag">never-replicate</span>.</p><h3>20.1 Future distributed authority</h3><p>Future server meshing is research only. Align any later cell/container ownership with the same world partition system so renderer, simulation and network do not invent incompatible spatial models.</p></section>
+
+<section id="scripting"><h2>21. Scripting &amp; Plugins</h2><p>Gameplay scripting begins with TypeScript/ES modules. Performance-sensitive or ecosystem-driven modules may later use WASM/native boundaries with explicit ABI contracts.</p><pre><code>{
+  "id": "com.example.vehicle-tools",
+  "version": "0.1.0",
+  "engine": "^0.4.0",
+  "entryRuntime": "./dist/runtime.mjs",
+  "entryEditor": "./dist/editor.mjs",
+  "permissions": ["asset.read", "editor.panel.register"]
+}</code></pre><p>Never expose raw internal object pointers as the plugin ABI. Capabilities and permissions should be explicit so future collaboration/marketplace work is possible.</p></section>
+
+<section id="build"><h2>22. Build / Cook / Package</h2><pre><code>engine validate project
+engine import --changed
+engine cook --target webgpu-web
+engine cook --target windows-desktop
+engine cook --target dedicated-server
+engine package --target windows-desktop --configuration shipping
+engine test --suite smoke
+engine test --suite perf</code></pre><table><tr><th>Mode</th><th>Purpose</th></tr><tr><td>Debug</td><td>assertions, symbols, validation, debug UI</td></tr><tr><td>Development</td><td>profiling + hot reload + optimization</td></tr><tr><td>Test</td><td>automation hooks and deterministic capture</td></tr><tr><td>Shipping</td><td>editor/debug stripped, cooked assets, optimized runtime</td></tr></table></section>
+
+<section id="observability"><h2>23. Profiling / Capture / Telemetry</h2><p>Every major subsystem exposes named timings and counters from its first implementation.</p><ul><li>CPU hierarchical trace.</li><li>GPU timestamp trace.</li><li>draw/dispatch counts.</li><li>world-cell residency and churn.</li><li>geometry/texture page faults.</li><li>asset IO bandwidth.</li><li>physics bodies/islands/contacts.</li><li>network bytes/entities/events.</li><li>JS/WASM heap + GC.</li><li>frame/input/network capture packages for replay.</li></ul></section>
+
+<section id="security"><h2>24. Security &amp; Trust Boundaries</h2><ul><li>Downloaded project plugins are untrusted relative to the Hub/update system.</li><li>Collaboration never auto-executes arbitrary remote code.</li><li>Importers validate sizes/types and run in workers/sandboxed processes where practical.</li><li>Server never trusts client position, damage, inventory or entitlement claims.</li><li>Binary update signing is designed before public distribution.</li></ul></section>
+
+<section id="scm"><h2>25. Source Control / Studio Workflow</h2><pre><code>main                  # buildable
+feature/&lt;issue&gt;-name   # short-lived production work
+research/&lt;topic&gt;       # experiments; never silently production
+release/x.y            # once formal releases exist</code></pre><ul><li>Public API changes update tests/docs in the same change.</li><li>Performance PRs include raw before/after data.</li><li>No unrelated refactors inside benchmark comparisons.</li><li>Generated cooked data is not committed except explicit golden fixtures.</li></ul></section>
+
+<section id="testing"><h2>26. Testing &amp; Merge Gates</h2><table><tr><th>Class</th><th>Examples</th></tr><tr><td>Unit</td><td>math, transforms, schemas, codecs, component storage</td></tr><tr><td>Integration</td><td>import→cook→load, editor undo, client/server replication</td></tr><tr><td>Golden image</td><td>renderer scenes with tolerance comparison</td></tr><tr><td>Replay</td><td>recorded input/network streams reproduce known state</td></tr><tr><td>Stress</td><td>instance count, world-cell churn, memory pressure</td></tr><tr><td>Performance</td><td>fixed scenes + regression thresholds</td></tr><tr><td>Soak</td><td>hours-long simulation for leaks/desync</td></tr></table><ul class="check"><li>typecheck/lint pass.</li><li>unit/integration suites pass.</li><li>forbidden dependency checks pass.</li><li>serialization compatibility checked.</li><li>performance-sensitive changes measured.</li><li>cross-cutting architecture changes have ADR/RFC.</li></ul></section>
+
+<section id="budgets"><h2>27. Initial Engineering Budgets</h2><p>Targets below exist to force measurement; revise them after baseline profiling.</p><table><tr><th>Area</th><th>Initial target</th></tr><tr><td>Client frame</td><td>16.67 ms @ 60 Hz baseline</td></tr><tr><td>Fixed simulation</td><td>≤ 4 ms typical client slice</td></tr><tr><td>Main-thread JS</td><td>≤ 6 ms typical</td></tr><tr><td>Render CPU submit</td><td>≤ 2 ms long-term target via GPU-driven path</td></tr><tr><td>Streaming</td><td>no visible-frame blocking IO in normal traversal</td></tr><tr><td>Editor interaction</td><td>&lt;100 ms perceived response for common operations</td></tr><tr><td>World save</td><td>incremental; never rewrite giant world for one actor move</td></tr></table></section>
+
+<section id="milestones"><h2>28. Milestone Roadmap</h2><div class="timeline">
+<div class="phase"><div class="id">P0</div><div><h3>Foundation / Governance</h3><p>Monorepo, tests, AGENTS.md, source-license boundaries, upstream strategy.</p><b>Exit:</b> CI builds and minimal sample runs.</div></div>
+<div class="phase"><div class="id">P1</div><div><h3>Editor Kernel</h3><p>Shell, runtime viewport, outliner, inspector, transform tools, save/load, undo/redo.</p><b>Exit:</b> author a scene without editing raw files.</div></div>
+<div class="phase"><div class="id">P2</div><div><h3>Play-In-Editor</h3><p>authoring/runtime isolation, snapshot/COW, pause, step, eject, possess.</p><b>Exit:</b> stop restores exact authoring state.</div></div>
+<div class="phase"><div class="id">P3</div><div><h3>Large-World Core</h3><p>hierarchical coordinates, partition, async cell loading, debug visualization.</p><b>Exit:</b> traverse more authored content than resident memory.</div></div>
+<div class="phase"><div class="id">P4</div><div><h3>Asset / Cook Pipeline</h3><p>hash DDC, import graph, cooked formats, validation, target builds.</p><b>Exit:</b> clean checkout reproduces packaged sample.</div></div>
+<div class="phase"><div class="id">P4M</div><div><h3>Material / PBR Authoring</h3><p>canonical PBR inputs, material graph/IR, master materials, instances, functions, texture-set import and library browser.</p><b>Exit:</b> import a complete PBR set, build a reusable master, create instances, stream textures and reproduce the result from CLI.</div></div>
+<div class="phase"><div class="id">P5</div><div><h3>GPU-Driven Renderer</h3><p>render graph, GPU scene, compute culling, HZB, indirect submission.</p><b>Exit:</b> stress scene shows bounded CPU submission cost.</div></div>
+<div class="phase"><div class="id">P6</div><div><h3>Virtual Geometry Baseline</h3><p>meshlet hierarchy, error metric, paging, fallback.</p><b>Exit:</b> stable LOD/streaming with no missing-geometry holes.</div></div>
+<div class="phase"><div class="id">P7</div><div><h3>FPS Gameplay</h3><p>character, weapon, physics interaction, animation, audio, AI.</p><b>Exit:</b> real playable loop.</div></div>
+<div class="phase"><div class="id">P8</div><div><h3>Moving Frames / Vehicles</h3><p>vehicle/ship local frame and interior traversal.</p><b>Exit:</b> combat/physics inside moving vehicle without precision failure.</div></div>
+<div class="phase"><div class="id">P9</div><div><h3>Networked Vertical Slice</h3><p>authority, prediction, interpolation, relevance, dedicated server.</p><b>Exit:</b> repeatable multiplayer traversal/combat demo.</div></div>
+<div class="phase"><div class="id">R1</div><div><h3>Microgeometry Research</h3><p>aperiodic/stochastic detail, compute generation, transient caches.</p><b>Exit:</b> promote only measured wins.</div></div>
+<div class="phase"><div class="id">R2</div><div><h3>Representation Virtualization</h3><p>mesh/splat/proxy/procedural switching under unified cost/error model.</p><b>Exit:</b> measured stability + cost advantage.</div></div>
+</div></section>
+
+<section id="slice"><h2>29. First AAA-Style Vertical Slice</h2><p>This demo is an architecture torture test, not a content showcase.</p><ol><li>Player spawns in a streamed outdoor range.</li><li>Walks into a drivable spacecraft/large vehicle.</li><li>Vehicle moves quickly while player walks inside.</li><li>Player fires a weapon and moves physics objects inside.</li><li>Vehicle crosses partition boundaries.</li><li>Second client observes the same scenario through a dedicated server.</li><li>Player exits to a different local/world frame.</li><li>Editor can eject and inspect while PIE is active.</li></ol><ul class="check"><li>No obvious transform jitter at validated scale.</li><li>No blocking content IO during normal traversal.</li><li>Momentum is credible across frame transition.</li><li>Server build has no graphics/editor dependency.</li><li>Client cannot authoritatively self-teleport or self-award state.</li><li>Replay reproduces a scripted traversal.</li><li>Profiler exposes CPU/GPU/streaming/network costs.</li></ul></section>
+
+<section id="agents"><h2>30. GPT + Grok CLI Development Protocol</h2><div class="callout good"><b>This HTML is the initial architecture authority.</b> If implementation proves a section wrong, change it through an ADR/RFC instead of allowing silent architectural drift.</div><h3>30.1 AGENTS.md baseline</h3><pre><code># ENGINE AGENT RULES
+1. Read ARCHITECTURE.md and relevant ADRs before cross-module changes.
+2. Engine modules never import editor modules.
+3. Preserve CLI parity for critical editor operations.
+4. Record reason + license for every new dependency.
+5. No architecture rewrite without an ADR.
+6. Research systems stay behind flags and include benchmarks.
+7. Bug fixes add regression tests where practical.
+8. Never claim performance wins without reproducible data.
+9. Do not copy proprietary CryEngine/Unreal implementation source.
+10. End every session by updating docs/status/CURRENT.md:
+   completed / tests / failures / changed files / exact next task.</code></pre><h3>30.2 Suggested agent roles</h3><table><tr><th>Agent</th><th>Primary responsibility</th></tr><tr><td>GPT CLI</td><td>architecture/integration, contracts, implementation, tests, code review</td></tr><tr><td>Grok CLI</td><td>independent challenger, alternative designs, stress cases, renderer research, benchmark criticism</td></tr><tr><td>Human lead</td><td>promotion gates, product direction, license decisions, milestone priority</td></tr></table><h3>30.3 Handoff format</h3><pre><code># HANDOFF — &lt;TASK&gt;
+DATE:
+BASE COMMIT:
+AUTHORITY DOC: AAA_ENGINE_PROJECT_START_FRAMEWORK.html §X
+GOAL:
+FILES CHANGED:
+DECISIONS:
+TESTS + RESULTS:
+PERF DATA:
+OPEN RISKS / DISAGREEMENTS:
+DO NOT CHANGE:
+NEXT EXACT TASK:</code></pre><h3>30.4 Session-start prompt</h3><pre><code>You are working on the AAA Engine Platform repository.
+Before coding:
+1. Read AAA_ENGINE_PROJECT_START_FRAMEWORK.html.
+2. Read AGENTS.md.
+3. Read docs/status/CURRENT.md.
+4. Read ADRs referenced by the current subsystem.
+5. Inspect git status/diff.
+
+Do not invent cross-cutting architecture. If a task requires a new engine-wide decision,
+write an ADR proposal first. The Editor hosts the same runtime engine used by the game;
+engine modules never depend on editor code.
+
+For each task: state acceptance criteria, implement the smallest coherent slice,
+add tests, run checks, report exact commands/results, and update CURRENT.md.
+Experimental renderer/geometry work stays feature-flagged and benchmarked against baseline.</code></pre></section>
+
+<section id="bootstrap"><h2>31. Bootstrap Commands</h2><p>Pin exact versions when initializing the repository. These commands define the intended startup path.</p><pre><code>mkdir engine-platform &amp;&amp; cd engine-platform
+git init
+corepack enable
+pnpm init
+
+# Scaffold a PlayCanvas code project separately for upstream/reference comparison:
+npm create playcanvas@latest
+
+mkdir -p apps engine editor tools hosts packages samples tests \
+  docs/adr docs/rfc docs/status docs/legal
+
+# Copy this document into docs/ and establish canonical root files:
+cp AAA_ENGINE_PROJECT_START_FRAMEWORK.html ./docs/
+touch AGENTS.md ARCHITECTURE.md docs/status/CURRENT.md
+
+# First CI contract to wire immediately:
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build</code></pre><h3>31.1 Upstream discipline</h3><pre><code>git remote add upstream-playcanvas https://github.com/playcanvas/engine.git
+# project fork = origin
+# upstream merges are deliberate, reviewed and tested.</code></pre></section>
+
+<section id="templates"><h2>32. ADR / RFC Templates</h2><h3>32.1 Architecture Decision Record</h3><pre><code># ADR-XXXX — Title
+Status: Proposed | Accepted | Superseded | Rejected
+Date:
+Owners:
+
+## Context
+## Decision
+## Alternatives considered
+## Consequences
+## Validation
+## Rollback / Supersession</code></pre><h3>32.2 Rendering Research RFC</h3><pre><code># RFC-RND-XXXX — Experiment
+Hypothesis:
+Baseline:
+Feature flag:
+Test scenes:
+Hardware:
+Image-quality metric:
+Frame-time metric:
+VRAM/storage/bandwidth metric:
+Expected failure cases:
+Raw result location:
+Promotion threshold:
+Conclusion: PROMOTE | CONTINUE RESEARCH | REJECT</code></pre></section>
+
+<section id="backlog"><h2>33. First Engineering Backlog</h2><table><tr><th>#</th><th>Ticket</th><th>Exit</th></tr>
+<tr><td>001</td><td>Freeze dependency rules</td><td>CI rejects forbidden engine→editor imports.</td></tr>
+<tr><td>002</td><td>Document PlayCanvas fork/upstream strategy</td><td>remote + merge policy recorded.</td></tr>
+<tr><td>003</td><td>Minimal EngineHost</td><td>same lifecycle boots client and test host.</td></tr>
+<tr><td>004</td><td>Clock/fixed-step service</td><td>tests pass under variable render delta.</td></tr>
+<tr><td>005</td><td>Stable entity IDs</td><td>IDs survive save/load/duplicate.</td></tr>
+<tr><td>006</td><td>Component schema metadata</td><td>sample components serialize + inspect.</td></tr>
+<tr><td>007</td><td>Editor shell</td><td>dock layout + commands + viewport pane.</td></tr>
+<tr><td>008</td><td>Embedded runtime viewport</td><td>editor displays live engine camera.</td></tr>
+<tr><td>009</td><td>Outliner/selection</td><td>hierarchy selection synchronized.</td></tr>
+<tr><td>010</td><td>Transform inspector + undo</td><td>edit/undo/redo works.</td></tr>
+<tr><td>011</td><td>Gizmo transaction coalescing</td><td>drag = one undo record.</td></tr>
+<tr><td>012</td><td>Project schema v1</td><td>CLI validates fixtures.</td></tr>
+<tr><td>013</td><td>Scene schema v1</td><td>round-trip golden test.</td></tr>
+<tr><td>014</td><td>PIE snapshot/COW</td><td>stop discards runtime changes.</td></tr>
+<tr><td>015</td><td>PIE pause/step/eject</td><td>debug controls work in sample.</td></tr>
+<tr><td>016</td><td>64-bit frame transform</td><td>precision tests at extreme distance.</td></tr>
+<tr><td>017</td><td>Camera-relative render transforms</td><td>far-origin jitter stress test passes.</td></tr>
+<tr><td>018</td><td>World-cell schema</td><td>deterministic entity→cell assignment.</td></tr>
+<tr><td>019</td><td>Async cell loader</td><td>no frame-blocking test path.</td></tr>
+<tr><td>020</td><td>Streaming debug overlay</td><td>state/cost/reason visible.</td></tr>
+<tr><td>021</td><td>Derived-data keys</td><td>source/settings/tool changes invalidate cache.</td></tr>
+<tr><td>022</td><td>glTF import node</td><td>canonical asset metadata + dependencies.</td></tr>
+<tr><td>023</td><td>Cooker skeleton</td><td>client + server outputs.</td></tr>
+<tr><td>024</td><td>RenderGraph v1</td><td>pass dependencies + transient validation.</td></tr>
+<tr><td>025</td><td>GPUScene v1</td><td>compact instance DB uploaded.</td></tr>
+<tr><td>026</td><td>GPU frustum culling</td><td>matches CPU reference set.</td></tr>
+<tr><td>027</td><td>HZB occlusion</td><td>stable camera-motion test.</td></tr>
+<tr><td>028</td><td>Meshlet preprocessing experiment</td><td>clusters + debug view + stats.</td></tr>
+<tr><td>029</td><td>Dedicated server host</td><td>boots world with no graphics dependency.</td></tr>
+<tr><td>030</td><td>AI session continuity</td><td>agents resume from CURRENT.md without chat history.</td></tr>
+<tr><td>031</td><td>Canonical material schema</td><td>PBR inputs, shading model and parameter metadata validate/round-trip.</td></tr>
+<tr><td>032</td><td>Texture semantic importer</td><td>sRGB/linear/normal/channel mappings are explicit and tested.</td></tr>
+<tr><td>033</td><td>PBR texture-set wizard</td><td>common naming/packed-map conventions import with reviewable recipe.</td></tr>
+<tr><td>034</td><td>Material graph v1</td><td>typed graph edits, preview and error diagnostics work.</td></tr>
+<tr><td>035</td><td>Material IR/compiler v1</td><td>graph compiles to deterministic WGSL + reflection metadata.</td></tr>
+<tr><td>036</td><td>Master/instance inheritance</td><td>parameter-only instance edits avoid unnecessary graph recompilation.</td></tr>
+<tr><td>037</td><td>Material function assets</td><td>shared graph logic versions and invalidates dependents correctly.</td></tr>
+<tr><td>038</td><td>Material library browser</td><td>search/preview/drag-drop + provenance fields work.</td></tr>
+<tr><td>039</td><td>Virtual texture prototype</td><td>large PBR set stays within configured residency budget.</td></tr>
+<tr><td>040</td><td>Material performance diagnostics</td><td>variants, textures, passes and GPU/resource counters exposed in editor + CLI.</td></tr>
+</table></section>
+
+<section id="sources"><h2>34. Current Public References</h2><p>These sources establish the upstream facts and public reference concepts used in this v0.1 architecture. They are references, not code to copy.</p><ul><li><a href="https://github.com/playcanvas/engine">PlayCanvas Engine</a> — current open-source WebGL2/WebGPU engine.</li><li><a href="https://developer.playcanvas.com/user-manual/ecs/">PlayCanvas ECS docs</a> — entity/component/system model.</li><li><a href="https://github.com/playcanvas/editor">PlayCanvas Editor</a> — editor codebase and PCUI/graph ecosystem reference.</li><li><a href="https://github.com/Pterosoft/-CRYENGINE-Community-Edition-/">CRYENGINE Community Edition</a> — community patch repository and license statement.</li><li><a href="https://dev.epicgames.com/documentation/en-us/unreal-engine/unreal-engine-materials">Epic Unreal Engine Materials documentation</a> — public reference for graph-based material authoring and material workflow concepts.</li><li><a href="https://dev.epicgames.com/documentation/en-us/unreal-engine/instanced-materials-in-unreal-engine">Epic Material Instances documentation</a> — public reference for parent/child parameterized material workflows.</li><li><a href="https://dev.epicgames.com/documentation/en-us/unreal-engine/material-functions-in-unreal-engine">Epic Material Functions documentation</a> — public reference for reusable material graph logic.</li><li><a href="https://dev.epicgames.com/documentation/en-us/unreal-engine/virtual-texturing-in-unreal-engine">Epic Virtual Texturing documentation</a> — public reference for streaming/runtime virtual texture concepts.</li><li><a href="https://dev.epicgames.com/documentation/unreal-engine/nanite-in-unreal-engine">Epic Nanite documentation</a> — public virtualized-geometry reference.</li><li><a href="https://dev.epicgames.com/documentation/unreal-engine/world-partition-in-unreal-engine">Epic World Partition documentation</a> — public automatic streaming/partition reference.</li></ul><div class="callout"><b>Authority rule:</b> a later Accepted ADR supersedes this document for the decision it covers. Code that diverges from both this document and Accepted ADRs is undocumented drift and should be corrected or documented.</div></section>
+
+<div class="footer"><b>AAA Engine Platform — Project Start &amp; Technical Framework v0.2</b><p>Portable browser/CLI architecture brief. Working codename intentionally left TBD. Update through reviewed ADR/RFC decisions rather than informal drift.</p></div>
+</main></div></body></html>

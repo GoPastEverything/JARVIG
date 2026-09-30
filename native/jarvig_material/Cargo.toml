@@ -1,0 +1,9 @@
+[package]
+name = "jarvig_material"
+version = "0.0.1"
+edition = "2021"
+description = "JARVIG material graph, IR, and compiler. No GPU crate and no window crate."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "jarvig_rhi"
+version = "0.0.1"
+edition = "2021"
+description = "JARVIG rendering hardware interface. GPU crates are not dependencies of this crate."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]

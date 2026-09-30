@@ -1,0 +1,22 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/scene-schema" },
+    { "path": "packages/project-schema" },
+    { "path": "packages/node-host" },
+    { "path": "engine/math" },
+    { "path": "engine/core" },
+    { "path": "engine/ecs" },
+    { "path": "engine/world" },
+    { "path": "engine/assets" },
+    { "path": "engine/materials" },
+    { "path": "engine/render" },
+    { "path": "editor/shell" },
+    { "path": "apps/hub" },
+    { "path": "apps/editor" },
+    { "path": "hosts/client" },
+    { "path": "hosts/dedicated-server" },
+    { "path": "tools/cli" },
+    { "path": "samples/minimal" }
+  ]
+}

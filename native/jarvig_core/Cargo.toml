@@ -1,0 +1,15 @@
+[package]
+name = "jarvig_core"
+version = "0.0.1"
+edition = "2021"
+description = "JARVIG native core. The TypeScript engine packages are a prototype of these contracts, not the shipping runtime."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+getrandom = "0.3"
+jarvig_material = { path = "../jarvig_material" }
+zune-jpeg = "0.5"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]

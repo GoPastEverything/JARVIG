@@ -1,0 +1,32 @@
+[package]
+name = "jarvig_editor"
+version = "0.0.1"
+edition = "2021"
+description = "Native JARVIGEditor. Hosts the engine. It is not a second renderer and not the player."
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "JARVIGEditor"
+path = "src/main.rs"
+
+[dependencies]
+jarvig_core = { path = "../jarvig_core" }
+png = "0.18.1"
+jarvig_engine = { path = "../jarvig_engine" }
+jarvig_renderer = { path = "../jarvig_renderer" }
+jarvig_rhi = { path = "../jarvig_rhi" }
+jarvig_rhi_wgpu = { path = "../jarvig_rhi_wgpu" }
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

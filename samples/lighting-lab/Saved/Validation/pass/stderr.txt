@@ -1,0 +1,3 @@
+JARVIG Material Tiles101: base color sRGB, normal directx-negative-y (no green flip), roughness/AO/metallic linear, displacement recognized, not sampled , ingested 2048x2048, mips 12, anisotropy 8. The level stores the set name, not the pixels.
+JARVIG Material Gravel035: base color sRGB, normal directx-negative-y (no green flip), roughness/AO/metallic linear, displacement recognized, not sampled , ingested 2048x2048, mips 12, anisotropy 8. The level stores the set name, not the pixels.
+JARVIG Material path: 2 staged sets, 1 shader compiles. The shader does not name a set or a filename.

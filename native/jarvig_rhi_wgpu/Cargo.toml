@@ -1,0 +1,13 @@
+[package]
+name = "jarvig_rhi_wgpu"
+version = "0.0.1"
+edition = "2021"
+description = "Private wgpu backend for the JARVIG RHI. The only crate allowed to name wgpu."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+jarvig_rhi = { path = "../jarvig_rhi" }
+pollster = "0.4"
+raw-window-handle = "0.6"
+wgpu = "24"

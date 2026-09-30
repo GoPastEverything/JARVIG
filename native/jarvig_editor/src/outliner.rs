@@ -1,0 +1,337 @@
+//! Derived world outliner. Editor state only.
+//!
+//! The registry owns the entities. This model is a view: names, parent links by
+//! uuid, and which rows are expanded. It does not store a window handle, a
+//! bootstrap slot, or a render instance. The tree caret is not editor selection.
+
+use std::collections::{BTreeSet, HashMap};
+
+use jarvig_core::{EntityOutlineInfo, EntityUuid};
+
+/// World is an editor row. It is not an entity and it has no uuid.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum OutlinerNodeId {
+    WorldRoot,
+    Entity(EntityUuid),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlinerEntityNode {
+    pub entity: EntityUuid,
+    pub display_name: String,
+    /// Mesh, Light, Probe, World, or empty. Not a second identity.
+    pub category: String,
+    pub parent: Option<EntityUuid>,
+    pub children: Vec<EntityUuid>,
+}
+
+/// In-memory view of [`EntityOutlineInfo`]. Expansion is not scene data.
+#[derive(Clone, Debug, Default)]
+pub struct WorldOutlinerModel {
+    revision: u64,
+    nodes: Vec<OutlinerEntityNode>,
+    roots: Vec<EntityUuid>,
+    expanded: BTreeSet<EntityUuid>,
+    world_expanded: bool,
+    caret: Option<OutlinerNodeId>,
+}
+
+/// Empty names still need a label. The uuid stays the identity either way.
+pub fn presentation_name(name: &str) -> &str {
+    if name.is_empty() { "Unnamed" } else { name }
+}
+
+/// Tree text. The category is a suffix, not the row identity. An empty class has no suffix.
+pub fn presentation_row(name: &str, category: &str) -> String {
+    if category.is_empty() { name.to_string() } else { format!("{name}          {category}") }
+}
+
+impl WorldOutlinerModel {
+    pub fn empty() -> Self {
+        Self { world_expanded: true, ..Self::default() }
+    }
+
+    /// Rebuild from one hierarchy pass. Sibling order is the order of `rows`.
+    /// That order is the registry insertion order, not a hash-map walk and not
+    /// alphabetical. New entities start expanded. A missing caret is cleared.
+    pub fn derive(revision: u64, rows: &[EntityOutlineInfo], previous: &Self) -> Self {
+        let mut index: HashMap<EntityUuid, usize> = HashMap::with_capacity(rows.len());
+        let mut nodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            if index.contains_key(&row.uuid) {
+                continue;
+            }
+            index.insert(row.uuid, nodes.len());
+            nodes.push(OutlinerEntityNode {
+                entity: row.uuid,
+                display_name: presentation_name(&row.name).to_string(),
+                category: row.class.label().to_string(),
+                parent: None,
+                children: Vec::new(),
+            });
+        }
+        let mut roots = Vec::new();
+        for row in rows {
+            let Some(&slot) = index.get(&row.uuid) else {
+                continue;
+            };
+            match row.parent.and_then(|parent| index.get(&parent).copied()) {
+                Some(parent_slot) => {
+                    let parent = nodes[parent_slot].entity;
+                    nodes[parent_slot].children.push(row.uuid);
+                    nodes[slot].parent = Some(parent);
+                }
+                None => roots.push(row.uuid),
+            }
+        }
+        let live: BTreeSet<EntityUuid> = nodes.iter().map(|node| node.entity).collect();
+        let mut expanded = previous.expanded.intersection(&live).copied().collect::<BTreeSet<_>>();
+        for entity in &live {
+            if !previous.expanded.contains(entity) && previous.nodes.iter().all(|node| node.entity != *entity) {
+                expanded.insert(*entity);
+            }
+        }
+        let caret = previous.caret.filter(|caret| match caret {
+            OutlinerNodeId::WorldRoot => true,
+            OutlinerNodeId::Entity(entity) => live.contains(entity),
+        });
+        Self { revision, nodes, roots, expanded, world_expanded: previous.world_expanded || previous.nodes.is_empty(), caret }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Names, classes, parents, and sibling order. Expansion and the caret are not rows.
+    /// A pose edit revises the world and still returns true.
+    pub fn same_rows(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.roots == other.roots
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn root_entity_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub fn roots(&self) -> &[EntityUuid] {
+        &self.roots
+    }
+
+    pub fn node(&self, entity: EntityUuid) -> Option<&OutlinerEntityNode> {
+        self.nodes.iter().find(|node| node.entity == entity)
+    }
+
+    pub fn display_name(&self, entity: EntityUuid) -> Option<&str> {
+        self.node(entity).map(|node| node.display_name.as_str())
+    }
+
+    /// What the tree control shows. `display_name` stays the entity name.
+    pub fn row_text(&self, entity: EntityUuid) -> Option<String> {
+        let node = self.node(entity)?;
+        Some(presentation_row(&node.display_name, &node.category))
+    }
+
+    pub fn children(&self, entity: EntityUuid) -> &[EntityUuid] {
+        self.node(entity).map(|node| node.children.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn is_expanded(&self, entity: EntityUuid) -> bool {
+        self.expanded.contains(&entity)
+    }
+
+    pub fn set_expanded(&mut self, entity: EntityUuid, expanded: bool) {
+        if self.node(entity).is_none() {
+            return;
+        }
+        if expanded {
+            self.expanded.insert(entity);
+        } else {
+            self.expanded.remove(&entity);
+        }
+    }
+
+    pub fn world_expanded(&self) -> bool {
+        self.world_expanded
+    }
+
+    pub fn set_world_expanded(&mut self, expanded: bool) {
+        self.world_expanded = expanded;
+    }
+
+    pub fn caret(&self) -> Option<OutlinerNodeId> {
+        self.caret
+    }
+
+    pub fn set_caret(&mut self, caret: Option<OutlinerNodeId>) {
+        self.caret = caret.filter(|caret| match caret {
+            OutlinerNodeId::WorldRoot => true,
+            OutlinerNodeId::Entity(entity) => self.node(*entity).is_some(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jarvig_core::{RenderFrameId, SceneWorld};
+
+    fn model_of(world: &SceneWorld, previous: &WorldOutlinerModel) -> WorldOutlinerModel {
+        WorldOutlinerModel::derive(world.revision(), &world.entity_outline(), previous)
+    }
+
+    #[test]
+    fn world_root_is_not_an_entity_and_bootstrap_names_follow_insertion_order() {
+        let world = SceneWorld::bootstrap();
+        let model = model_of(&world, &WorldOutlinerModel::empty());
+        assert!(!matches!(OutlinerNodeId::WorldRoot, OutlinerNodeId::Entity(_)));
+        assert_eq!(model.entity_count(), 7);
+        assert_eq!(model.root_entity_count(), 7);
+        assert_eq!(model.display_name(model.roots()[0]), Some("Near Triangle"));
+        assert_eq!(model.display_name(model.roots()[1]), Some("Far Triangle"));
+        assert_eq!(model.node(model.roots()[0]).unwrap().category, "Mesh");
+        assert_eq!(model.node(model.roots()[2]).unwrap().category, "Light");
+        assert_eq!(model.node(model.roots()[3]).unwrap().category, "Light");
+        assert_eq!(model.node(model.roots()[4]).unwrap().category, "Light");
+        assert_eq!(model.node(model.roots()[5]).unwrap().category, "Probe");
+        assert_eq!(model.node(model.roots()[6]).unwrap().category, "World");
+        assert_eq!(model.row_text(model.roots()[0]).as_deref(), Some("Near Triangle          Mesh"));
+        assert_eq!(model.display_name(model.roots()[5]), Some("Reflection Probe"));
+        assert_eq!(model.display_name(model.roots()[6]), Some("World Settings"));
+        assert_eq!(model.entity_count(), world.entity_count());
+        for root in model.roots() {
+            let node = model.node(*root).unwrap();
+            assert!(world.component_stack(node.entity).is_ok());
+            assert_ne!(node.category, "Transform");
+            assert_ne!(node.category, "Components");
+        }
+        assert_ne!(model.roots()[0], model.roots()[1]);
+        assert!(model.display_name(model.roots()[0]).unwrap() != "Object 1");
+        assert_eq!(presentation_name(""), "Unnamed");
+    }
+
+    #[test]
+    fn a_pose_edit_keeps_the_same_rows_and_a_rename_does_not() {
+        let mut world = SceneWorld::bootstrap();
+        let before = model_of(&world, &WorldOutlinerModel::empty());
+        let near = world.entity_outline()[0].uuid;
+        world.set_entity_local_translation(near, jarvig_core::Vec3::new(1.25, 0.0, -2.0)).unwrap();
+        let moved = model_of(&world, &before);
+        assert_ne!(before.revision(), moved.revision());
+        assert!(before.same_rows(&moved));
+        world.set_entity_name(near, "Moved Card").unwrap();
+        let renamed = model_of(&world, &moved);
+        assert!(!moved.same_rows(&renamed));
+        assert_eq!(renamed.display_name(near), Some("Moved Card"));
+    }
+
+    #[test]
+    fn a_non_renderable_entity_is_a_row_and_not_a_render_instance() {
+        let mut world = SceneWorld::bootstrap();
+        let marker = world.create_entity("Gameplay Marker");
+        let marker_id = world.resolve(marker).unwrap();
+        let model = model_of(&world, &WorldOutlinerModel::empty());
+        assert_eq!(model.entity_count(), 8);
+        assert_eq!(world.object_count(), 2);
+        assert_eq!(model.display_name(marker_id), Some("Gameplay Marker"));
+        assert_eq!(model.node(marker_id).unwrap().category, "");
+        assert_eq!(model.row_text(marker_id).as_deref(), Some("Gameplay Marker"));
+        assert!(model.roots().contains(&marker_id));
+        let snapshot = world.extract(RenderFrameId(1)).unwrap();
+        assert_eq!(snapshot.instance_count(), 2);
+        assert!(snapshot.instances().iter().all(|instance| instance.entity != marker_id));
+    }
+
+    #[test]
+    fn same_names_stay_distinct_rename_keeps_the_uuid_and_duplicate_mints_one() {
+        let mut world = SceneWorld::bootstrap();
+        let first = world.create_entity("Light");
+        let first_id = world.resolve(first).unwrap();
+        let mut model = model_of(&world, &WorldOutlinerModel::empty());
+        model.set_caret(Some(OutlinerNodeId::Entity(first_id)));
+        model.set_expanded(first_id, false);
+        world.rename_entity(first, "Key Light").unwrap();
+        assert_eq!(world.resolve(first).unwrap(), first_id);
+        model = model_of(&world, &model);
+        assert_eq!(model.display_name(first_id), Some("Key Light"));
+        assert_eq!(model.caret(), Some(OutlinerNodeId::Entity(first_id)));
+        assert!(!model.is_expanded(first_id));
+        let second = world.duplicate_entity(first).unwrap();
+        let second_id = world.resolve(second).unwrap();
+        assert_ne!(second_id, first_id);
+        world.rename_entity(second, "Light").unwrap();
+        world.rename_entity(first, "Light").unwrap();
+        model = model_of(&world, &model);
+        assert_eq!(model.display_name(first_id), Some("Light"));
+        assert_eq!(model.display_name(second_id), Some("Light"));
+        assert_ne!(first_id, second_id);
+        assert_eq!(model.entity_count(), 9);
+    }
+
+    #[test]
+    fn parent_hierarchy_cycle_rejection_and_stale_reuse_do_not_resurrect_a_uuid() {
+        let mut world = SceneWorld::bootstrap();
+        let ship = world.create_entity("Ship");
+        let hull = world.create_entity("Hull");
+        let ship_id = world.resolve(ship).unwrap();
+        let hull_id = world.resolve(hull).unwrap();
+        world.reparent_entity(hull, Some(ship)).unwrap();
+        let mut model = model_of(&world, &WorldOutlinerModel::empty());
+        assert_eq!(model.node(hull_id).unwrap().parent, Some(ship_id));
+        assert_eq!(model.children(ship_id), &[hull_id]);
+        assert!(!model.roots().contains(&hull_id));
+        assert!(world.reparent_entity(ship, Some(hull)).is_err());
+        model = model_of(&world, &model);
+        assert_eq!(model.node(ship_id).unwrap().parent, None);
+        assert_eq!(model.children(ship_id), &[hull_id]);
+        model.set_caret(Some(OutlinerNodeId::Entity(hull_id)));
+        model.set_expanded(ship_id, true);
+        let retired = world.retire_entity(hull).unwrap();
+        assert_eq!(retired, hull_id);
+        assert!(world.resolve(hull).is_err());
+        model = model_of(&world, &model);
+        assert!(model.node(hull_id).is_none());
+        assert_eq!(model.caret(), None);
+        assert!(model.is_expanded(ship_id));
+        let reused = world.create_entity("Barrel");
+        assert_eq!(reused.index, hull.index);
+        assert_ne!(reused.generation, hull.generation);
+        let reused_id = world.resolve(reused).unwrap();
+        model = model_of(&world, &model);
+        assert!(model.node(hull_id).is_none());
+        assert_eq!(model.display_name(reused_id), Some("Barrel"));
+        assert_ne!(model.node(reused_id).unwrap().parent, Some(ship_id));
+        assert!(model.is_expanded(reused_id));
+    }
+
+    #[test]
+    fn sibling_order_is_insertion_order_not_alphabetical() {
+        let mut world = SceneWorld::bootstrap();
+        let zebra = world.create_entity("Zebra");
+        let apple = world.create_entity("apple");
+        let model = model_of(&world, &WorldOutlinerModel::empty());
+        let roots = model.roots();
+        let zebra_at = roots.iter().position(|id| *id == world.resolve(zebra).unwrap()).unwrap();
+        let apple_at = roots.iter().position(|id| *id == world.resolve(apple).unwrap()).unwrap();
+        assert!(zebra_at < apple_at);
+    }
+
+    #[test]
+    fn expansion_is_editor_state_and_collapsing_world_is_not_a_scene_edit() {
+        let world = SceneWorld::bootstrap();
+        let mut model = model_of(&world, &WorldOutlinerModel::empty());
+        let revision = world.revision();
+        let near = model.roots()[0];
+        model.set_expanded(near, false);
+        model.set_world_expanded(false);
+        model.set_caret(Some(OutlinerNodeId::WorldRoot));
+        let again = model_of(&world, &model);
+        assert_eq!(world.revision(), revision);
+        assert!(!again.is_expanded(near));
+        assert!(!again.world_expanded());
+        assert_eq!(again.caret(), Some(OutlinerNodeId::WorldRoot));
+        assert_eq!(again.entity_count(), world.entity_count());
+    }
+}

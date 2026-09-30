@@ -1,0 +1,11 @@
+[package]
+name = "jarvig_engine"
+version = "0.0.1"
+edition = "2021"
+description = "Frame order for a JARVIG host. No renderer and no GPU crate."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+jarvig_core = { path = "../jarvig_core" }
+jarvig_material = { path = "../jarvig_material" }

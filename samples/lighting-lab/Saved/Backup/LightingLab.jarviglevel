@@ -1,0 +1,933 @@
+{
+  "schema": "jarvig.level",
+  "format_version": 1,
+  "level_uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  "name": "Lighting Lab",
+  "world_settings": {
+    "entity": "11111111-1111-4111-8111-111111111111",
+    "enabled": true,
+    "intensity": 0.2,
+    "upper": [
+      0.55,
+      0.68,
+      0.86
+    ],
+    "lower": [
+      0.22,
+      0.16,
+      0.11
+    ],
+    "probe_update_policy": "static"
+  },
+  "entities": [
+    {
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "name": "World Settings",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "WorldSettings",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "uuid": "22222222-2222-4222-8222-222222222222",
+      "name": "Near Triangle",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.6080598675448612,
+            0.9548431008490019
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "near_triangle"
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "bootstrap_near",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.85,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "33333333-3333-4333-8333-333333333333",
+      "name": "Far Triangle",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.7058403659032162,
+            -6.892920218104896
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "far_triangle"
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "bootstrap_far",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 0.2,
+            "emissive": [
+              0.35,
+              0.12,
+              0.02,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "44444444-4444-4444-8444-444444444444",
+      "name": "Directional Light",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "DirectionalLight",
+          "version": 1,
+          "enabled": true,
+          "color": [
+            1,
+            0.96,
+            0.9
+          ],
+          "intensity": 0.35,
+          "range_m": 0,
+          "inner_radians": 0,
+          "outer_radians": 0,
+          "cast_shadows": true,
+          "shadow_resolution": 0,
+          "depth_bias_m": 0.002,
+          "slope_bias_m": 0.01,
+          "normal_bias_m": 0.004,
+          "filter_radius": 2,
+          "shadow_distance_m": 0,
+          "cascade_count": 0,
+          "cascade_distribution": 0.5
+        }
+      ]
+    },
+    {
+      "uuid": "55555555-5555-4555-8555-555555555555",
+      "name": "Blue Point Light",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            1.25,
+            0.7,
+            -0.8
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "PointLight",
+          "version": 1,
+          "enabled": true,
+          "color": [
+            0.3,
+            0.48,
+            1
+          ],
+          "intensity": 14,
+          "range_m": 0,
+          "inner_radians": 0,
+          "outer_radians": 0,
+          "cast_shadows": true,
+          "shadow_resolution": 0,
+          "depth_bias_m": 0.002,
+          "slope_bias_m": 0.01,
+          "normal_bias_m": 0.004,
+          "filter_radius": 2,
+          "shadow_distance_m": 0,
+          "cascade_count": 0,
+          "cascade_distribution": 0.5
+        }
+      ]
+    },
+    {
+      "uuid": "66666666-6666-4666-8666-666666666666",
+      "name": "Warm Spot Light",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.15,
+            1.35,
+            -3.1
+          ],
+          "rotation": [
+            -0.2683231936851229,
+            0.03499867743718995,
+            0,
+            0.9626929709457027
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "SpotLight",
+          "version": 1,
+          "enabled": true,
+          "color": [
+            1,
+            0.4,
+            0.12
+          ],
+          "intensity": 22,
+          "range_m": 0,
+          "inner_radians": 0.2,
+          "outer_radians": 0.75,
+          "cast_shadows": true,
+          "shadow_resolution": 0,
+          "depth_bias_m": 0.002,
+          "slope_bias_m": 0.01,
+          "normal_bias_m": 0.004,
+          "filter_radius": 2,
+          "shadow_distance_m": 0,
+          "cascade_count": 0,
+          "cascade_distribution": 0.5
+        }
+      ]
+    },
+    {
+      "uuid": "77777777-7777-4777-8777-777777777777",
+      "name": "Reflection Probe",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.2,
+            -3.5
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "ReflectionProbe",
+          "version": 1,
+          "enabled": true,
+          "radius_m": 8,
+          "intensity": 1,
+          "priority": 0,
+          "resolution": 64
+        }
+      ]
+    },
+    {
+      "uuid": "88888888-8888-4888-8888-888888888888",
+      "name": "Floor",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -1.15,
+            -4
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            4.2,
+            1,
+            4.2
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "floor",
+            "width_m": 6,
+            "depth_m": 6
+          },
+          "material": {
+            "scheme": "jarvig.material",
+            "name": "Gravel035",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 1,
+            "normal_scale": 1,
+            "normal_convention": "directx-negative-y"
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "99999999-9999-4999-8999-999999999999",
+      "name": "White Cube",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -3.84690682888031,
+            -0.65,
+            -4.2
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 1
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.82,
+              0.82,
+              0.8,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.78,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "name": "Metal Sphere",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            1.25,
+            -0.65,
+            -3.7
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.5,
+            "segments": 32,
+            "rings": 24
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.92,
+              0.92,
+              0.94,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 0.045,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "name": "Flat Sphere",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -1.4446176528930663,
+            -0.83,
+            -5.15
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "flat",
+            "radius_m": 0.32,
+            "segments": 32,
+            "rings": 24
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.92,
+              0.92,
+              0.94,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 0.045,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "name": "Emissive Panel",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            2.35,
+            -0.2,
+            -4
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "emissive_panel",
+            "width_m": 1.4,
+            "height_m": 0.9
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.02,
+              0.02,
+              0.02,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.5,
+            "emissive": [
+              8,
+              0.15,
+              0.08,
+              1
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1",
+      "name": "Tile Plane",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            4.3,
+            -1.15,
+            -5.6
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "floor",
+            "width_m": 1.5,
+            "depth_m": 1.5
+          },
+          "material": {
+            "scheme": "jarvig.material",
+            "name": "Tiles101",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 0.5,
+            "normal_scale": 1,
+            "normal_convention": "directx-negative-y"
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2",
+      "name": "Tile Cube",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -3.696898412704468,
+            -0.75,
+            -1.570883989748182
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 0.8
+          },
+          "material": {
+            "scheme": "jarvig.material",
+            "name": "Tiles101",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 2,
+            "normal_scale": 1,
+            "normal_convention": "directx-negative-y"
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "e3e3e3e3-e3e3-43e3-83e3-e3e3e3e3e3e3",
+      "name": "Tile Sphere",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -3.483037066459656,
+            -0.75,
+            0.3775632535143756
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.4,
+            "segments": 32,
+            "rings": 24
+          },
+          "material": {
+            "scheme": "jarvig.material",
+            "name": "Tiles101",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 4,
+            "normal_scale": 1,
+            "normal_convention": "directx-negative-y"
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "e4e4e4e4-e4e4-44e4-84e4-e4e4e4e4e4e4",
+      "name": "Gravel Plane",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.28087942600250226,
+            -1.1210540370281747,
+            -6.164024241927586
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "floor",
+            "width_m": 1.5,
+            "depth_m": 1.5
+          },
+          "material": {
+            "scheme": "jarvig.material",
+            "name": "Gravel035",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 1,
+            "normal_scale": 1,
+            "normal_convention": "directx-negative-y"
+          }
+        }
+      ]
+    },
+    {
+      "uuid": "46bb0ee8-3940-4709-a2b7-c60a53c7d558",
+      "name": "townshop",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            2.8221923112869263,
+            -0.39042788959021,
+            -1.4596873620590953
+          ],
+          "rotation": [
+            0,
+            -0.7166102842850611,
+            0,
+            0.6974737991185648
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.asset",
+            "id": "affe7d8d-e3e1-448a-a008-76c6e6266867",
+            "name": "townshop"
+          },
+          "material": {
+            "scheme": "jarvig.mesh",
+            "name": "Imported",
+            "base_color": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "metallic": 1,
+            "roughness": 1,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "uv_scale": 1,
+            "normal_scale": 1
+          }
+        }
+      ]
+    }
+  ]
+}

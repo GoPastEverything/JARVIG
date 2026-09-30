@@ -1,0 +1,23 @@
+[package]
+name = "jarvig_game"
+version = "0.0.1"
+edition = "2021"
+description = "Standalone JARVIG game host. Not the editor."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "JARVIGGame"
+path = "src/main.rs"
+
+[dependencies]
+jarvig_core = { path = "../jarvig_core" }
+jarvig_engine = { path = "../jarvig_engine" }
+jarvig_platform = { path = "../jarvig_platform" }
+jarvig_renderer = { path = "../jarvig_renderer" }
+jarvig_rhi = { path = "../jarvig_rhi" }
+jarvig_rhi_wgpu = { path = "../jarvig_rhi_wgpu" }
+png = "0.18.1"

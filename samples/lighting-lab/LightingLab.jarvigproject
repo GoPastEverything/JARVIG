@@ -1,0 +1,13 @@
+{
+  "schema": "jarvig.project",
+  "format_version": 1,
+  "project_uuid": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+  "display_name": "Lighting Lab",
+  "engine_version": "0.0.1",
+  "startup_level": "Content/Levels/LightingLab.jarviglevel",
+  "content_directory": "Content",
+  "saved_directory": "Saved",
+  "config_directory": "Config",
+  "intermediate_directory": "Intermediate",
+  "settings": "Config/Project.jarvigsettings"
+}

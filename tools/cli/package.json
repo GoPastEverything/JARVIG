@@ -1,0 +1,22 @@
+{
+  "name": "@jarvig/cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "jarvig": "./dist/main.js"
+  },
+  "main": "./dist/main.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@jarvig/core": "workspace:*",
+    "@jarvig/node-host": "workspace:*",
+    "@jarvig/project-schema": "workspace:*"
+  }
+}

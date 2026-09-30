@@ -1,0 +1,19 @@
+[gd_resource type="StandardMaterial3D" load_steps=6 format=3 uid="acg_oqev1l0y"]
+
+[ext_resource type="Texture2D" uid="uid://acg_d2oewz68" id="Color" path="./Gravel035_4K-PNG_Color.png"]
+[ext_resource type="Texture2D" uid="uid://acg_16ymw7zl" id="AmbientOcclusion" path="./Gravel035_4K-PNG_AmbientOcclusion.png"]
+[ext_resource type="Texture2D" uid="uid://acg_fg1r5n8o" id="Displacement" path="./Gravel035_4K-PNG_Displacement.png"]
+[ext_resource type="Texture2D" uid="uid://acg_at7rsjge" id="Roughness" path="./Gravel035_4K-PNG_Roughness.png"]
+[ext_resource type="Texture2D" uid="uid://acg_pwuirtgo" id="NormalGL" path="./Gravel035_4K-PNG_NormalGL.png"]
+[resource]
+albedo_texture = ExtResource("Color")
+ao_enabled = true
+ao_texture = ExtResource("AmbientOcclusion")
+ao_texture_channel = 4
+roughness_texture = ExtResource("Roughness")
+roughness_texture_channel = 4
+normal_texture = ExtResource("NormalGL")
+normal_enabled = true
+heightmap_texture = ExtResource("Displacement")
+heightmap_scale = 1.0
+heightmap_enabled = true

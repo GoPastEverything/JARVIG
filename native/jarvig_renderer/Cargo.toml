@@ -1,0 +1,12 @@
+[package]
+name = "jarvig_renderer"
+version = "0.0.1"
+edition = "2021"
+description = "JARVIG renderer. Talks to the RHI only. No GPU crate."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+jarvig_core = { path = "../jarvig_core" }
+jarvig_material = { path = "../jarvig_material" }
+jarvig_rhi = { path = "../jarvig_rhi" }

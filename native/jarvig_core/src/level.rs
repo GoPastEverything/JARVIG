@@ -1,0 +1,1276 @@
+//! Authored level document. This is the save file, not a render snapshot and not a GPU resource.
+//!
+//! Schema `jarvig.level` format version 1. A later asset database replaces `jarvig.builtin`
+//! names with stable AssetIds. The loader must not invent those ids. MeshId, MaterialInstanceId,
+//! EntityHandle, ObjectId, LightId, ProbeId, FrameId, and every GPU handle stay out of the file.
+
+use std::collections::HashSet;
+use std::fmt;
+
+use crate::json_lite::{parse_json, Json, JsonError};
+use crate::{
+    cube_mesh, emissive_panel_mesh, far_triangle_mesh, flat_sphere_mesh, floor_mesh, near_triangle_mesh, sphere_mesh, AuthoringError,
+    EntityId, EnvironmentLight, HighPrecisionPose, LightKind, LightShadowSettings, ProbeUpdatePolicy, Quat, SceneWorld, Vec3,
+    BOOTSTRAP_ENVIRONMENT_INTENSITY, BOOTSTRAP_LOWER_HEMISPHERE_LINEAR, BOOTSTRAP_PROBE_INTENSITY, BOOTSTRAP_PROBE_LOCAL_M,
+    BOOTSTRAP_PROBE_PRIORITY, BOOTSTRAP_PROBE_RADIUS_M, BOOTSTRAP_UPPER_HEMISPHERE_LINEAR,
+};
+
+pub const LEVEL_SCHEMA: &str = "jarvig.level";
+pub const LEVEL_FORMAT_VERSION: u32 = 1;
+/// Cameras are version 2. Version 1 files still load. A save writes 2 only when a camera is present.
+pub const LEVEL_CAMERA_VERSION: u32 = 2;
+
+/// Fixed identity for the regression level. Not a runtime slot.
+pub const LIGHTING_LAB_LEVEL_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LevelDocument {
+    pub format_version: u32,
+    pub level_uuid: EntityId,
+    pub name: String,
+    pub world_settings: WorldSettingsRecord,
+    pub entities: Vec<EntityRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldSettingsRecord {
+    pub entity: EntityId,
+    pub enabled: bool,
+    pub intensity: f32,
+    pub upper: [f32; 3],
+    pub lower: [f32; 3],
+    pub probe_update_policy: ProbeUpdatePolicy,
+    /// Explicit runtime camera. Absent from version-1 files. Never "the first Camera."
+    pub startup_camera: Option<EntityId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityRecord {
+    pub uuid: EntityId,
+    pub name: String,
+    pub parent_uuid: Option<EntityId>,
+    pub components: Vec<ComponentRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ComponentRecord {
+    Transform { translation: Vec3, rotation: Quat, scale: Vec3 },
+    MeshRenderer { visible: bool, cast_shadows: bool, receive_shadows: bool, mesh: MeshAssetRef, material: MaterialAssetRef },
+    DirectionalLight(LightRecord),
+    PointLight(LightRecord),
+    SpotLight(LightRecord),
+    ReflectionProbe(ProbeRecord),
+    Camera(CameraRecord),
+    WorldSettings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CameraRecord {
+    pub enabled: bool,
+    pub orthographic: bool,
+    pub vertical_fov_deg: f64,
+    pub ortho_height_m: f64,
+    pub near_m: f32,
+    pub far_m: f32,
+    pub priority: i32,
+    pub viewport: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightRecord {
+    pub enabled: bool,
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range_m: f32,
+    pub inner_radians: f32,
+    pub outer_radians: f32,
+    pub shadow: LightShadowSettings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbeRecord {
+    pub enabled: bool,
+    pub radius_m: f64,
+    pub intensity: f32,
+    pub priority: i32,
+    pub resolution: u32,
+}
+
+/// Authored mesh reference. A builtin is an engine mesh. `Asset` is an `AssetId`, not a path and not a [`crate::MeshId`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum MeshAssetRef {
+    NearTriangle,
+    FarTriangle,
+    Floor { width_m: f64, depth_m: f64 },
+    Cube { size_m: f64 },
+    Sphere { radius_m: f64, segments: u32, rings: u32, flat: bool },
+    EmissivePanel { width_m: f64, height_m: f64 },
+    /// A project mesh asset. The id is the reference. The name is a label.
+    Asset { id: crate::AssetId, name: String },
+}
+
+/// How a level names a material. Not a GPU instance and not PNG bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MaterialScheme {
+    /// `standard_white`, `bootstrap_near`, `bootstrap_far`.
+    #[default]
+    Builtin,
+    /// A staging set name such as `Tiles101`. Resolved from the material root, not from `jarvig.asset`.
+    Staged,
+    /// The mesh asset's own glTF material. The name is a label. The images stay with the asset.
+    Mesh,
+}
+
+/// Temporary material identity until AssetIds exist. Not a [`crate::MaterialInstanceId`].
+///
+/// Builtin `name` selects a texture set. Factors are the overrides. `scheme: jarvig.asset` stays
+/// rejected. `jarvig.material` is a set name the editor resolves. The level does not store pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialAssetRef {
+    pub scheme: MaterialScheme,
+    pub name: String,
+    pub base_color: [f32; 4],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 4],
+    pub uv_scale: f32,
+    pub normal_scale: f32,
+    /// Present when a staged set chose a normal file. Builtin materials leave this empty.
+    pub normal_convention: Option<crate::NormalConvention>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LevelError {
+    Syntax(String),
+    UnsupportedVersion(u32),
+    DuplicateUuid(String),
+    InvalidParent(String),
+    Cycle(String),
+    UnknownComponent(String),
+    MissingAsset(String),
+    MissingWorldSettings,
+    Corrupt(String),
+}
+
+impl fmt::Display for LevelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(text) | Self::Corrupt(text) | Self::UnknownComponent(text) | Self::MissingAsset(text) => write!(formatter, "{text}"),
+            Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_CAMERA_VERSION}"),
+            Self::DuplicateUuid(uuid) => write!(formatter, "duplicate entity uuid {uuid}"),
+            Self::InvalidParent(uuid) => write!(formatter, "parent uuid {uuid} is not in the level"),
+            Self::Cycle(uuid) => write!(formatter, "parent cycle includes {uuid}"),
+            Self::MissingWorldSettings => write!(formatter, "level has no World Settings entity"),
+        }
+    }
+}
+
+impl From<JsonError> for LevelError {
+    fn from(error: JsonError) -> Self {
+        Self::Syntax(error.0)
+    }
+}
+
+impl LevelDocument {
+    pub fn validate(&self) -> Result<(), LevelError> {
+        if self.format_version == 0 {
+            return Err(LevelError::Corrupt("level format version is missing".into()));
+        }
+        if self.format_version > LEVEL_CAMERA_VERSION {
+            return Err(LevelError::UnsupportedVersion(self.format_version));
+        }
+        if self.name.is_empty() || !self.level_uuid.is_persistent() {
+            return Err(LevelError::Corrupt("level name or uuid is invalid".into()));
+        }
+        let mut seen = HashSet::new();
+        let mut settings = 0u32;
+        for entity in &self.entities {
+            let text = entity.uuid.to_string();
+            if !entity.uuid.is_persistent() || !seen.insert(entity.uuid) {
+                return Err(LevelError::DuplicateUuid(text));
+            }
+            if entity.name.is_empty() {
+                return Err(LevelError::Corrupt(format!("entity {text} has no name")));
+            }
+            let mut kinds = HashSet::new();
+            for component in &entity.components {
+                let kind = component.kind_name();
+                if !kinds.insert(kind) {
+                    return Err(LevelError::Corrupt(format!("entity {text} repeats {kind}")));
+                }
+                if let ComponentRecord::WorldSettings = component {
+                    settings += 1;
+                    if entity.uuid != self.world_settings.entity {
+                        return Err(LevelError::Corrupt("World Settings entity does not match world_settings".into()));
+                    }
+                }
+                if let ComponentRecord::MeshRenderer { material, .. } = component {
+                    material.validate()?;
+                }
+                if let ComponentRecord::ReflectionProbe(probe) = component {
+                    if !crate::reflection_probe_resolution_supported(probe.resolution) {
+                        return Err(LevelError::Corrupt(format!("probe resolution {} is not 32, 64, 128, or 256", probe.resolution)));
+                    }
+                }
+            }
+            let has_transform = entity.components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. }));
+            let needs_transform = entity.components.iter().any(|component| {
+                matches!(
+                    component,
+                    ComponentRecord::MeshRenderer { .. }
+                        | ComponentRecord::DirectionalLight(_)
+                        | ComponentRecord::PointLight(_)
+                        | ComponentRecord::SpotLight(_)
+                        | ComponentRecord::ReflectionProbe(_)
+                        | ComponentRecord::Camera(_)
+                )
+            });
+            if needs_transform && !has_transform {
+                return Err(LevelError::Corrupt(format!("entity {text} has no transform")));
+            }
+            if self.format_version < LEVEL_CAMERA_VERSION && entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_))) {
+                return Err(LevelError::Corrupt(format!("entity {text} has a camera, which needs level format {LEVEL_CAMERA_VERSION}")));
+            }
+            if let Some(ComponentRecord::Camera(camera)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::Camera(_))) {
+                camera.validate()?;
+            }
+        }
+        if settings != 1 {
+            return Err(LevelError::MissingWorldSettings);
+        }
+        for entity in &self.entities {
+            if let Some(parent) = entity.parent_uuid {
+                if !seen.contains(&parent) {
+                    return Err(LevelError::InvalidParent(parent.to_string()));
+                }
+                if parent == entity.uuid {
+                    return Err(LevelError::Cycle(entity.uuid.to_string()));
+                }
+            }
+        }
+        for entity in &self.entities {
+            let mut cursor = entity.parent_uuid;
+            let mut guard = 0;
+            while let Some(parent) = cursor {
+                guard += 1;
+                if guard > self.entities.len() || parent == entity.uuid {
+                    return Err(LevelError::Cycle(entity.uuid.to_string()));
+                }
+                cursor = self.entities.iter().find(|item| item.uuid == parent).and_then(|item| item.parent_uuid);
+            }
+        }
+        self.world_settings.validate()?;
+        if let Some(camera) = self.world_settings.startup_camera {
+            if self.format_version < LEVEL_CAMERA_VERSION {
+                return Err(LevelError::Corrupt(format!("startup camera {camera} needs level format {LEVEL_CAMERA_VERSION}")));
+            }
+            let entity = self.entities.iter().find(|entity| entity.uuid == camera).ok_or_else(|| {
+                LevelError::Corrupt(format!("startup camera {camera} is not in the level"))
+            })?;
+            if !entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_))) {
+                return Err(LevelError::Corrupt(format!("startup camera {camera} has no Camera component")));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> String {
+        let entities = Json::array(self.entities.iter().map(EntityRecord::to_json).collect());
+        Json::object(vec![
+            ("schema", Json::string(LEVEL_SCHEMA)),
+            ("format_version", Json::int(self.format_version as i64)),
+            ("level_uuid", Json::string(self.level_uuid.to_string())),
+            ("name", Json::string(&self.name)),
+            ("world_settings", self.world_settings.to_json()),
+            ("entities", entities),
+        ])
+        .write()
+    }
+
+    /// Rebuild a session world. Runtime ids are new. UUIDs, names, parents, and payloads are not.
+    /// Material instances are not created here. The engine binds those when a material library exists.
+    pub fn instantiate(&self) -> Result<SceneWorld, LevelError> {
+        self.instantiate_with(&crate::MeshAssetLibrary::default())
+    }
+
+    /// Same as [`Self::instantiate`], resolving `scheme: jarvig.asset` from `assets`.
+    pub fn instantiate_with(&self, assets: &crate::MeshAssetLibrary) -> Result<SceneWorld, LevelError> {
+        self.validate()?;
+        let mut world = SceneWorld::new_session();
+        world.install_imported_meshes(assets);
+        let mut remaining: Vec<&EntityRecord> = self.entities.iter().collect();
+        let mut guard = remaining.len() + 1;
+        while !remaining.is_empty() {
+            guard -= 1;
+            if guard == 0 {
+                return Err(LevelError::Cycle("level entity order did not resolve".into()));
+            }
+            let ready = remaining.iter().position(|entity| match entity.parent_uuid {
+                None => true,
+                Some(parent) => world.entity_ownership(parent).is_ok(),
+            });
+            let Some(index) = ready else {
+                return Err(LevelError::InvalidParent("a parent was not created".into()));
+            };
+            let entity = remaining.remove(index);
+            spawn_entity(&mut world, entity, &self.world_settings)?;
+        }
+        world.set_saved_probe_policy(self.world_settings.probe_update_policy);
+        if let Some(camera) = self.world_settings.startup_camera {
+            world.set_startup_camera(Some(camera)).map_err(authoring)?;
+        }
+        Ok(world)
+    }
+
+    pub fn capture(world: &SceneWorld, level_uuid: EntityId, name: impl Into<String>) -> Result<Self, LevelError> {
+        let mut entities = Vec::new();
+        let mut settings = None;
+        for row in world.entity_outline() {
+            if world.entity_ownership(row.uuid).is_ok_and(|ownership| ownership.capabilities.payload_count() > 1) {
+                return Err(LevelError::Corrupt(format!("{} has more than one payload; level version 1 cannot store it", row.name)));
+            }
+            let parent = world.entity_parent(row.uuid).map_err(|error| LevelError::Corrupt(error.to_string()))?;
+            let mut components = Vec::new();
+            if let Some(record) = world.authored_world_settings(row.uuid) {
+                settings = Some(record);
+                components.push(ComponentRecord::WorldSettings);
+            } else if world.entity_ownership(row.uuid).is_ok_and(|ownership| ownership.capabilities.mesh_renderer) {
+                let Some((translation, rotation, scale, visible, cast_shadows, receive_shadows, mesh, material)) = world.authored_mesh(row.uuid) else {
+                    return Err(LevelError::MissingAsset(format!("{} has no builtin mesh or material reference", row.name)));
+                };
+                components.push(ComponentRecord::Transform { translation, rotation, scale });
+                components.push(ComponentRecord::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material });
+            } else if let Some((kind, light)) = world.authored_light(row.uuid) {
+                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                components.push(match kind {
+                    LightKind::Directional => ComponentRecord::DirectionalLight(light),
+                    LightKind::Point => ComponentRecord::PointLight(light),
+                    LightKind::Spot => ComponentRecord::SpotLight(light),
+                });
+            } else if let Some(probe) = world.authored_probe(row.uuid) {
+                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                components.push(ComponentRecord::ReflectionProbe(probe));
+            } else if let Some(camera) = world.authored_camera(row.uuid) {
+                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                components.push(ComponentRecord::Camera(camera));
+            } else if let Some((translation, rotation)) = world.authored_local_pose(row.uuid) {
+                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+            }
+            entities.push(EntityRecord { uuid: row.uuid, name: row.name, parent_uuid: parent, components });
+        }
+        let world_settings = settings.ok_or(LevelError::MissingWorldSettings)?;
+        let format_version = if entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_)))) {
+            LEVEL_CAMERA_VERSION
+        } else {
+            LEVEL_FORMAT_VERSION
+        };
+        let document = Self { format_version, level_uuid, name: name.into(), world_settings, entities };
+        document.validate()?;
+        Ok(document)
+    }
+}
+
+impl WorldSettingsRecord {
+    fn validate(&self) -> Result<(), LevelError> {
+        if !self.entity.is_persistent() || !self.intensity.is_finite() || self.intensity < 0.0 {
+            return Err(LevelError::Corrupt("world settings are not finite".into()));
+        }
+        if self.upper.iter().chain(self.lower.iter()).any(|channel| !channel.is_finite()) {
+            return Err(LevelError::Corrupt("world settings color is not finite".into()));
+        }
+        Ok(())
+    }
+
+    fn to_environment(&self) -> Result<EnvironmentLight, LevelError> {
+        EnvironmentLight {
+            upper_hemisphere_linear_rgb: self.upper,
+            lower_hemisphere_linear_rgb: self.lower,
+            intensity: self.intensity,
+            enabled: self.enabled,
+        }
+        .validate()
+        .map_err(|error| LevelError::Corrupt(error.to_string()))
+    }
+
+    fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("entity", Json::string(self.entity.to_string())),
+            ("enabled", Json::bool(self.enabled)),
+            ("intensity", Json::number(self.intensity as f64)),
+            ("upper", rgb_json(self.upper)),
+            ("lower", rgb_json(self.lower)),
+            ("probe_update_policy", Json::string(policy_name(self.probe_update_policy))),
+        ];
+        if let Some(camera) = self.startup_camera {
+            fields.push(("startup_camera", Json::string(camera.to_string())));
+        }
+        Json::object(fields)
+    }
+}
+
+impl MaterialAssetRef {
+    pub fn builtin(name: impl Into<String>, base_color: [f32; 4], metallic: f32, roughness: f32, emissive: [f32; 4]) -> Self {
+        Self {
+            scheme: MaterialScheme::Builtin,
+            name: name.into(),
+            base_color,
+            metallic,
+            roughness,
+            emissive,
+            uv_scale: 1.0,
+            normal_scale: 1.0,
+            normal_convention: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), LevelError> {
+        match self.scheme {
+            MaterialScheme::Builtin => match self.name.as_str() {
+                "standard_white" | "bootstrap_near" | "bootstrap_far" => {}
+                other => return Err(LevelError::MissingAsset(format!("unknown builtin material {other}"))),
+            },
+            MaterialScheme::Staged => {
+                if self.name.is_empty() || self.name.contains('/') || self.name.contains('\\') || self.name.contains('.') {
+                    return Err(LevelError::MissingAsset(format!("staged material {} is not a set name", self.name)));
+                }
+            }
+            MaterialScheme::Mesh => {
+                if self.name.is_empty() {
+                    return Err(LevelError::MissingAsset("imported material has no name".into()));
+                }
+            }
+        }
+        if !self.uv_scale.is_finite() || self.uv_scale <= 0.0 || !self.normal_scale.is_finite() || self.normal_scale < 0.0 {
+            return Err(LevelError::Corrupt("material scale is not usable".into()));
+        }
+        let finite = self.base_color.iter().chain(self.emissive.iter()).all(|channel| channel.is_finite())
+            && self.metallic.is_finite()
+            && self.roughness.is_finite();
+        if !finite {
+            return Err(LevelError::Corrupt("material factors are not finite".into()));
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("scheme", Json::string(match self.scheme {
+                MaterialScheme::Builtin => "jarvig.builtin",
+                MaterialScheme::Staged => "jarvig.material",
+                MaterialScheme::Mesh => "jarvig.mesh",
+            })),
+            ("name", Json::string(&self.name)),
+            ("base_color", float4_json(self.base_color)),
+            ("metallic", Json::number(self.metallic as f64)),
+            ("roughness", Json::number(self.roughness as f64)),
+            ("emissive", float4_json(self.emissive)),
+        ];
+        if self.scheme != MaterialScheme::Builtin || (self.uv_scale - 1.0).abs() > 1.0e-6 {
+            fields.push(("uv_scale", Json::number(self.uv_scale as f64)));
+        }
+        if self.scheme != MaterialScheme::Builtin || (self.normal_scale - 1.0).abs() > 1.0e-6 {
+            fields.push(("normal_scale", Json::number(self.normal_scale as f64)));
+        }
+        if let Some(convention) = self.normal_convention {
+            fields.push(("normal_convention", Json::string(convention.label())));
+        }
+        Json::object(fields)
+    }
+}
+
+impl MeshAssetRef {
+    pub fn instantiate(&self) -> crate::Mesh {
+        if let Self::Asset { id, name } = self {
+            panic!("mesh asset {name} ({id}) must be resolved from the project catalog");
+        }
+        match self.clone() {
+            Self::NearTriangle => near_triangle_mesh(),
+            Self::FarTriangle => far_triangle_mesh(),
+            Self::Floor { width_m, depth_m } => floor_mesh(width_m as f32, depth_m as f32),
+            Self::Cube { size_m } => cube_mesh(size_m as f32),
+            Self::Sphere { radius_m, segments, rings, flat: false } => sphere_mesh(radius_m as f32, segments, rings),
+            Self::Sphere { radius_m, segments, rings, flat: true } => flat_sphere_mesh(radius_m as f32, segments, rings),
+            Self::EmissivePanel { width_m, height_m } => emissive_panel_mesh(width_m as f32, height_m as f32),
+            Self::Asset { .. } => unreachable!("asset meshes are resolved before instantiate"),
+        }
+    }
+
+    pub fn materialize(&self, assets: &crate::MeshAssetLibrary) -> Result<crate::Mesh, LevelError> {
+        match self {
+            Self::Asset { id, name } => assets.get(*id).cloned().ok_or_else(|| LevelError::MissingAsset(format!("mesh asset {name} ({id}) is not loaded"))),
+            other => Ok(other.instantiate()),
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        if let Self::Asset { id, name } = self {
+            return Json::object(vec![
+                ("scheme", Json::string("jarvig.asset")),
+                ("id", Json::string(id.to_string())),
+                ("name", Json::string(name)),
+            ]);
+        }
+        match self.clone() {
+            Self::NearTriangle => builtin_mesh("near_triangle", vec![]),
+            Self::FarTriangle => builtin_mesh("far_triangle", vec![]),
+            Self::Floor { width_m, depth_m } => builtin_mesh("floor", vec![("width_m", Json::number(width_m)), ("depth_m", Json::number(depth_m))]),
+            Self::Cube { size_m } => builtin_mesh("cube", vec![("size_m", Json::number(size_m))]),
+            Self::Sphere { radius_m, segments, rings, flat } => builtin_mesh(
+                "sphere",
+                vec![
+                    ("shading", Json::string(if flat { "flat" } else { "smooth" })),
+                    ("radius_m", Json::number(radius_m)),
+                    ("segments", Json::int(segments as i64)),
+                    ("rings", Json::int(rings as i64)),
+                ],
+            ),
+            Self::EmissivePanel { width_m, height_m } => {
+                builtin_mesh("emissive_panel", vec![("width_m", Json::number(width_m)), ("height_m", Json::number(height_m))])
+            }
+            Self::Asset { .. } => unreachable!("asset meshes are written above"),
+        }
+    }
+}
+
+impl CameraRecord {
+    pub(crate) fn validate(&self) -> Result<(), LevelError> {
+        if !self.vertical_fov_deg.is_finite() || self.vertical_fov_deg <= 0.0 || self.vertical_fov_deg >= 180.0 {
+            return Err(LevelError::Corrupt("camera fov is not a finite angle below 180 degrees".into()));
+        }
+        if !self.ortho_height_m.is_finite() || self.ortho_height_m <= 0.0 || !self.near_m.is_finite() || self.near_m <= 0.0 {
+            return Err(LevelError::Corrupt("camera near plane or orthographic height is not positive".into()));
+        }
+        if self.orthographic && (!self.far_m.is_finite() || self.far_m <= self.near_m) {
+            return Err(LevelError::Corrupt("orthographic camera far plane must be beyond the near plane".into()));
+        }
+        if self.viewport.iter().any(|value| !value.is_finite()) || self.viewport[2] <= 0.0 || self.viewport[3] <= 0.0 {
+            return Err(LevelError::Corrupt("camera viewport is not a positive rectangle".into()));
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Json {
+        Json::object(vec![
+            ("type", Json::string("Camera")),
+            ("version", Json::int(1)),
+            ("enabled", Json::bool(self.enabled)),
+            ("projection", Json::string(if self.orthographic { "Orthographic" } else { "Perspective" })),
+            ("vertical_fov_deg", Json::number(self.vertical_fov_deg)),
+            ("ortho_height_m", Json::number(self.ortho_height_m)),
+            ("near_m", Json::number(self.near_m as f64)),
+            ("far_m", Json::number(self.far_m as f64)),
+            ("priority", Json::int(self.priority as i64)),
+            ("viewport", Json::array(self.viewport.iter().copied().map(|value| Json::number(value as f64)).collect())),
+        ])
+    }
+}
+
+impl ComponentRecord {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Transform { .. } => "Transform",
+            Self::MeshRenderer { .. } => "MeshRenderer",
+            Self::DirectionalLight(_) => "DirectionalLight",
+            Self::PointLight(_) => "PointLight",
+            Self::SpotLight(_) => "SpotLight",
+            Self::ReflectionProbe(_) => "ReflectionProbe",
+            Self::Camera(_) => "Camera",
+            Self::WorldSettings => "WorldSettings",
+        }
+    }
+}
+
+impl EntityRecord {
+    fn to_json(&self) -> Json {
+        let parent = match self.parent_uuid {
+            Some(parent) => Json::string(parent.to_string()),
+            None => Json::Null,
+        };
+        Json::object(vec![
+            ("uuid", Json::string(self.uuid.to_string())),
+            ("name", Json::string(&self.name)),
+            ("parent_uuid", parent),
+            ("components", Json::array(self.components.iter().map(ComponentRecord::to_json).collect())),
+        ])
+    }
+}
+
+impl ComponentRecord {
+    fn to_json(&self) -> Json {
+        match self {
+            Self::Transform { translation, rotation, scale } => Json::object(vec![
+                ("type", Json::string("Transform")),
+                ("version", Json::int(1)),
+                ("translation", vec3_json(*translation)),
+                ("rotation", quat_json(*rotation)),
+                ("scale", vec3_json(*scale)),
+            ]),
+            Self::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material } => Json::object(vec![
+                ("type", Json::string("MeshRenderer")),
+                ("version", Json::int(1)),
+                ("visible", Json::bool(*visible)),
+                ("cast_shadows", Json::bool(*cast_shadows)),
+                ("receive_shadows", Json::bool(*receive_shadows)),
+                ("mesh", mesh.to_json()),
+                ("material", material.to_json()),
+            ]),
+            Self::DirectionalLight(light) => light.to_json("DirectionalLight"),
+            Self::PointLight(light) => light.to_json("PointLight"),
+            Self::SpotLight(light) => light.to_json("SpotLight"),
+            Self::ReflectionProbe(probe) => Json::object(vec![
+                ("type", Json::string("ReflectionProbe")),
+                ("version", Json::int(1)),
+                ("enabled", Json::bool(probe.enabled)),
+                ("radius_m", Json::number(probe.radius_m)),
+                ("intensity", Json::number(probe.intensity as f64)),
+                ("priority", Json::int(probe.priority as i64)),
+                ("resolution", Json::int(probe.resolution as i64)),
+            ]),
+            Self::Camera(camera) => camera.to_json(),
+            Self::WorldSettings => Json::object(vec![("type", Json::string("WorldSettings")), ("version", Json::int(1))]),
+        }
+    }
+}
+
+impl LightRecord {
+    fn to_json(&self, kind: &str) -> Json {
+        Json::object(vec![
+            ("type", Json::string(kind)),
+            ("version", Json::int(1)),
+            ("enabled", Json::bool(self.enabled)),
+            ("color", rgb_json(self.color)),
+            ("intensity", Json::number(self.intensity as f64)),
+            ("range_m", Json::number(self.range_m as f64)),
+            ("inner_radians", Json::number(self.inner_radians as f64)),
+            ("outer_radians", Json::number(self.outer_radians as f64)),
+            ("cast_shadows", Json::bool(self.shadow.cast)),
+            ("shadow_resolution", Json::int(self.shadow.resolution as i64)),
+            ("depth_bias_m", Json::number(self.shadow.depth_bias_m as f64)),
+            ("slope_bias_m", Json::number(self.shadow.slope_bias_m as f64)),
+            ("normal_bias_m", Json::number(self.shadow.normal_bias_m as f64)),
+            ("filter_radius", Json::number(self.shadow.filter_radius as f64)),
+            ("shadow_distance_m", Json::number(self.shadow.distance_m as f64)),
+            ("cascade_count", Json::int(self.shadow.cascade_count as i64)),
+            ("cascade_distribution", Json::number(self.shadow.cascade_distribution as f64)),
+        ])
+    }
+}
+
+pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
+    let json = parse_json(text)?;
+    let schema = required_str(&json, "schema")?;
+    if schema != LEVEL_SCHEMA {
+        return Err(LevelError::Corrupt(format!("schema {schema} is not {LEVEL_SCHEMA}")));
+    }
+    let format_version = required_u32(&json, "format_version")?;
+    if format_version > LEVEL_CAMERA_VERSION {
+        return Err(LevelError::UnsupportedVersion(format_version));
+    }
+    let level_uuid = parse_uuid(required_str(&json, "level_uuid")?)?;
+    let name = required_str(&json, "name")?.to_string();
+    let world_settings = parse_world_settings(json.get("world_settings").ok_or_else(|| LevelError::Corrupt("world_settings is missing".into()))?)?;
+    let entities_json = json.get("entities").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("entities is missing".into()))?;
+    let mut entities = Vec::new();
+    for entity in entities_json {
+        entities.push(parse_entity(entity)?);
+    }
+    let document = LevelDocument { format_version, level_uuid, name, world_settings, entities };
+    document.validate()?;
+    Ok(document)
+}
+
+fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settings: &WorldSettingsRecord) -> Result<(), LevelError> {
+    let transform = entity.components.iter().find_map(|component| match component {
+        ComponentRecord::Transform { translation, rotation, scale } => Some((*translation, *rotation, *scale)),
+        _ => None,
+    });
+    if entity.components.iter().any(|component| matches!(component, ComponentRecord::WorldSettings)) {
+        let environment = settings.to_environment()?;
+        world.spawn_saved_world_settings(entity.uuid, &entity.name, environment).map_err(authoring)?;
+        return Ok(());
+    }
+    let Some((translation, rotation, scale)) = transform else {
+        return Err(LevelError::Corrupt(format!("{} has no component payload", entity.name)));
+    };
+    let pose = HighPrecisionPose { translation, rotation };
+    for component in &entity.components {
+        match component {
+            ComponentRecord::Transform { .. } | ComponentRecord::WorldSettings => {}
+            ComponentRecord::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material } => {
+                world
+                    .spawn_saved_mesh(
+                        entity.uuid,
+                        &entity.name,
+                        entity.parent_uuid,
+                        pose,
+                        scale,
+                        *visible,
+                        *cast_shadows,
+                        *receive_shadows,
+                        mesh.clone(),
+                        material.clone(),
+                    )
+                    .map_err(authoring)?;
+            }
+            ComponentRecord::DirectionalLight(light) => spawn_light(world, entity, pose, LightKind::Directional, light)?,
+            ComponentRecord::PointLight(light) => spawn_light(world, entity, pose, LightKind::Point, light)?,
+            ComponentRecord::SpotLight(light) => spawn_light(world, entity, pose, LightKind::Spot, light)?,
+            ComponentRecord::ReflectionProbe(probe) => {
+                world.spawn_saved_probe(entity.uuid, &entity.name, entity.parent_uuid, pose, probe.clone()).map_err(authoring)?;
+            }
+            ComponentRecord::Camera(camera) => {
+                world.spawn_saved_camera(entity.uuid, &entity.name, entity.parent_uuid, pose, camera.clone()).map_err(authoring)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn spawn_light(world: &mut SceneWorld, entity: &EntityRecord, pose: HighPrecisionPose, kind: LightKind, light: &LightRecord) -> Result<(), LevelError> {
+    world.spawn_saved_light(entity.uuid, &entity.name, entity.parent_uuid, pose, kind, light.clone()).map_err(authoring)
+}
+
+fn authoring(error: AuthoringError) -> LevelError {
+    LevelError::Corrupt(error.to_string())
+}
+
+fn parse_entity(json: &Json) -> Result<EntityRecord, LevelError> {
+    let uuid = parse_uuid(required_str(json, "uuid")?)?;
+    let name = required_str(json, "name")?.to_string();
+    let parent_uuid = match json.get("parent_uuid") {
+        Some(Json::Null) | None => None,
+        Some(Json::String(text)) => Some(parse_uuid(text)?),
+        _ => return Err(LevelError::Corrupt("parent_uuid is not a string or null".into())),
+    };
+    let components_json = json.get("components").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("components is missing".into()))?;
+    let mut components = Vec::new();
+    for component in components_json {
+        components.push(parse_component(component)?);
+    }
+    Ok(EntityRecord { uuid, name, parent_uuid, components })
+}
+
+fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
+    let kind = required_str(json, "type")?;
+    let version = required_u32(json, "version")?;
+    if version != 1 {
+        return Err(LevelError::UnsupportedVersion(version));
+    }
+    match kind {
+        "Transform" => Ok(ComponentRecord::Transform {
+            translation: required_vec3(json, "translation")?,
+            rotation: required_quat(json, "rotation")?,
+            scale: required_vec3(json, "scale")?,
+        }),
+        "MeshRenderer" => Ok(ComponentRecord::MeshRenderer {
+            visible: required_bool(json, "visible")?,
+            cast_shadows: optional_bool(json, "cast_shadows", true)?,
+            receive_shadows: optional_bool(json, "receive_shadows", true)?,
+            mesh: parse_mesh(json.get("mesh").ok_or_else(|| LevelError::MissingAsset("mesh reference is missing".into()))?)?,
+            material: parse_material(json.get("material").ok_or_else(|| LevelError::MissingAsset("material reference is missing".into()))?)?,
+        }),
+        "DirectionalLight" => Ok(ComponentRecord::DirectionalLight(parse_light(json)?)),
+        "PointLight" => Ok(ComponentRecord::PointLight(parse_light(json)?)),
+        "SpotLight" => Ok(ComponentRecord::SpotLight(parse_light(json)?)),
+        "ReflectionProbe" => Ok(ComponentRecord::ReflectionProbe(ProbeRecord {
+            enabled: required_bool(json, "enabled")?,
+            radius_m: required_f64(json, "radius_m")?,
+            intensity: required_f32(json, "intensity")?,
+            priority: required_i32(json, "priority")?,
+            resolution: required_u32(json, "resolution")?,
+        })),
+        "Camera" => Ok(ComponentRecord::Camera(CameraRecord {
+            enabled: required_bool(json, "enabled")?,
+            orthographic: match required_str(json, "projection")? {
+                "Perspective" => false,
+                "Orthographic" => true,
+                other => return Err(LevelError::Corrupt(format!("camera projection {other} is not Perspective or Orthographic"))),
+            },
+            vertical_fov_deg: required_f64(json, "vertical_fov_deg")?,
+            ortho_height_m: required_f64(json, "ortho_height_m")?,
+            near_m: required_f32(json, "near_m")?,
+            far_m: required_f32(json, "far_m")?,
+            priority: required_i32(json, "priority")?,
+            viewport: required_viewport(json)?,
+        })),
+        "WorldSettings" => Ok(ComponentRecord::WorldSettings),
+        other => Err(LevelError::UnknownComponent(format!("unknown component {other}"))),
+    }
+}
+
+fn parse_world_settings(json: &Json) -> Result<WorldSettingsRecord, LevelError> {
+    Ok(WorldSettingsRecord {
+        entity: parse_uuid(required_str(json, "entity")?)?,
+        enabled: required_bool(json, "enabled")?,
+        intensity: required_f32(json, "intensity")?,
+        upper: required_rgb(json, "upper")?,
+        lower: required_rgb(json, "lower")?,
+        probe_update_policy: parse_policy(required_str(json, "probe_update_policy")?)?,
+        startup_camera: match optional_str(json, "startup_camera")? {
+            Some(text) => Some(parse_uuid(text)?),
+            None => None,
+        },
+    })
+}
+
+fn parse_light(json: &Json) -> Result<LightRecord, LevelError> {
+    let defaults = LightShadowSettings::default();
+    let shadow = LightShadowSettings {
+        cast: optional_bool(json, "cast_shadows", defaults.cast)?,
+        resolution: optional_u32(json, "shadow_resolution", defaults.resolution)?,
+        depth_bias_m: optional_f32(json, "depth_bias_m", defaults.depth_bias_m)?,
+        slope_bias_m: optional_f32(json, "slope_bias_m", defaults.slope_bias_m)?,
+        normal_bias_m: optional_f32(json, "normal_bias_m", defaults.normal_bias_m)?,
+        filter_radius: optional_f32(json, "filter_radius", defaults.filter_radius)?,
+        distance_m: optional_f32(json, "shadow_distance_m", defaults.distance_m)?,
+        cascade_count: optional_u32(json, "cascade_count", defaults.cascade_count)?,
+        cascade_distribution: optional_f32(json, "cascade_distribution", defaults.cascade_distribution)?,
+    };
+    shadow.finite().map_err(|error| LevelError::Corrupt(error.to_string()))?;
+    Ok(LightRecord {
+        enabled: required_bool(json, "enabled")?,
+        color: required_rgb(json, "color")?,
+        intensity: required_f32(json, "intensity")?,
+        range_m: required_f32(json, "range_m")?,
+        inner_radians: required_f32(json, "inner_radians")?,
+        outer_radians: required_f32(json, "outer_radians")?,
+        shadow,
+    })
+}
+
+fn parse_mesh(json: &Json) -> Result<MeshAssetRef, LevelError> {
+    let scheme = required_str(json, "scheme")?;
+    if scheme == "jarvig.asset" {
+        let id = crate::AssetId::parse(required_str(json, "id")?).ok_or_else(|| LevelError::MissingAsset("mesh asset id is not a UUID".into()))?;
+        let name = required_str(json, "name")?.to_string();
+        if name.is_empty() {
+            return Err(LevelError::MissingAsset("mesh asset has no name".into()));
+        }
+        return Ok(MeshAssetRef::Asset { id, name });
+    }
+    if scheme != "jarvig.builtin" {
+        return Err(LevelError::MissingAsset(format!("mesh scheme {scheme} is not resolvable yet")));
+    }
+    match required_str(json, "name")? {
+        "near_triangle" => Ok(MeshAssetRef::NearTriangle),
+        "far_triangle" => Ok(MeshAssetRef::FarTriangle),
+        "floor" => Ok(MeshAssetRef::Floor { width_m: required_f64(json, "width_m")?, depth_m: required_f64(json, "depth_m")? }),
+        "cube" => Ok(MeshAssetRef::Cube { size_m: required_f64(json, "size_m")? }),
+        "sphere" => {
+            let shading = required_str(json, "shading")?;
+            let flat = match shading {
+                "flat" => true,
+                "smooth" => false,
+                other => return Err(LevelError::MissingAsset(format!("unknown sphere shading {other}"))),
+            };
+            Ok(MeshAssetRef::Sphere {
+                radius_m: required_f64(json, "radius_m")?,
+                segments: required_u32(json, "segments")?,
+                rings: required_u32(json, "rings")?,
+                flat,
+            })
+        }
+        "emissive_panel" => Ok(MeshAssetRef::EmissivePanel { width_m: required_f64(json, "width_m")?, height_m: required_f64(json, "height_m")? }),
+        other => Err(LevelError::MissingAsset(format!("unknown builtin mesh {other}"))),
+    }
+}
+
+fn parse_material(json: &Json) -> Result<MaterialAssetRef, LevelError> {
+    let scheme = match required_str(json, "scheme")? {
+        "jarvig.builtin" => MaterialScheme::Builtin,
+        "jarvig.material" => MaterialScheme::Staged,
+        "jarvig.mesh" => MaterialScheme::Mesh,
+        other => return Err(LevelError::MissingAsset(format!("material scheme {other} is not resolvable yet"))),
+    };
+    let convention = match optional_str(json, "normal_convention")? {
+        Some(text) => Some(crate::NormalConvention::parse(text).ok_or_else(|| LevelError::Corrupt(format!("unknown normal convention {text}")))?),
+        None => None,
+    };
+    let material = MaterialAssetRef {
+        scheme,
+        name: required_str(json, "name")?.to_string(),
+        base_color: required_float4(json, "base_color")?,
+        metallic: required_f32(json, "metallic")?,
+        roughness: required_f32(json, "roughness")?,
+        emissive: required_float4(json, "emissive")?,
+        uv_scale: optional_f32(json, "uv_scale", 1.0)?,
+        normal_scale: optional_f32(json, "normal_scale", 1.0)?,
+        normal_convention: convention,
+    };
+    material.validate()?;
+    Ok(material)
+}
+
+fn parse_policy(text: &str) -> Result<ProbeUpdatePolicy, LevelError> {
+    Ok(match text {
+        "static" => ProbeUpdatePolicy::Static,
+        "on-demand" => ProbeUpdatePolicy::OnDemand,
+        "on-transform" => ProbeUpdatePolicy::OnTransformChange,
+        "on-lighting" => ProbeUpdatePolicy::OnLightingChange,
+        "time-sliced" => ProbeUpdatePolicy::TimeSliced,
+        other => return Err(LevelError::Corrupt(format!("unknown probe policy {other}"))),
+    })
+}
+
+fn policy_name(policy: ProbeUpdatePolicy) -> &'static str {
+    match policy {
+        ProbeUpdatePolicy::Static => "static",
+        ProbeUpdatePolicy::OnDemand => "on-demand",
+        ProbeUpdatePolicy::OnTransformChange => "on-transform",
+        ProbeUpdatePolicy::OnLightingChange => "on-lighting",
+        ProbeUpdatePolicy::TimeSliced => "time-sliced",
+    }
+}
+
+fn parse_uuid(text: &str) -> Result<EntityId, LevelError> {
+    EntityId::parse(text).ok_or_else(|| LevelError::Corrupt(format!("invalid uuid {text}")))
+}
+
+fn required_str<'a>(json: &'a Json, key: &str) -> Result<&'a str, LevelError> {
+    json.get(key).and_then(Json::as_str).ok_or_else(|| LevelError::Corrupt(format!("{key} is missing")))
+}
+
+fn optional_str<'a>(json: &'a Json, key: &str) -> Result<Option<&'a str>, LevelError> {
+    match json.get(key) {
+        None => Ok(None),
+        Some(_) => required_str(json, key).map(Some),
+    }
+}
+
+fn required_bool(json: &Json, key: &str) -> Result<bool, LevelError> {
+    json.get(key).and_then(Json::as_bool).ok_or_else(|| LevelError::Corrupt(format!("{key} is missing")))
+}
+
+fn optional_bool(json: &Json, key: &str, default: bool) -> Result<bool, LevelError> {
+    match json.get(key) {
+        None => Ok(default),
+        Some(_) => required_bool(json, key),
+    }
+}
+
+fn optional_f32(json: &Json, key: &str, default: f32) -> Result<f32, LevelError> {
+    match json.get(key) {
+        None => Ok(default),
+        Some(_) => required_f32(json, key),
+    }
+}
+
+fn optional_u32(json: &Json, key: &str, default: u32) -> Result<u32, LevelError> {
+    match json.get(key) {
+        None => Ok(default),
+        Some(_) => required_u32(json, key),
+    }
+}
+
+fn required_f64(json: &Json, key: &str) -> Result<f64, LevelError> {
+    json.get(key).and_then(Json::as_f64).ok_or_else(|| LevelError::Corrupt(format!("{key} is missing")))
+}
+
+fn required_f32(json: &Json, key: &str) -> Result<f32, LevelError> {
+    Ok(required_f64(json, key)? as f32)
+}
+
+fn required_u32(json: &Json, key: &str) -> Result<u32, LevelError> {
+    let value = required_f64(json, key)?;
+    if value.fract() != 0.0 || !(0.0..u32::MAX as f64).contains(&value) {
+        return Err(LevelError::Corrupt(format!("{key} is not an integer")));
+    }
+    Ok(value as u32)
+}
+
+fn required_i32(json: &Json, key: &str) -> Result<i32, LevelError> {
+    let value = required_f64(json, key)?;
+    if value.fract() != 0.0 || !(i32::MIN as f64..=i32::MAX as f64).contains(&value) {
+        return Err(LevelError::Corrupt(format!("{key} is not an integer")));
+    }
+    Ok(value as i32)
+}
+
+fn required_viewport(json: &Json) -> Result<[f32; 4], LevelError> {
+    let values = required_floats(json, "viewport", 4)?;
+    Ok([values[0] as f32, values[1] as f32, values[2] as f32, values[3] as f32])
+}
+
+fn required_vec3(json: &Json, key: &str) -> Result<Vec3, LevelError> {
+    let values = required_floats(json, key, 3)?;
+    Ok(Vec3::new(values[0], values[1], values[2]))
+}
+
+fn required_quat(json: &Json, key: &str) -> Result<Quat, LevelError> {
+    let values = required_floats(json, key, 4)?;
+    Ok(Quat { x: values[0], y: values[1], z: values[2], w: values[3] })
+}
+
+fn required_rgb(json: &Json, key: &str) -> Result<[f32; 3], LevelError> {
+    let values = required_floats(json, key, 3)?;
+    Ok([values[0] as f32, values[1] as f32, values[2] as f32])
+}
+
+fn required_float4(json: &Json, key: &str) -> Result<[f32; 4], LevelError> {
+    let values = required_floats(json, key, 4)?;
+    Ok([values[0] as f32, values[1] as f32, values[2] as f32, values[3] as f32])
+}
+
+fn required_floats(json: &Json, key: &str, count: usize) -> Result<Vec<f64>, LevelError> {
+    let values = json.get(key).and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt(format!("{key} is missing")))?;
+    if values.len() != count {
+        return Err(LevelError::Corrupt(format!("{key} has the wrong width")));
+    }
+    values.iter().map(|value| value.as_f64().ok_or_else(|| LevelError::Corrupt(format!("{key} is not a number")))).collect()
+}
+
+fn vec3_json(value: Vec3) -> Json {
+    Json::array(vec![Json::number(value.x), Json::number(value.y), Json::number(value.z)])
+}
+
+fn quat_json(value: Quat) -> Json {
+    Json::array(vec![Json::number(value.x), Json::number(value.y), Json::number(value.z), Json::number(value.w)])
+}
+
+fn rgb_json(value: [f32; 3]) -> Json {
+    Json::array(vec![Json::number(value[0] as f64), Json::number(value[1] as f64), Json::number(value[2] as f64)])
+}
+
+fn float4_json(value: [f32; 4]) -> Json {
+    Json::array(value.iter().copied().map(|channel| Json::number(channel as f64)).collect())
+}
+
+fn builtin_mesh(name: &str, extra: Vec<(&str, Json)>) -> Json {
+    let mut fields = vec![("scheme", Json::string("jarvig.builtin")), ("name", Json::string(name))];
+    fields.extend(extra);
+    Json::object(fields)
+}
+
+fn uuid(text: &str) -> EntityId {
+    EntityId::parse(text).expect("stable level uuid")
+}
+
+fn transform(x: f64, y: f64, z: f64) -> ComponentRecord {
+    ComponentRecord::Transform { translation: Vec3::new(x, y, z), rotation: Quat::IDENTITY, scale: Vec3::new(1.0, 1.0, 1.0) }
+}
+
+fn solid(name: &str, color: [f32; 4], metallic: f32, roughness: f32, emissive: [f32; 4]) -> MaterialAssetRef {
+    MaterialAssetRef::builtin(name, color, metallic, roughness, emissive)
+}
+
+fn mesh_entity(id: &str, name: &str, pose: ComponentRecord, mesh: MeshAssetRef, material: MaterialAssetRef) -> EntityRecord {
+    EntityRecord {
+        uuid: uuid(id),
+        name: name.into(),
+        parent_uuid: None,
+        components: vec![pose, ComponentRecord::MeshRenderer { visible: true, cast_shadows: true, receive_shadows: true, mesh, material }],
+    }
+}
+
+/// The permanent lighting and material validation level. Builtin references, not GPU ids.
+pub fn lighting_lab_level() -> LevelDocument {
+    let settings_id = uuid("11111111-1111-4111-8111-111111111111");
+    let spot_aim = crate::rotation_emitting_toward(Vec3::new(-0.15, -1.15, -1.9)).expect("spot aim");
+    let (probe_x, probe_y, probe_z) = BOOTSTRAP_PROBE_LOCAL_M;
+    let white = [1.0, 1.0, 1.0, 1.0];
+    let none = [0.0, 0.0, 0.0, 0.0];
+    LevelDocument {
+        format_version: LEVEL_FORMAT_VERSION,
+        level_uuid: uuid(LIGHTING_LAB_LEVEL_UUID),
+        name: "Lighting Lab".into(),
+        world_settings: WorldSettingsRecord {
+            entity: settings_id,
+            enabled: true,
+            intensity: BOOTSTRAP_ENVIRONMENT_INTENSITY,
+            upper: BOOTSTRAP_UPPER_HEMISPHERE_LINEAR,
+            lower: BOOTSTRAP_LOWER_HEMISPHERE_LINEAR,
+            probe_update_policy: ProbeUpdatePolicy::Static,
+            startup_camera: None,
+        },
+        entities: vec![
+            EntityRecord {
+                uuid: settings_id,
+                name: "World Settings".into(),
+                parent_uuid: None,
+                components: vec![ComponentRecord::WorldSettings],
+            },
+            mesh_entity(
+                "22222222-2222-4222-8222-222222222222",
+                "Near Triangle",
+                transform(0.0, 0.0, -2.0),
+                MeshAssetRef::NearTriangle,
+                solid("bootstrap_near", white, 0.0, 0.85, none),
+            ),
+            mesh_entity(
+                "33333333-3333-4333-8333-333333333333",
+                "Far Triangle",
+                transform(0.0, 0.0, -5.0),
+                MeshAssetRef::FarTriangle,
+                solid("bootstrap_far", white, 1.0, 0.2, [0.35, 0.12, 0.02, 0.0]),
+            ),
+            EntityRecord {
+                uuid: uuid("44444444-4444-4444-8444-444444444444"),
+                name: "Directional Light".into(),
+                parent_uuid: None,
+                components: vec![
+                    transform(0.0, 0.0, 0.0),
+                    ComponentRecord::DirectionalLight(LightRecord {
+                        enabled: true,
+                        color: [1.0, 0.96, 0.90],
+                        intensity: 0.35,
+                        range_m: 0.0,
+                        inner_radians: 0.0,
+                        outer_radians: 0.0,
+                        shadow: LightShadowSettings::default(),
+                    }),
+                ],
+            },
+            EntityRecord {
+                uuid: uuid("55555555-5555-4555-8555-555555555555"),
+                name: "Blue Point Light".into(),
+                parent_uuid: None,
+                components: vec![
+                    transform(1.25, 0.7, -0.8),
+                    ComponentRecord::PointLight(LightRecord {
+                        enabled: true,
+                        color: [0.30, 0.48, 1.0],
+                        intensity: 14.0,
+                        range_m: 0.0,
+                        inner_radians: 0.0,
+                        outer_radians: 0.0,
+                        shadow: LightShadowSettings::default(),
+                    }),
+                ],
+            },
+            EntityRecord {
+                uuid: uuid("66666666-6666-4666-8666-666666666666"),
+                name: "Warm Spot Light".into(),
+                parent_uuid: None,
+                components: vec![
+                    ComponentRecord::Transform { translation: Vec3::new(0.15, 1.35, -3.1), rotation: spot_aim, scale: Vec3::new(1.0, 1.0, 1.0) },
+                    ComponentRecord::SpotLight(LightRecord {
+                        enabled: true,
+                        color: [1.0, 0.40, 0.12],
+                        intensity: 22.0,
+                        range_m: 0.0,
+                        inner_radians: 0.20,
+                        outer_radians: 0.75,
+                        shadow: LightShadowSettings::default(),
+                    }),
+                ],
+            },
+            EntityRecord {
+                uuid: uuid("77777777-7777-4777-8777-777777777777"),
+                name: "Reflection Probe".into(),
+                parent_uuid: None,
+                components: vec![
+                    transform(probe_x, probe_y, probe_z),
+                    ComponentRecord::ReflectionProbe(ProbeRecord {
+                        enabled: true,
+                        radius_m: BOOTSTRAP_PROBE_RADIUS_M,
+                        intensity: BOOTSTRAP_PROBE_INTENSITY,
+                        priority: BOOTSTRAP_PROBE_PRIORITY,
+                        resolution: 64,
+                    }),
+                ],
+            },
+            mesh_entity(
+                "88888888-8888-4888-8888-888888888888",
+                "Floor",
+                transform(0.0, -1.15, -4.0),
+                MeshAssetRef::Floor { width_m: 6.0, depth_m: 6.0 },
+                solid("standard_white", [0.62, 0.62, 0.60, 1.0], 0.0, 0.92, none),
+            ),
+            mesh_entity(
+                "99999999-9999-4999-8999-999999999999",
+                "White Cube",
+                transform(-1.55, -0.65, -4.2),
+                MeshAssetRef::Cube { size_m: 1.0 },
+                solid("standard_white", [0.82, 0.82, 0.80, 1.0], 0.0, 0.78, none),
+            ),
+            mesh_entity(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "Metal Sphere",
+                transform(1.25, -0.65, -3.7),
+                MeshAssetRef::Sphere { radius_m: 0.5, segments: 32, rings: 24, flat: false },
+                solid("standard_white", [0.92, 0.92, 0.94, 1.0], 1.0, 0.045, none),
+            ),
+            mesh_entity(
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "Flat Sphere",
+                transform(0.35, -0.83, -5.15),
+                MeshAssetRef::Sphere { radius_m: 0.32, segments: 32, rings: 24, flat: true },
+                solid("standard_white", [0.92, 0.92, 0.94, 1.0], 1.0, 0.045, none),
+            ),
+            mesh_entity(
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "Emissive Panel",
+                transform(2.35, -0.2, -4.0),
+                MeshAssetRef::EmissivePanel { width_m: 1.4, height_m: 0.9 },
+                solid("standard_white", [0.02, 0.02, 0.02, 1.0], 0.0, 0.5, [8.0, 0.15, 0.08, 1.0]),
+            ),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip_text(document: &LevelDocument) -> LevelDocument {
+        parse_level(&document.to_json()).expect("level json")
+    }
+
+    #[test]
+    fn lighting_lab_round_trips_without_runtime_ids() {
+        let document = lighting_lab_level();
+        document.validate().unwrap();
+        let text = document.to_json();
+        for forbidden in ["ObjectId", "EntityHandle", "LightId", "ProbeId", "MeshId", "MaterialInstanceId", "FrameId", "RenderInstanceId", "wgpu"] {
+            assert!(!text.contains(forbidden), "{forbidden} leaked into the level");
+        }
+        let parsed = round_trip_text(&document);
+        let world = parsed.instantiate().unwrap();
+        let captured = LevelDocument::capture(&world, parsed.level_uuid, parsed.name.clone()).unwrap();
+        assert_eq!(captured.to_json(), parsed.to_json());
+        assert_eq!(world.entity_count(), 12);
+        assert_eq!(world.object_count(), 7);
+        assert_eq!(world.light_count(), 3);
+        let cube = uuid("99999999-9999-4999-8999-999999999999");
+        let (translation, _, scale, visible, cast_shadows, receive_shadows, mesh, material) = world.authored_mesh(cube).unwrap();
+        assert!((translation.x + 1.55).abs() < 1.0e-9);
+        assert_eq!(scale, Vec3::new(1.0, 1.0, 1.0));
+        assert!(visible && cast_shadows && receive_shadows);
+        assert_eq!(mesh, MeshAssetRef::Cube { size_m: 1.0 });
+        assert!((material.roughness - 0.78).abs() < 1.0e-6);
+        assert!(world.entity_parent(cube).unwrap().is_none());
+        let flat = world.authored_mesh(uuid("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")).unwrap();
+        assert!(matches!(flat.6, MeshAssetRef::Sphere { flat: true, .. }));
+        let smooth = world.authored_mesh(uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")).unwrap();
+        assert!(matches!(smooth.6, MeshAssetRef::Sphere { flat: false, .. }));
+    }
+
+    #[test]
+    fn bad_levels_do_not_instantiate() {
+        let mut document = lighting_lab_level();
+        document.entities.push(document.entities[1].clone());
+        assert!(matches!(document.validate(), Err(LevelError::DuplicateUuid(_))));
+        document = lighting_lab_level();
+        document.entities[1].parent_uuid = Some(uuid("12345678-1234-4234-8234-123456789abc"));
+        assert!(matches!(document.validate(), Err(LevelError::InvalidParent(_))));
+        document = lighting_lab_level();
+        document.entities[1].parent_uuid = Some(document.entities[2].uuid);
+        document.entities[2].parent_uuid = Some(document.entities[1].uuid);
+        assert!(matches!(document.validate(), Err(LevelError::Cycle(_))));
+        document = lighting_lab_level();
+        document.format_version = 3;
+        assert!(matches!(document.validate(), Err(LevelError::UnsupportedVersion(3))));
+        let mut text = lighting_lab_level().to_json();
+        text.truncate(24);
+        assert!(matches!(parse_level(&text), Err(LevelError::Syntax(_))));
+        text = lighting_lab_level().to_json().replace("\"Near Triangle\"", "\"Near Triangle\"").replace("near_triangle", "imported_hero");
+        assert!(matches!(parse_level(&text), Err(LevelError::MissingAsset(_))));
+        text = lighting_lab_level().to_json().replace("\"MeshRenderer\"", "\"Nanite\"");
+        assert!(matches!(parse_level(&text), Err(LevelError::UnknownComponent(_))));
+        text = lighting_lab_level().to_json().replace("\"jarvig.builtin\"", "\"jarvig.asset\"");
+        assert!(matches!(parse_level(&text), Err(LevelError::MissingAsset(_))));
+    }
+}

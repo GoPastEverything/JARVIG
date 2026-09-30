@@ -1,0 +1,28 @@
+{
+  "style": {
+    "transparent_background": true,
+    "primary": "#D8E5F2",
+    "accent": "#4AB4FF",
+    "muted": "#7F93A8",
+    "svg_viewbox": "96x96",
+    "png_size": "128x128"
+  },
+  "assets": [
+    "select_cursor",
+    "translate",
+    "rotate",
+    "scale",
+    "play",
+    "pause",
+    "stop",
+    "camera_fly",
+    "pan",
+    "orbit",
+    "focus_selected",
+    "frame_all",
+    "grid_snap",
+    "local_world",
+    "speed",
+    "maximize_viewport"
+  ]
+}

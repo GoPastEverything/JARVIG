@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../engine/assets" },
+    { "path": "../../engine/core" },
+    { "path": "../../packages/node-host" },
+    { "path": "../../engine/world" }
+  ]
+}

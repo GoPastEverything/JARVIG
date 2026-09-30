@@ -1,0 +1,18 @@
+[package]
+name = "jarvig_editor_host"
+version = "0.0.1"
+edition = "2021"
+description = "Transitional native JARVIG host. Presents one engine clear. Not the editor UI."
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "jarvig_editor_host"
+path = "src/main.rs"
+
+[dependencies]
+jarvig_engine = { path = "../jarvig_engine" }
+jarvig_platform = { path = "../jarvig_platform" }
+jarvig_renderer = { path = "../jarvig_renderer" }
+jarvig_rhi = { path = "../jarvig_rhi" }
+jarvig_rhi_wgpu = { path = "../jarvig_rhi_wgpu" }

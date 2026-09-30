@@ -1,0 +1,4 @@
+projects
+C:\JARVIG\samples/lighting-lab/LightingLab.jarvigproject
+levels
+C:\JARVIG\samples/lighting-lab\Content/Levels/LightingLab.jarviglevel

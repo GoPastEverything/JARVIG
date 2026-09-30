@@ -1,0 +1,8 @@
+packages:
+  - "engine/*"
+  - "editor/*"
+  - "apps/*"
+  - "hosts/*"
+  - "tools/*"
+  - "packages/*"
+  - "samples/*"
