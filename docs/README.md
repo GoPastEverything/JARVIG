@@ -12,6 +12,8 @@
 6. Notes and session reports
 7. Chat or model suggestions
 
+A public document can describe private/local research without making that implementation part of the public source tree. See [Research disclosure boundary](legal/RESEARCH_DISCLOSURE_BOUNDARY.md).
+
 ## Map
 
 | Area | Start here |
@@ -30,7 +32,7 @@
 | Scripting and plugins | [scripting/overview.md](scripting/overview.md), [plugins/overview.md](plugins/overview.md) |
 | Build, profile, test | [build/overview.md](build/overview.md), [profiling/overview.md](profiling/overview.md), [testing/overview.md](testing/overview.md) |
 | Hosts | [hub/overview.md](hub/overview.md), [editor/overview.md](editor/overview.md), [cli/overview.md](cli/overview.md) |
-| Legal | [legal/THIRD_PARTY.md](legal/THIRD_PARTY.md) |
+| Legal | [legal/THIRD_PARTY.md](legal/THIRD_PARTY.md), [legal/RESEARCH_DISCLOSURE_BOUNDARY.md](legal/RESEARCH_DISCLOSURE_BOUNDARY.md) |
 | Decisions | [adr/README.md](adr/README.md) |
 | Research proposals | [rfc/README.md](rfc/README.md), [research/README.md](research/README.md) |
 | Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
