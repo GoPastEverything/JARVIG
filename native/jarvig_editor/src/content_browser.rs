@@ -117,6 +117,8 @@ pub fn drop_caption(asset: &RegistryAsset, over_viewport: bool) -> String {
     }
     match asset.kind.as_str() {
         "Model" => format!("{}  + Create Mesh Actor", asset.name),
+        "Prefab" => format!("{}  + Place Prefab", asset.name),
+        "Character" => format!("{}  open in Character Editor, not spawned", asset.name),
         "Level" => format!("{}  open level, not spawned", asset.name),
         "Source" | "Config" | "Shader" => format!("{}  does not enter the world", asset.name),
         "Material" => format!("{}  assign is not wired in this slice", asset.name),
@@ -126,5 +128,5 @@ pub fn drop_caption(asset: &RegistryAsset, over_viewport: bool) -> String {
 }
 
 pub fn drop_places_actor(asset: &RegistryAsset, over_viewport: bool) -> bool {
-    over_viewport && asset.kind == "Model"
+    over_viewport && (asset.kind == "Model" || asset.kind == "Prefab")
 }

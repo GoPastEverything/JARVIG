@@ -1,13 +1,15 @@
-//! Procedural detail module.
+//! Public detail module.
 //!
-//! `linked_detail(false)` is disabled. `linked_detail(true)` is the flat
-//! reference marker from `detail_provider`.
+//! This file is the release-candidate stand-in. It does not implement a private
+//! surface rule. `linked_detail(false)` is disabled. `linked_detail(true)` is the
+//! flat reference marker from `detail_provider`.
 
 use crate::detail_provider::{public_detail, DisabledDetail, ProceduralMicrogeometry, ReferenceDetail};
 
 pub const PROCEDURAL_MICROGEOMETRY_DEFAULT: bool = false;
 pub const DETAIL_ERROR_THRESHOLD_PX: f32 = 1.0;
 pub const DETAIL_FEATURE_SIZE_M: f32 = 0.02;
+pub const EINSTEIN_DEBUG_UV_SCALE: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetailQuery {
@@ -25,7 +27,7 @@ impl DetailQuery {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailRule {
-    Flat,
+    EinsteinHat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,11 +64,15 @@ pub fn projected_detail_px(feature_size_m: f32, depth_m: f32, viewport_height: f
     feature_size_m * (viewport_height.max(1.0) * 0.5) / (depth * tan_half)
 }
 
+pub fn einstein_debug_color(_sample: &DetailSample) -> [f32; 3] {
+    [0.5, 0.5, 0.5]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DetailProbe {
     pub samples: u32,
     pub ordinary: u32,
-    pub fine: u32,
+    pub einstein: u32,
     pub generation_us: u32,
     pub fingerprint: u64,
 }
@@ -80,7 +86,7 @@ pub fn probe_detail(uvs: &[[f32; 2]], seed: u64, projected_error_px: f32, enable
             DetailDecision::Fine(_) => fine = fine.saturating_add(1),
         }
     }
-    DetailProbe { samples: uvs.len() as u32, ordinary, fine, generation_us: 0, fingerprint: seed ^ u64::from(ordinary) ^ u64::from(fine) }
+    DetailProbe { samples: uvs.len() as u32, ordinary, einstein: fine, generation_us: 0, fingerprint: seed ^ u64::from(ordinary) ^ u64::from(fine) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +123,10 @@ pub struct LocalPatch {
     pub triangle_count: u8,
 }
 
+pub fn einstein_local_patch(_sample: &DetailSample) -> LocalPatch {
+    LocalPatch { positions: [[0.0; 3]; 9], triangles: [[0, 0, 0]; 8], triangle_count: 0 }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MicroSpan {
     pub vertex_start: u32,
@@ -149,10 +159,11 @@ pub fn group_micro_spans(mesh: &MicroMesh, _max_vertex_bytes: usize) -> Vec<Micr
     vec![MicroSpan { vertex_start: 0, vertex_count: mesh.vertex_count, index_start: 0, index_count: mesh.indices.len() as u32 }]
 }
 
+/// Names kept so the current editor source still typechecks. Neither variant selects a private rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailProvider {
-    Disabled,
-    Reference,
+    EinsteinHat,
+    EinsteinSurface,
 }
 
 pub fn surface_level(projected_px: f32) -> u32 {
@@ -182,10 +193,18 @@ pub fn build_procedural_microtriangles_cancellable(
     cancel: &dyn Fn() -> bool,
 ) -> Result<MicroMesh, String> {
     let detail: Box<dyn ProceduralMicrogeometry> = match provider {
-        DetailProvider::Disabled => Box::new(DisabledDetail),
-        DetailProvider::Reference => Box::new(ReferenceDetail),
+        DetailProvider::EinsteinHat => Box::new(DisabledDetail),
+        DetailProvider::EinsteinSurface => Box::new(ReferenceDetail),
     };
     detail.build(anchors, seed, enabled, viewport_height, tan_half_fov, cancel)
+}
+
+pub fn build_einstein_microtriangles(anchors: &[SurfaceAnchor], seed: u64, enabled: bool, viewport_height: f32, tan_half_fov: f32, budget: &MicroBudget) -> MicroMesh {
+    build_procedural_microtriangles(anchors, seed, enabled, viewport_height, tan_half_fov, budget, DetailProvider::EinsteinHat)
+}
+
+pub fn einstein_hat_sample(seed: u64, uv: [f32; 2]) -> DetailSample {
+    zero_sample(seed, uv)
 }
 
 pub fn linked_detail(surface: bool) -> Box<dyn ProceduralMicrogeometry> {
@@ -193,7 +212,7 @@ pub fn linked_detail(surface: bool) -> Box<dyn ProceduralMicrogeometry> {
 }
 
 fn zero_sample(_seed: u64, _uv: [f32; 2]) -> DetailSample {
-    DetailSample { rule: DetailRule::Flat, feature: 0, local: [0.0, 0.0], offset: [0.0, 0.0] }
+    DetailSample { rule: DetailRule::EinsteinHat, feature: 0, local: [0.0, 0.0], offset: [0.0, 0.0] }
 }
 
 fn blank(seed: u64) -> MicroMesh {

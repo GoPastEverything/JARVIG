@@ -849,4 +849,268 @@ mod tests {
         assert!(playing.entity_outline().iter().any(|row| row.name == "townshop"));
         assert!(playing.entity_outline().iter().any(|row| row.name == "Metal Sphere"));
     }
+
+    /// Local Sketchfab map. Not a character, and not part of the default suite.
+    #[test]
+    #[ignore = "imports the local Ghost City glb into samples/ghost-city and does not touch Lighting Lab"]
+    fn ghost_city_glb_imports_without_defining_a_joint() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/ghost-city/third-party/source/BLD_Ghost_city.glb");
+        assert!(source.is_file(), "missing {}", source.display());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/ghost-city");
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/lighting-lab/Content/Levels/LightingLab.jarviglevel");
+        let lab_before = fs::read(&lab).expect("lighting lab");
+        let (library, id) = import_mesh_into_project(&root, "Content", "Intermediate", &source).expect("ghost city import");
+        assert_eq!(fs::read(&lab).unwrap(), lab_before, "import rewrote Lighting Lab");
+        let record = library.record(id).expect("record");
+        assert!(record.triangle_count > 10_000 && record.triangle_count < 200_000, "triangles {}", record.triangle_count);
+        assert!(record.submesh_count >= 1, "submeshes {}", record.submesh_count);
+        let surface = library.imported_surface(id);
+        let decoded = surface.is_some_and(|surface| surface.base_color.is_some() || surface.normal.is_some() || surface.orm.is_some());
+        let base_color = surface.map(|surface| surface.base_color_factor).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let metallic = surface.map(|surface| surface.metallic).unwrap_or(1.0);
+        let roughness = surface.map(|surface| surface.roughness).unwrap_or(1.0);
+        let normal_scale = surface.map(|surface| surface.normal_scale).unwrap_or(1.0);
+        let mut world = SceneWorld::new_session();
+        world.install_imported_meshes(&library);
+        let settings = crate::EntityId::parse("22222222-2222-4222-8222-2222222222ff").unwrap();
+        world.spawn_saved_world_settings(settings, "World Settings", EnvironmentLight::bootstrap()).unwrap();
+        let material = MaterialAssetRef {
+            scheme: crate::MaterialScheme::Mesh,
+            name: "Imported".into(),
+            base_color,
+            metallic,
+            roughness,
+            emissive: [0.0, 0.0, 0.0, 0.0],
+            uv_scale: 1.0,
+            normal_scale,
+            normal_convention: Some(crate::NormalConvention::DirectXNegativeY),
+        };
+        world.place_imported_mesh(id, &record.name, material).unwrap();
+        let level_id = crate::EntityId::parse("22222222-2222-4222-8222-2222222222ee").unwrap();
+        let level = LevelDocument::capture(&world, level_id, "Ghost City").unwrap();
+        assert_eq!(level.format_version, crate::LEVEL_FORMAT_VERSION);
+        assert!(!level.to_json().contains("\"Joint\""));
+        let level_path = root.join("Content/Levels/GhostCity.jarviglevel");
+        fs::create_dir_all(level_path.parent().unwrap()).unwrap();
+        fs::write(&level_path, level.to_json()).unwrap();
+        fs::create_dir_all(root.join("Config")).unwrap();
+        fs::write(
+            root.join("GhostCity.jarvigproject"),
+            "{\n  \"schema\": \"jarvig.project\",\n  \"format_version\": 1,\n  \"project_uuid\": \"22222222-2222-4222-8222-2222222222dd\",\n  \"display_name\": \"Ghost City\",\n  \"engine_version\": \"0.0.1\",\n  \"startup_level\": \"Content/Levels/GhostCity.jarviglevel\",\n  \"content_directory\": \"Content\",\n  \"saved_directory\": \"Saved\",\n  \"config_directory\": \"Config\",\n  \"intermediate_directory\": \"Intermediate\",\n  \"settings\": \"Config/Project.jarvigsettings\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Config/Project.jarvigsettings"),
+            "{\n  \"schema\": \"jarvig.settings\",\n  \"format_version\": 1,\n  \"default_player_controller\": \"JARVIG.PlayerController\",\n  \"default_pawn\": \"JARVIG.DefaultFreeFlyPawn\",\n  \"default_mapping_context\": \"JARVIG.Default\",\n  \"startup_camera\": \"pawn\"\n}\n",
+        )
+        .unwrap();
+        eprintln!("GHOST_CITY triangles={} submeshes={} decoded_image={}", record.triangle_count, record.submesh_count, decoded);
+    }
+
+    /// Local default bodies. One standing rigid copy each, then a character document.
+    #[test]
+    #[ignore = "imports the local Base and Base Male source glb files into samples/base-characters and does not touch Lighting Lab"]
+    fn base_characters_import_as_bind_pose_meshes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/base-characters");
+        let source_dir = root.join("third-party/source");
+        let base_file = source_dir.join("Base.source.glb");
+        let male_file = source_dir.join("Base Male.source.glb");
+        assert!(base_file.is_file(), "missing {}", base_file.display());
+        assert!(male_file.is_file(), "missing {}", male_file.display());
+        let base_assembly = crate::assemble_rigid_bind_pose(&fs::read(&base_file).unwrap()).expect("base assembly");
+        let male_assembly = crate::assemble_rigid_bind_pose(&fs::read(&male_file).unwrap()).expect("male assembly");
+        assert_bind_body(&base_assembly, 66, 158_224, 409_188, 70, 1.0e-6);
+        assert_bind_body(&male_assembly, 66, 150_752, 312_596, 52, 0.08);
+        assert!(base_assembly.parts.iter().all(|part| part.source_parent == "RootNode"));
+        assert!(male_assembly.parts.iter().all(|part| part.source_parent == "RootNode"));
+        assert!(male_assembly.parts.iter().any(|part| part.name == "upperArmMesh.002"));
+        assert!(male_assembly.parts.iter().any(|part| part.name == "shoulderMesh.002"));
+        assert!(male_assembly.outliers.iter().any(|part| part.name == "foreArmMesh.002"));
+        assert!(!male_assembly.parts.iter().any(|part| part.name == "foreArmMesh.002"));
+        assert!(mirror_gap(&male_assembly, "upperArmMesh.001", "upperArmMesh.002") <= 0.03);
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/lighting-lab/Content/Levels/LightingLab.jarviglevel");
+        let lab_before = fs::read(&lab).expect("lighting lab");
+        let _ = fs::remove_dir_all(root.join("Content"));
+        let _ = fs::remove_dir_all(root.join("Intermediate"));
+        let parts_dir = root.join("third-party/parts");
+        let _ = fs::remove_dir_all(&parts_dir);
+        fs::create_dir_all(&parts_dir).unwrap();
+        let (_base_library, base_assets) = import_bind_parts(&root, &parts_dir, "Base", &base_assembly);
+        let (library, male_assets) = import_bind_parts(&root, &parts_dir, "BaseMale", &male_assembly);
+        assert_eq!(fs::read(&lab).unwrap(), lab_before, "import rewrote Lighting Lab");
+        assert_eq!(library.record(base_assets[0]).is_some(), true);
+        let base_uuid = crate::EntityId::parse("33333333-3333-4333-8333-333333333310").unwrap();
+        let male_uuid = crate::EntityId::parse("33333333-3333-4333-8333-333333333320").unwrap();
+        let base_build = crate::character_from_bind_pose("Base", base_uuid, 0x10, &base_assembly, &base_assets).expect("base character");
+        let male_build = crate::character_from_bind_pose("Base Male", male_uuid, 0x20, &male_assembly, &male_assets).expect("male character");
+        assert_eq!(crate::parse_character(&base_build.document.to_json()).unwrap(), base_build.document);
+        assert_eq!(crate::parse_character(&male_build.document.to_json()).unwrap(), male_build.document);
+        let base_origin = viewing_origin(&base_assembly, -0.175);
+        let male_origin = viewing_origin(&male_assembly, 0.175);
+        assert_eq!(base_origin.y, 0.0);
+        assert_eq!(male_origin.y, 0.0);
+        let mut world = SceneWorld::new_session();
+        world.install_imported_meshes(&library);
+        let settings = crate::EntityId::parse("33333333-3333-4333-8333-3333333333ff").unwrap();
+        world.spawn_saved_world_settings(settings, "World Settings", EnvironmentLight::bootstrap()).unwrap();
+        base_build.document.instantiate_preserving_ids(&mut world, base_origin).unwrap();
+        male_build.document.instantiate_preserving_ids(&mut world, male_origin).unwrap();
+        assert_placed_pose(&world, &base_build.document, &base_assembly, base_origin);
+        assert_placed_pose(&world, &male_build.document, &male_assembly, male_origin);
+        let level_id = crate::EntityId::parse("33333333-3333-4333-8333-3333333333ee").unwrap();
+        let level = LevelDocument::capture(&world, level_id, "Base Characters").unwrap();
+        assert_eq!(level.format_version, crate::LEVEL_JOINT_VERSION);
+        let json = level.to_json();
+        assert!(json.contains("\"Joint\""));
+        assert!(json.contains("upperArmMesh.002"));
+        assert!(!json.contains("foreArmMesh.002"));
+        assert!(!json.to_ascii_lowercase().contains("c:\\tmp"));
+        assert!(!json.to_ascii_lowercase().contains(".fbx"));
+        assert_eq!(json.matches("\"cast_shadows\": true").count(), 132);
+        assert_eq!(json.matches("\"kind\": \"Fixed\"").count(), 2);
+        assert_eq!(json.matches("\"kind\": \"Ball\"").count(), 130);
+        let level_path = root.join("Content/Levels/Base.jarviglevel");
+        fs::create_dir_all(level_path.parent().unwrap()).unwrap();
+        fs::write(&level_path, &json).unwrap();
+        let characters = root.join("Content/Characters");
+        fs::create_dir_all(&characters).unwrap();
+        fs::write(characters.join("Base.jarvigcharacter"), base_build.document.to_json()).unwrap();
+        fs::write(characters.join("Base Male.jarvigcharacter"), male_build.document.to_json()).unwrap();
+        let mut report = String::new();
+        report.push_str(&base_build.report);
+        report.push_str(&format!("\nviewing_offset_m: one rigid root translation t=({:.6}, 0, {:.6}). Part deltas match the source. The character file stays in source space.\n\n", base_origin.x, base_origin.z));
+        report.push_str(&male_build.report);
+        report.push_str(&format!("\nviewing_offset_m: one rigid root translation t=({:.6}, 0, {:.6}). Part deltas match the source. The character file stays in source space.\n", male_origin.x, male_origin.z));
+        fs::write(root.join("bind-pose-report.txt"), &report).unwrap();
+        fs::create_dir_all(root.join("Config")).unwrap();
+        fs::create_dir_all(root.join("Saved/Editor")).unwrap();
+        fs::write(
+            root.join("BaseCharacters.jarvigproject"),
+            "{\n  \"schema\": \"jarvig.project\",\n  \"format_version\": 1,\n  \"project_uuid\": \"33333333-3333-4333-8333-3333333333dd\",\n  \"display_name\": \"Base Characters\",\n  \"engine_version\": \"0.0.1\",\n  \"startup_level\": \"Content/Levels/Base.jarviglevel\",\n  \"content_directory\": \"Content\",\n  \"saved_directory\": \"Saved\",\n  \"config_directory\": \"Config\",\n  \"intermediate_directory\": \"Intermediate\",\n  \"settings\": \"Config/Project.jarvigsettings\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Config/Project.jarvigsettings"),
+            "{\n  \"schema\": \"jarvig.settings\",\n  \"format_version\": 1,\n  \"default_player_controller\": \"JARVIG.PlayerController\",\n  \"default_pawn\": \"JARVIG.DefaultFreeFlyPawn\",\n  \"default_mapping_context\": \"JARVIG.Default\",\n  \"startup_camera\": \"pawn\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Saved/Editor/viewport.json"),
+            format!(
+                "{{\n  \"schema\": \"jarvig.editor-viewport\",\n  \"format_version\": 1,\n  \"position\": [{}, 0.95, 4.6],\n  \"yaw\": 0,\n  \"pitch\": -0.08,\n  \"speed_m_s\": 2\n}}\n",
+                crate::BOOTSTRAP_ROOT_M
+            ),
+        )
+        .unwrap();
+        eprintln!(
+            "BASE_CHARACTERS base_parts={} base_triangles=158224 male_parts={} male_triangles=150752 feet_base={} feet_male={} symmetry_male={}",
+            base_assembly.parts.len(),
+            male_assembly.parts.len(),
+            base_assembly.feet_y,
+            male_assembly.feet_y,
+            male_assembly.symmetry_max_m
+        );
+    }
+
+    fn assert_bind_body(assembly: &crate::BindPoseAssembly, parts: usize, triangles: u32, outline: u32, outliers: usize, symmetry_max: f64) {
+        assert_eq!(assembly.parts.len(), parts);
+        assert_eq!(assembly.outliers.len(), outliers);
+        assert_eq!(assembly.parts.iter().map(|part| part.triangles).sum::<u32>(), triangles);
+        assert_eq!(assembly.outline_triangles, outline);
+        assert!(assembly.feet_y.abs() < 0.02, "feet {}", assembly.feet_y);
+        assert!((1.40..2.05).contains(&assembly.height_m), "height {}", assembly.height_m);
+        let ratio = (assembly.pelvis_y - assembly.feet_y) / assembly.height_m;
+        assert!((0.45..0.70).contains(&ratio), "pelvis ratio {ratio}");
+        assert!(assembly.symmetry_max_m <= symmetry_max, "symmetry {}", assembly.symmetry_max_m);
+        assert!(assembly.parts.iter().all(|part| !part.outlier && part.neighbor_gap_m <= 0.021), "a kept part is farther than 0.02 m from its neighbor");
+        for part in &assembly.parts {
+            for axis in 0..3 {
+                let socket = part.socket_world[axis] as f32;
+                let low = part.bounds_min[axis] - 0.08;
+                let high = part.bounds_max[axis] + 0.08;
+                assert!(
+                    socket >= low && socket <= high,
+                    "{} axis {axis} socket {socket} bounds {}..{}",
+                    part.name, part.bounds_min[axis], part.bounds_max[axis]
+                );
+            }
+        }
+        assert!(assembly.parts.iter().all(|part| part.triangles <= crate::SHADOW_CASTER_TRIANGLE_LIMIT));
+        assert!(assembly.pelvis_name.to_ascii_lowercase().contains("hip"));
+    }
+
+    fn mirror_gap(assembly: &crate::BindPoseAssembly, left: &str, right: &str) -> f64 {
+        let left = assembly.parts.iter().find(|part| part.name == left).unwrap();
+        let right = assembly.parts.iter().find(|part| part.name == right).unwrap();
+        let left_center = part_center(left);
+        let right_center = part_center(right);
+        let low = assembly.parts.iter().map(|part| part.bounds_min[0]).fold(f32::MAX, f32::min);
+        let high = assembly.parts.iter().map(|part| part.bounds_max[0]).fold(f32::MIN, f32::max);
+        let mid = (low + high) as f64 * 0.5;
+        let target = [mid * 2.0 - left_center[0], left_center[1], left_center[2]];
+        let delta = [right_center[0] - target[0], right_center[1] - target[1], right_center[2] - target[2]];
+        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
+    }
+
+    fn part_center(part: &crate::BindPart) -> [f64; 3] {
+        [
+            (part.bounds_min[0] + part.bounds_max[0]) as f64 * 0.5,
+            (part.bounds_min[1] + part.bounds_max[1]) as f64 * 0.5,
+            (part.bounds_min[2] + part.bounds_max[2]) as f64 * 0.5,
+        ]
+    }
+
+    fn viewing_origin(assembly: &crate::BindPoseAssembly, edge_x: f64) -> crate::Vec3 {
+        let low_x = assembly.parts.iter().map(|part| part.bounds_min[0]).fold(f32::MAX, f32::min) as f64;
+        let high_x = assembly.parts.iter().map(|part| part.bounds_max[0]).fold(f32::MIN, f32::max) as f64;
+        let low_z = assembly.parts.iter().map(|part| part.bounds_min[2]).fold(f32::MAX, f32::min) as f64;
+        let high_z = assembly.parts.iter().map(|part| part.bounds_max[2]).fold(f32::MIN, f32::max) as f64;
+        let shift_x = if edge_x < 0.0 { edge_x - high_x } else { edge_x - low_x };
+        crate::Vec3::new(shift_x, 0.0, -((low_z + high_z) * 0.5))
+    }
+
+    fn import_bind_parts(root: &PathBuf, parts_dir: &PathBuf, prefix: &str, assembly: &crate::BindPoseAssembly) -> (MeshAssetLibrary, Vec<AssetId>) {
+        let mut library = None;
+        let mut assets = Vec::new();
+        for (index, part) in assembly.parts.iter().enumerate() {
+            let mut clean = String::new();
+            for ch in part.name.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+                    clean.push(ch);
+                } else {
+                    clean.push('_');
+                }
+            }
+            let path = parts_dir.join(format!("{prefix}__{index:02}_{clean}.glb"));
+            let bytes = crate::rigid_part_glb(&part.positions, &part.normals, &part.uvs, &part.indices, assembly.base_color, assembly.metallic, assembly.roughness);
+            fs::write(&path, bytes).unwrap();
+            let (loaded, id) = import_mesh_into_project(root, "Content", "Intermediate", &path).expect("part import");
+            assert_eq!(loaded.record(id).unwrap().triangle_count, part.triangles, "{}", part.name);
+            assets.push(id);
+            library = Some(loaded);
+        }
+        (library.expect("parts"), assets)
+    }
+
+    fn assert_placed_pose(world: &SceneWorld, document: &crate::CharacterDocument, assembly: &crate::BindPoseAssembly, origin: crate::Vec3) {
+        for part in &assembly.parts {
+            let entity = document
+                .entities
+                .iter()
+                .find(|entity| entity.name == part.name || (part.name == assembly.pelvis_name && entity.parent_uuid.is_none()))
+                .unwrap_or_else(|| panic!("missing {}", part.name));
+            let pose = world.entity_world_pose(entity.uuid).unwrap();
+            let dx = pose.translation.x - crate::BOOTSTRAP_ROOT_M - origin.x - part.socket_world[0];
+            let dy = pose.translation.y - origin.y - part.socket_world[1];
+            let dz = pose.translation.z - origin.z - part.socket_world[2];
+            assert!(dx.abs().max(dy.abs()).max(dz.abs()) < 1.0e-4, "{} pose delta {dx} {dy} {dz}", part.name);
+            let source = crate::Quat { x: part.world.rotation[0], y: part.world.rotation[1], z: part.world.rotation[2], w: part.world.rotation[3] };
+            let dot = (pose.rotation.x * source.x + pose.rotation.y * source.y + pose.rotation.z * source.z + pose.rotation.w * source.w).abs();
+            assert!(dot > 1.0 - 1.0e-5, "{} rotation {dot}", part.name);
+            let (_, _, scale, _, _, _, _, _) = world.authored_mesh(entity.uuid).unwrap();
+            assert!((scale.x - part.local.scale[0]).abs() < 1.0e-6, "{} scale", part.name);
+            assert!((scale.y - part.local.scale[1]).abs() < 1.0e-6);
+            assert!((scale.z - part.local.scale[2]).abs() < 1.0e-6);
+        }
+    }
 }

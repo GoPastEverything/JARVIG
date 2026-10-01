@@ -1170,10 +1170,15 @@ impl Device for WgpuDevice {
         if source.is_empty() {
             return Err(RhiError::Validation("shader source is empty".into()));
         }
+        self.shared.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.shared.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: desc.label.as_deref(),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
         });
+        if let Some(error) = pollster::block_on(self.shared.device.pop_error_scope()) {
+            drop(module);
+            return Err(RhiError::Validation(error.to_string()));
+        }
         let handle = lock(&self.shared.shaders)?.insert(module, desc.label.clone(), 0);
         Ok(ShaderModuleId(handle))
     }
@@ -1826,6 +1831,41 @@ impl WgpuDevice {
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, RhiError> {
     mutex.lock().map_err(|_| RhiError::DeviceLost)
+}
+
+fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Declaration order drops the device and the surface before `current`.
+        // wgpu then panics in SurfaceTexture::drop: the surface id is already gone.
+        // That panic aborts a Win32 window procedure. Release the image first.
+        self.device.poll(wgpu::Maintain::Wait);
+        drop(guard(&self.pending).take());
+        let groups = std::mem::take(&mut *guard(&self.groups));
+        let pipelines = std::mem::take(&mut *guard(&self.pipelines));
+        let views = std::mem::take(&mut *guard(&self.views));
+        let samplers = std::mem::take(&mut *guard(&self.samplers));
+        let buffers = std::mem::take(&mut *guard(&self.buffers));
+        let textures = std::mem::take(&mut *guard(&self.textures));
+        let shaders = std::mem::take(&mut *guard(&self.shaders));
+        let layouts = std::mem::take(&mut *guard(&self.layouts));
+        drop(groups);
+        drop(pipelines);
+        drop(views);
+        drop(samplers);
+        drop(buffers);
+        drop(textures);
+        drop(shaders);
+        drop(layouts);
+        let _ = guard(&self.frame_view).take();
+        drop(guard(&self.current).take());
+    }
 }
 
 // The instance trait is not used for window attach. Keep a named backend for logs.

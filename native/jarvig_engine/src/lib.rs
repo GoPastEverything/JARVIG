@@ -49,6 +49,8 @@ pub struct EngineSession {
     staged: std::collections::HashMap<String, StagedMaterialTextures>,
     imported: std::collections::HashMap<jarvig_core::AssetId, StagedMaterialTextures>,
     mesh_assets: jarvig_core::MeshAssetLibrary,
+    /// Standard master from the bootstrap scene. Empty worlds have no mesh to rediscover it.
+    standard_master: Option<jarvig_material::MasterMaterialId>,
 }
 
 #[derive(Clone, Copy)]
@@ -75,7 +77,7 @@ impl EngineSession {
         } else {
             (MaterialLibrary::new(), TextureLibrary::new(), None, None, None)
         };
-        Ok(Self {
+        let mut session = Self {
             runtime: Runtime::new(profile, 60.0, 8)?,
             world,
             materials,
@@ -94,7 +96,14 @@ impl EngineSession {
             staged: std::collections::HashMap::new(),
             imported: std::collections::HashMap::new(),
             mesh_assets: jarvig_core::MeshAssetLibrary::default(),
-        })
+            standard_master: None,
+        };
+        if profile.renders() {
+            if let Ok(master) = session.current_material_master() {
+                session.standard_master = Some(master);
+            }
+        }
+        Ok(session)
     }
 
     pub fn mesh_asset_library(&self) -> &jarvig_core::MeshAssetLibrary {
@@ -165,6 +174,13 @@ impl EngineSession {
             self.bind_object_materials(entity, &material, master)?;
         }
         Ok(entity)
+    }
+
+    /// Place a `.jarvigprefab`. New uuids. The file stays on disk.
+    pub fn instantiate_prefab_file(&mut self, path: &std::path::Path, origin: jarvig_core::Vec3) -> Result<Vec<jarvig_core::EntityId>, String> {
+        let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let prefab = jarvig_core::parse_prefab(&text).map_err(|error| error.to_string())?;
+        prefab.instantiate(self.world_mut(), origin).map_err(|error| error.to_string())
     }
 
     fn imported_placement_material(&self, id: jarvig_core::AssetId) -> jarvig_core::MaterialAssetRef {
@@ -272,9 +288,28 @@ impl EngineSession {
     }
 
     fn current_material_master(&self) -> Result<jarvig_material::MasterMaterialId, String> {
-        let object = self.world.objects().next().ok_or("no mesh is available to find the standard material")?;
-        let instance = self.world.material_instance(object, 0).ok_or("bootstrap material is not bound")?;
-        self.materials.master_of(instance).map_err(|error| error.to_string())
+        if let Some(object) = self.world.objects().next() {
+            if let Some(instance) = self.world.material_instance(object, 0) {
+                if let Ok(master) = self.materials.master_of(instance) {
+                    return Ok(master);
+                }
+            }
+        }
+        self.standard_master.clone().ok_or_else(|| "no mesh is available to find the standard material".to_string())
+    }
+
+    /// Binds chunk meshes that have an authored material and no instance yet.
+    fn bind_new_chunk_materials(&mut self, master: jarvig_material::MasterMaterialId) -> Result<(), String> {
+        let objects = self.world.terrain_chunk_objects();
+        for object in objects {
+            if self.world.material_instance(object, 0).is_some() {
+                continue;
+            }
+            let entity = self.world.entity(object).map_err(|error| error.to_string())?;
+            let Some((_, _, _, _, _, _, _, material)) = self.world.authored_mesh(entity) else { continue };
+            self.bind_object(object, &material, master)?;
+        }
+        Ok(())
     }
 
     fn bind_level_materials(&mut self, world: &mut SceneWorld, master: jarvig_material::MasterMaterialId) -> Result<(), String> {

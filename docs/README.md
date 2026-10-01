@@ -26,6 +26,7 @@
 | Materials | [materials/overview.md](materials/overview.md) |
 | Assets | [assets/asset-system.md](assets/asset-system.md) |
 | Simulation | [physics/overview.md](physics/overview.md), [animation/overview.md](animation/overview.md), [ai/overview.md](ai/overview.md), [audio/overview.md](audio/overview.md) |
+| Terrain | [terrain/foundation.md](terrain/foundation.md), [adr/ADR-0058-terrain-is-a-local-heightfield.md](adr/ADR-0058-terrain-is-a-local-heightfield.md) |
 | Networking | [networking/overview.md](networking/overview.md) |
 | Scripting and plugins | [scripting/overview.md](scripting/overview.md), [plugins/overview.md](plugins/overview.md) |
 | Build, profile, test | [build/overview.md](build/overview.md), [profiling/overview.md](profiling/overview.md), [testing/overview.md](testing/overview.md) |

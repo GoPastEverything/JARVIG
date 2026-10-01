@@ -200,6 +200,9 @@ pub enum ToolbarCommand {
     Translate,
     Rotate,
     Scale,
+    Level,
+    Land,
+    Character,
     Play,
     Pause,
     Stop,
@@ -213,9 +216,21 @@ pub enum ToolbarCommand {
     Maximize,
 }
 
+/// Which editor workspace is showing. Not a second world.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkspaceMode {
+    Level,
+    Land,
+    Character,
+}
+
 impl ToolbarCommand {
     pub fn is_object_tool(self) -> bool {
         matches!(self, Self::Select | Self::Translate | Self::Rotate | Self::Scale)
+    }
+
+    pub fn is_workspace(self) -> bool {
+        matches!(self, Self::Level | Self::Land | Self::Character)
     }
 
     pub fn label(self) -> &'static str {
@@ -224,6 +239,9 @@ impl ToolbarCommand {
             Self::Translate => "Translate",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
+            Self::Level => "Level",
+            Self::Land => "Land",
+            Self::Character => "Character",
             Self::Play => "Play",
             Self::Pause => "Pause",
             Self::Stop => "Stop",
@@ -264,6 +282,10 @@ impl Toolbar {
             Ok(factory) => {
                 let mut loaded = Vec::new();
                 for &(command, file, gap) in BUTTONS {
+                    if file.is_empty() {
+                        loaded.push(Button { command, icon: None, gap_before: gap });
+                        continue;
+                    }
                     match factory.decode(&icon_path(file)) {
                         Ok(icon) => loaded.push(Button { command, icon: Some(icon), gap_before: gap }),
                         Err(error) => {
@@ -290,7 +312,7 @@ impl Toolbar {
     }
 
     pub fn hit(&self, dpi: u32, x: i32, y: i32) -> Option<usize> {
-        self.slots(dpi).into_iter().find(|slot| x >= slot.x && y >= slot.y && x < slot.x + slot.size && y < slot.y + slot.size).map(|slot| slot.index)
+        self.slots(dpi).into_iter().find(|slot| x >= slot.x && y >= slot.y && x < slot.x + slot.width && y < slot.y + slot.size).map(|slot| slot.index)
     }
 
     pub fn paint(
@@ -304,6 +326,7 @@ impl Toolbar {
         local_space: bool,
         session: Option<ToolbarCommand>,
         font: HFONT,
+        mode: WorkspaceMode,
     ) {
         unsafe {
             let rect = RECT { left: 0, top: 0, right: width, bottom: height };
@@ -321,6 +344,9 @@ impl Toolbar {
             let on = !disabled
                 && ((button.command.is_object_tool() && button.command == active)
                     || (button.command == ToolbarCommand::Local && local_space)
+                    || (button.command == ToolbarCommand::Level && mode == WorkspaceMode::Level)
+                    || (button.command == ToolbarCommand::Land && mode == WorkspaceMode::Land)
+                    || (button.command == ToolbarCommand::Character && mode == WorkspaceMode::Character)
                     || session == Some(button.command));
             let hot = hot == Some(slot.index);
             let fill = if disabled {
@@ -345,17 +371,27 @@ impl Toolbar {
             } else {
                 IconTone::Full
             };
-            let rect = RECT { left: slot.x, top: slot.y, right: slot.x + slot.size, bottom: slot.y + slot.size };
+            let rect = RECT { left: slot.x, top: slot.y, right: slot.x + slot.width, bottom: slot.y + slot.size };
             unsafe { FillRect(hdc, &rect, fill); }
             if on {
-                let accent = RECT { left: slot.x, top: slot.y + slot.size - 2, right: slot.x + slot.size, bottom: slot.y + slot.size };
+                let accent = RECT { left: slot.x, top: slot.y + slot.size - 2, right: slot.x + slot.width, bottom: slot.y + slot.size };
                 unsafe { FillRect(hdc, &accent, brush(brushes().accent)); }
             }
             let pad = (slot.size / 6).max(2);
             let icon_size = (slot.size - pad * 2).max(8);
-            let icon_x = slot.x + (slot.size - icon_size) / 2;
+            let icon_x = slot.x + (slot.width - icon_size) / 2;
             let icon_y = slot.y + (slot.size - icon_size) / 2;
-            if let Some(icon) = &button.icon {
+            if button.command.is_workspace() {
+                let label = wide(button.command.label());
+                let mut extent = SIZE { cx: 0, cy: 0 };
+                unsafe {
+                    GetTextExtentPoint32W(hdc, label.as_ptr(), (label.len() - 1) as i32, &mut extent);
+                    let text_x = slot.x + (slot.width - extent.cx).max(0) / 2;
+                    let text_y = slot.y + (slot.size - extent.cy).max(0) / 2;
+                    SetTextColor(hdc, if on { TEXT } else { TEXT_DIM });
+                    TextOutW(hdc, text_x, text_y, label.as_ptr(), (label.len() - 1) as i32);
+                }
+            } else if let Some(icon) = &button.icon {
                 blit_icon(hdc, icon, icon_x, icon_y, icon_size, if on { BUTTON_ON } else if hot { BUTTON_HOT } else { BUTTON }, tone);
             } else {
                 let letter = wide(&button.command.label()[..1]);
@@ -388,8 +424,13 @@ impl Toolbar {
             if index > 0 {
                 x += gap_width;
             }
-            slots.push(Slot { index, x, y, size, gap: button.gap_before && index > 0, gap_width });
-            x += size;
+            let width = if button.command.is_workspace() {
+                dip(18.0 + button.command.label().len() as f32 * 7.4, dpi).max(size)
+            } else {
+                size
+            };
+            slots.push(Slot { index, x, y, size, width, gap: button.gap_before && index > 0, gap_width });
+            x += width;
         }
         slots
     }
@@ -400,6 +441,7 @@ struct Slot {
     x: i32,
     y: i32,
     size: i32,
+    width: i32,
     gap: bool,
     gap_width: i32,
 }
@@ -409,6 +451,9 @@ const BUTTONS: &[(ToolbarCommand, &str, bool)] = &[
     (ToolbarCommand::Translate, "translate.png", false),
     (ToolbarCommand::Rotate, "rotate.png", false),
     (ToolbarCommand::Scale, "scale.png", false),
+    (ToolbarCommand::Level, "", true),
+    (ToolbarCommand::Land, "", false),
+    (ToolbarCommand::Character, "", false),
     (ToolbarCommand::Play, "play.png", true),
     (ToolbarCommand::Pause, "pause.png", false),
     (ToolbarCommand::Stop, "stop.png", false),

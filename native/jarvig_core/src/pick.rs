@@ -67,10 +67,15 @@ pub fn pick_snapshot(ray: PickRay, snapshot: &RenderSceneSnapshot, meshes: &Mesh
 }
 
 pub fn pick_snapshot_timed(ray: PickRay, snapshot: &RenderSceneSnapshot, meshes: &MeshLibrary) -> (Option<PickHit>, PickTimings) {
+    pick_snapshot_skipping(ray, snapshot, meshes, &[])
+}
+
+/// Closest visible actor that is not in `skip`. Land Mode uses this so a hidden character does not steal the click.
+pub fn pick_snapshot_skipping(ray: PickRay, snapshot: &RenderSceneSnapshot, meshes: &MeshLibrary, skip: &[EntityId]) -> (Option<PickHit>, PickTimings) {
     let mut timings = PickTimings::default();
     let started = std::time::Instant::now();
     let mut candidates = Vec::new();
-    for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+    for instance in snapshot.instances().iter().filter(|instance| instance.visible && !skip.contains(&instance.entity)) {
         let Some(mesh) = meshes.get(instance.mesh) else { continue };
         let sphere = mesh.bounds().sphere;
         let center = instance.pose.translation

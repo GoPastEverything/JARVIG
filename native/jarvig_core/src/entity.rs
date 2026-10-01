@@ -152,6 +152,7 @@ pub enum AuthoringClass {
     ReflectionProbe,
     Camera,
     WorldSettings,
+    Terrain,
     Empty,
 }
 
@@ -163,6 +164,7 @@ impl AuthoringClass {
             Self::ReflectionProbe => "Probe",
             Self::Camera => "Camera",
             Self::WorldSettings => "World",
+            Self::Terrain => "Terrain",
             Self::Empty => "",
         }
     }

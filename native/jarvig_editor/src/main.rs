@@ -11,6 +11,7 @@ mod documents;
 mod png_decode;
 mod gizmo;
 mod inspector;
+
 mod outliner;
 mod progress;
 mod rfc_runtime;
@@ -24,14 +25,14 @@ use dock::{
     Layout, PanelId, WorkspaceCommand, CONTENT, INSPECTOR, OUTLINER, OUTPUT, PERSPECTIVE, SCHEMA_VERSION,
 };
 use jarvig_core::{
-    camera_relative_f32, environment_diffuse_for, environment_specular_for, perspective_ray, pick_snapshot_timed, plus_z_normal, reflection_probe_influence,
+    camera_relative_f32, environment_diffuse_for, environment_specular_for, perspective_ray, pick_snapshot_skipping, plus_z_normal, reflection_probe_influence,
     reflection_probe_lod, render_light_record, visible_side_normal, EntityHandle, EntityUuid, FocusError, LightKind, PropertyValue, Quat,
     RenderFrameId, ResolvedPose, ValueKind, Vec3, FIELD_LOCAL_ROTATION, REFLECTION_PROBE_MIP_COUNT, TYPE_CAMERA, TYPE_SPATIAL_FRAME,
 };
 use jarvig_engine::{AuthoringCommand, EngineSession, FrameError};
 use jarvig_renderer::{
     EditorOverlay, FrameOutcome, LightingDebug, NormalizedRect, RenderError, RenderTargetId, RenderViewDesc, RenderViewId,
-    PresentationMode, RenderViewSettings, RenderViewUpdate, Renderer,
+    PresentationMode, RenderViewSettings, RenderViewUpdate, Renderer, TerrainGridDesc,
 };
 use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, Win32WindowHandle, WindowHandle};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -69,7 +70,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE,
     GWLP_WNDPROC, IDC_ARROW, IDC_SIZENS, IDC_SIZEWE, IDI_APPLICATION, MB_OK, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
     MF_UNCHECKED, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SIZE,
     WM_MOUSEACTIVATE, WM_MOVE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
@@ -88,6 +89,10 @@ const ID_FILE_IMPORT_MESH: usize = 1019;
 const ID_EDIT_UNDO: usize = 1020;
 const ID_FILE_RECENT_PROJECT: usize = 1040;
 const ID_FILE_RECENT_LEVEL: usize = 1050;
+const ID_FILE_TEMPLATE_EMPTY: usize = 1060;
+const ID_FILE_TEMPLATE_TERRAIN: usize = 1061;
+const ID_FILE_TEMPLATE_THIRD: usize = 1062;
+const ID_FILE_TEMPLATE_FPS: usize = 1063;
 const ID_FILE_EXIT: usize = 1001;
 const ID_PLAY: usize = 1101;
 const ID_PLAY_STANDALONE: usize = 1102;
@@ -96,6 +101,12 @@ const ID_BUILD_AND_RUN: usize = 1402;
 const ID_BUILD_SETTINGS: usize = 1403;
 const ID_HELP_ABOUT: usize = 1201;
 const ID_VIEW_OUTLINER: usize = 1301;
+const ID_VIEW_CHARACTER: usize = 1390;
+const ID_VIEW_RESET_POSE: usize = 1391;
+const ID_VIEW_JOINTS: usize = 1392;
+const ID_VIEW_JOINT_LIMITS: usize = 1393;
+const ID_VIEW_ALL_JOINTS: usize = 1394;
+const ID_VIEW_LAND: usize = 1395;
 const ID_VIEW_INSPECTOR: usize = 1302;
 const ID_VIEW_CONTENT: usize = 1303;
 const ID_VIEW_OUTPUT: usize = 1304;
@@ -152,6 +163,9 @@ const ID_VIEW_ERROR_HALF: usize = 1372;
 const ID_VIEW_ERROR_ONE: usize = 1373;
 const ID_VIEW_ERROR_TWO: usize = 1374;
 const ID_VIEW_ERROR_FOUR: usize = 1375;
+const ID_VIEW_EINSTEIN: usize = 1376;
+const ID_VIEW_MICRO: usize = 1377;
+const ID_VIEW_MICRO_COLOR: usize = 1378;
 const ID_VIEW_RECAPTURE: usize = 1327;
 const ID_PROBE_STATIC: usize = 1328;
 const ID_PROBE_ON_DEMAND: usize = 1329;
@@ -281,6 +295,7 @@ enum CaptureKind {
     Pan,
     Orbit,
     Gizmo,
+    Terrain,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -357,6 +372,84 @@ struct CapturedWindow {
     rgba: Vec<u8>,
 }
 
+struct EinsteinCapture {
+    palette: f32,
+    probe: jarvig_core::DetailProbe,
+    draws: u32,
+    triangles: u32,
+    leaves: u32,
+    projected_px: f32,
+    rgba: Vec<u8>,
+    width: i32,
+    height: i32,
+    region: (i32, i32, i32, i32),
+}
+
+struct MicroShot {
+    name: String,
+    base_triangles: u32,
+    leaves: u32,
+    leaf_triangles: u32,
+    patches: u32,
+    samples: u32,
+    vertices: u32,
+    triangles: u32,
+    generation_us: u32,
+    upload_us: u32,
+    fallbacks: u32,
+    ordinary: u32,
+    fingerprint: u64,
+    displacement_um: u32,
+    projected_px: f32,
+    orange: f32,
+    rgba: Vec<u8>,
+    width: i32,
+    height: i32,
+    region: (i32, i32, i32, i32),
+}
+
+struct SourceSeal {
+    vertices: u32,
+    bytes: u64,
+    hash: u64,
+    leaf_triangles: u32,
+    hierarchy_nodes: u32,
+    parents_len: u64,
+    parents_modified: u64,
+}
+
+struct ReliefShot {
+    rgba: Vec<u8>,
+    width: i32,
+    height: i32,
+    region: (i32, i32, i32, i32),
+    origin: (i32, i32, i32, i32),
+    base_triangles: u32,
+    micro_triangles: u32,
+    vertices: u32,
+    fingerprint: u64,
+    invalid: u32,
+    displacement_um: u32,
+    projected_px: f32,
+    generation_us: u32,
+    upload_us: u32,
+    reused: u32,
+    leaf_triangles: u32,
+}
+
+struct TransitionRow {
+    distance: f64,
+    projected_px: f32,
+    base_triangles: u32,
+    micro_triangles: u32,
+    vertices: u32,
+    generation_us: u32,
+    upload_us: u32,
+    reused: u32,
+    fingerprint: u64,
+    invalid: u32,
+    leaf_triangles: u32,
+}
 
 struct ParentJob {
     id: jarvig_core::JobId,
@@ -366,6 +459,37 @@ struct ParentJob {
     finished: bool,
 }
 
+struct MicroJob {
+    id: jarvig_core::JobId,
+    epoch: u64,
+    finished: bool,
+    cancel_noted: bool,
+}
+
+struct MicroJobProduct {
+    epoch: u64,
+    key: u64,
+    mesh: jarvig_core::MicroMesh,
+    queue_wait_us: u32,
+    skipped: u32,
+}
+
+struct LandChunkProduct {
+    epoch: u64,
+    entity: jarvig_core::EntityId,
+    revisions: Vec<(u32, u32, u64)>,
+    built: Vec<jarvig_core::BuiltTerrainChunk>,
+}
+
+struct AsyncFrame {
+    base: u32,
+    leaf: u32,
+    tris: u32,
+    verts: u32,
+    fingerprint: u64,
+    partial: u32,
+    stage: String,
+}
 
 struct Editor {
     engine: EngineSession,
@@ -445,6 +569,44 @@ struct Editor {
     meshlet_highlight: bool,
     cluster_hierarchy: bool,
     hierarchy_error_px: f32,
+    einstein_debug: bool,
+    einstein_seed: u64,
+    einstein_uvs: Vec<[f32; 2]>,
+    micro_enabled: bool,
+    micro_surface: bool,
+    micro_color: bool,
+    micro_seed: u64,
+    rfc0002: bool,
+    rfc0002_micro: bool,
+    micro_shots: Vec<MicroShot>,
+    micro_seal: Option<SourceSeal>,
+    rfc0002_transition: bool,
+    rfc0002_refine: bool,
+    rfc0002_async: bool,
+    async_close: f64,
+    async_far: f64,
+    async_step: u32,
+    async_busy: u32,
+    async_frames: Vec<AsyncFrame>,
+    async_fault: String,
+    async_done: bool,
+    transition_distances: Vec<f64>,
+    transition_forward: usize,
+    transition_index: usize,
+    transition_rows: Vec<TransitionRow>,
+    transition_off: Option<ReliefShot>,
+    transition_on: Option<ReliefShot>,
+    transition_color: Option<ReliefShot>,
+    refine_hat: Option<ReliefShot>,
+    refine_grazing: Option<ReliefShot>,
+    transition_reasons: Vec<String>,
+    transition_crops: Vec<(f32, Vec<u8>, i32, i32)>,
+    transition_align: u8,
+    rfc0002_off: Option<EinsteinCapture>,
+    rfc0002_on: Option<EinsteinCapture>,
+    rfc0002_again: Option<EinsteinCapture>,
+    rfc0002_orbit: Option<EinsteinCapture>,
+    rfc0002_far: Option<EinsteinCapture>,
     lod_capture: bool,
     rfc0001: bool,
     lod_phase: u8,
@@ -468,19 +630,67 @@ struct Editor {
     rfc_integrate: Vec<rfc_runtime::IntegrateSample>,
     jobs: jarvig_core::JobManager,
     parent_job: Option<ParentJob>,
+    micro_job: Option<MicroJob>,
     registry_job: Option<jarvig_core::JobId>,
     browser: content_browser::BrowserModel,
     content_search: HWND,
     content_press: Option<(i32, i32, jarvig_core::AssetId)>,
     content_drag: Option<jarvig_core::AssetId>,
-    content_undo: Vec<jarvig_core::EntityId>,
+    content_undo: Vec<Vec<jarvig_core::EntityId>>,
+    /// Character workspace over the same frames and joints. Not a second skeleton.
+    character_workspace: bool,
+    /// Land workspace over the same world. Not a second editor.
+    land_mode: bool,
+    outliner_land: bool,
+    land_tool: LandTool,
+    land_width: f32,
+    land_depth: f32,
+    land_spacing: f32,
+    land_chunk: f32,
+    land_height: f32,
+    land_radius: f32,
+    land_delta: f32,
+    land_layer: u8,
+    land_falloff: jarvig_core::TerrainFalloff,
+    land_grid: bool,
+    land_grid_minor: f32,
+    land_grid_major: f32,
+    land_grid_snap: bool,
+    land_overlay_world: bool,
+    land_overlay_vertices: bool,
+    land_overlay_chunks: bool,
+    land_overlay_lod: bool,
+    land_show_terrain: bool,
+    land_show_helpers: bool,
+    land_show_lighting: bool,
+    land_show_characters: bool,
+    land_show_props: bool,
+    land_show_gameplay: bool,
+    land_show_full: bool,
+    /// Last brush sample in terrain-local XZ. Debounces a drag.
+    land_stamp: Option<(f32, f32)>,
+    land_hover: Option<(f32, f32)>,
+    land_flatten: Option<f32>,
+    land_visual_epoch: u64,
+    land_chunk_job: Option<jarvig_core::JobId>,
+    land_chunk_rev: Vec<(u32, u32, u64)>,
+    land_chunk_published: Vec<(u32, u32, u64)>,
+    show_joint_debug: bool,
+    show_joint_limits: bool,
+    show_all_joints: bool,
+    outliner_character: bool,
     drop_feedback: String,
     content_check: bool,
+    bind_pose_dir: Option<std::path::PathBuf>,
+    bind_pose_index: u8,
+    bind_pose_capture_next: bool,
     job_line: String,
     meshlet_bound: Option<(jarvig_core::EntityId, bool)>,
     scene_meshes: Vec<jarvig_core::MeshId>,
     status_base: String,
     project_file: Option<std::path::PathBuf>,
+    /// Set by `--project`. Cold start still opens Lighting Lab when this is empty.
+    startup_project: Option<std::path::PathBuf>,
     project_name: String,
     level_file: Option<std::path::PathBuf>,
     level_name: String,
@@ -599,6 +809,91 @@ struct Editor {
 enum TreeKey {
     World,
     Entity(EntityUuid),
+    Tool(LandTool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandTool {
+    Create,
+    Select,
+    Sculpt,
+    Smooth,
+    Flatten,
+    Paint,
+    Settings,
+    Einstein,
+    Debug,
+}
+
+impl LandTool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "Create Terrain",
+            Self::Select => "Select Terrain",
+            Self::Sculpt => "Sculpt",
+            Self::Smooth => "Smooth",
+            Self::Flatten => "Flatten",
+            Self::Paint => "Paint Layers",
+            Self::Settings => "Terrain Settings",
+            Self::Einstein => "Einstein Detail",
+            Self::Debug => "Debug",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Self::Create => "Flat heightfield from the inspector size.",
+            Self::Select => "Select the terrain actor.",
+            Self::Sculpt => "Raise the authoritative height. Shift lowers. Wheel changes radius.",
+            Self::Smooth => "Average the authoritative height. Wheel changes radius.",
+            Self::Flatten => "Pull height toward the brush center. Wheel changes radius.",
+            Self::Paint => "Write a material class. Height stays put. Wheel changes radius.",
+            Self::Settings => "Dimensions, collision, and LOD.",
+            Self::Einstein => "Stored detail settings. They do not write height.",
+            Self::Debug => "Height, slope, layer. Einstein detail is not generated.",
+        }
+    }
+
+    const ALL: [LandTool; 9] = [
+        Self::Create,
+        Self::Select,
+        Self::Sculpt,
+        Self::Smooth,
+        Self::Flatten,
+        Self::Paint,
+        Self::Settings,
+        Self::Einstein,
+        Self::Debug,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Select => "select",
+            Self::Sculpt => "sculpt",
+            Self::Smooth => "smooth",
+            Self::Flatten => "flatten",
+            Self::Paint => "paint",
+            Self::Settings => "settings",
+            Self::Einstein => "einstein",
+            Self::Debug => "debug",
+        }
+    }
+
+    fn from_key(text: &str) -> Option<Self> {
+        Some(match text {
+            "create" => Self::Create,
+            "select" => Self::Select,
+            "sculpt" => Self::Sculpt,
+            "smooth" => Self::Smooth,
+            "flatten" => Self::Flatten,
+            "paint" => Self::Paint,
+            "settings" => Self::Settings,
+            "einstein" => Self::Einstein,
+            "debug" => Self::Debug,
+            _ => return None,
+        })
+    }
 }
 
 struct InspectorControl {
@@ -658,8 +953,42 @@ fn main() {
         editor.lod_capture = true;
         editor.rfc_runtime = true;
     }
+    if args.iter().any(|arg| arg == "--rfc0002") {
+        editor.lod_capture = true;
+        editor.rfc0002 = true;
+    }
+    if args.iter().any(|arg| arg == "--rfc0002-micro") {
+        editor.lod_capture = true;
+        editor.rfc0002_micro = true;
+    }
+    if args.iter().any(|arg| arg == "--rfc0002-transition") {
+        editor.lod_capture = true;
+        editor.rfc0002_transition = true;
+    }
+    if args.iter().any(|arg| arg == "--rfc0002-refine") {
+        editor.lod_capture = true;
+        editor.rfc0002_refine = true;
+    }
+    if args.iter().any(|arg| arg == "--rfc0002-async") {
+        editor.lod_capture = true;
+        editor.rfc0002_async = true;
+    }
     if args.iter().any(|arg| arg == "--content-check") {
         editor.content_check = true;
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--bind-pose-shots") {
+        let Some(path) = args.get(index + 1) else {
+            eprintln!("JARVIG_FAIL --bind-pose-shots needs a directory");
+            std::process::exit(1);
+        };
+        editor.bind_pose_dir = Some(std::path::PathBuf::from(path));
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--project") {
+        let Some(path) = args.get(index + 1) else {
+            eprintln!("JARVIG_FAIL --project needs a .jarvigproject path");
+            std::process::exit(1);
+        };
+        editor.startup_project = Some(std::path::PathBuf::from(path));
     }
     if let Err(error) = editor.run() {
         eprintln!("JARVIG_FAIL {error}");
@@ -746,6 +1075,44 @@ impl Editor {
             meshlet_highlight: false,
             cluster_hierarchy: false,
             hierarchy_error_px: 1.0,
+            einstein_debug: false,
+            einstein_seed: 1,
+            einstein_uvs: Vec::new(),
+            micro_enabled: false,
+            micro_surface: true,
+            micro_color: false,
+            micro_seed: 1,
+            rfc0002: false,
+            rfc0002_micro: false,
+            micro_shots: Vec::new(),
+            micro_seal: None,
+            rfc0002_transition: false,
+            rfc0002_refine: false,
+            rfc0002_async: false,
+            async_close: 0.0,
+            async_far: 0.0,
+            async_step: 0,
+            async_busy: 0,
+            async_frames: Vec::new(),
+            async_fault: String::new(),
+            async_done: false,
+            transition_distances: Vec::new(),
+            transition_forward: 0,
+            transition_index: 0,
+            transition_rows: Vec::new(),
+            transition_off: None,
+            transition_on: None,
+            transition_color: None,
+            refine_hat: None,
+            refine_grazing: None,
+            transition_reasons: Vec::new(),
+            transition_crops: Vec::new(),
+            transition_align: 0,
+            rfc0002_off: None,
+            rfc0002_on: None,
+            rfc0002_again: None,
+            rfc0002_orbit: None,
+            rfc0002_far: None,
             lod_capture: false,
             rfc0001: false,
             lod_phase: 0,
@@ -769,19 +1136,63 @@ impl Editor {
             rfc_integrate: Vec::new(),
             jobs: jarvig_core::JobManager::new(2),
             parent_job: None,
+            micro_job: None,
             registry_job: None,
             browser: content_browser::BrowserModel::default(),
             content_search: std::ptr::null_mut(),
             content_press: None,
             content_drag: None,
             content_undo: Vec::new(),
+            character_workspace: false,
+            land_mode: false,
+            outliner_land: false,
+            land_tool: LandTool::Create,
+            land_width: jarvig_core::TERRAIN_DEFAULT_WIDTH_M,
+            land_depth: jarvig_core::TERRAIN_DEFAULT_DEPTH_M,
+            land_spacing: jarvig_core::TERRAIN_DEFAULT_SPACING_M,
+            land_chunk: jarvig_core::TERRAIN_DEFAULT_CHUNK_M,
+            land_height: jarvig_core::TERRAIN_DEFAULT_HEIGHT,
+            land_radius: jarvig_core::TERRAIN_BRUSH_RADIUS_M,
+            land_delta: jarvig_core::TERRAIN_BRUSH_DELTA_M,
+            land_layer: 1,
+            land_falloff: jarvig_core::TerrainFalloff::Smooth,
+            land_grid: true,
+            land_grid_minor: 1.0,
+            land_grid_major: 10.0,
+            land_grid_snap: false,
+            land_overlay_world: true,
+            land_overlay_vertices: false,
+            land_overlay_chunks: false,
+            land_overlay_lod: false,
+            land_show_terrain: true,
+            land_show_helpers: true,
+            land_show_lighting: true,
+            land_show_characters: false,
+            land_show_props: false,
+            land_show_gameplay: false,
+            land_show_full: false,
+            land_stamp: None,
+            land_hover: None,
+            land_flatten: None,
+            land_visual_epoch: 1,
+            land_chunk_job: None,
+            land_chunk_rev: Vec::new(),
+            land_chunk_published: Vec::new(),
+            show_joint_debug: true,
+            show_joint_limits: true,
+            show_all_joints: false,
+            outliner_character: false,
             drop_feedback: String::new(),
             content_check: false,
+            bind_pose_dir: None,
+            bind_pose_index: 0,
+            bind_pose_capture_next: false,
             job_line: String::new(),
             meshlet_bound: None,
             scene_meshes: Vec::new(),
             status_base: "Starting".to_string(),
             project_file: None,
+            startup_project: None,
             project_name: String::new(),
             level_file: None,
             level_name: String::new(),
@@ -1236,13 +1647,35 @@ impl Editor {
     fn sync_outliner(&mut self) {
         let source = self.view_source_key();
         let revision = self.viewed_world().revision();
-        if self.outliner.revision() == revision && self.outliner_source == source && !self.tree_keys.is_empty() {
+        let land = self.land_mode && !self.session_active();
+        let showing_tools = self.tree_keys.iter().any(|key| matches!(key, TreeKey::Tool(_)));
+        if land {
+            if self.outliner_land && self.outliner_source == source && !self.tree_keys.is_empty() {
+                return;
+            }
+            self.outliner_land = true;
+            self.outliner_character = false;
+            self.outliner_source = source;
+            self.realize_land_outliner();
+            self.sync_selection_view();
             return;
         }
-        let outline = self.viewed_world().entity_outline();
-        if !self.outliner_logged {
+        if self.outliner.revision() == revision
+            && self.outliner_source == source
+            && self.outliner_character == self.character_workspace
+            && !self.outliner_land
+            && !showing_tools
+            && !self.tree_keys.is_empty()
+        {
+            return;
+        }
+        let mut outline = self.viewed_world().entity_outline();
+        if self.character_workspace {
+            outline.retain(|row| self.viewed_world().authored_joint(row.uuid).is_some());
+        }
+        if !self.outliner_logged && self.project_file.is_some() {
             self.outliner_logged = true;
-            self.append("Outliner reads the entity registry. Names are labels. Selection is a separate editor service.");
+            self.append("Outliner reads the open level. Names are labels. Selection is a separate editor service.");
             for row in &outline {
                 let name = outliner::presentation_name(&row.name);
                 self.append(&format!("entity \"{name}\" {}", row.uuid));
@@ -1250,9 +1683,23 @@ impl Editor {
         }
         let next = outliner::WorldOutlinerModel::derive(revision, &outline, &self.outliner);
         // A pose or a simulation tick revises the world. The tree is the entity list, so those do not delete it.
-        let same_rows = self.outliner_source == source && !self.tree_keys.is_empty() && self.outliner.same_rows(&next);
+        let same_rows = self.outliner_source == source
+            && self.outliner_character == self.character_workspace
+            && !self.outliner_land
+            && !showing_tools
+            && !self.tree_keys.is_empty()
+            && self.outliner.same_rows(&next);
         self.outliner_source = source;
+        self.outliner_character = self.character_workspace;
+        self.outliner_land = false;
         self.outliner = next;
+        if self.character_workspace {
+            for row in &outline {
+                if let Some(joint) = self.viewed_world().authored_joint(row.uuid) {
+                    self.outliner.set_category(row.uuid, joint.kind.label());
+                }
+            }
+        }
         if !same_rows {
             let live: Vec<EntityUuid> = outline.iter().map(|row| row.uuid).collect();
             self.selection.reconcile_entities(&live);
@@ -1289,14 +1736,36 @@ impl Editor {
     }
 
     fn rebuild_inspector(&mut self) {
-        let entity = self.selection.primary_entity();
+        let land_focus = self.land_mode && !self.session_active();
+        let entity = if land_focus { self.viewed_world().terrain_entity() } else { self.selection.primary_entity() };
         if self.inspector_for != entity {
             self.inspector_for = entity;
             self.inspector_scroll = 0;
         }
         let staged = if self.session_active() { Vec::new() } else { self.engine.staged_material_names() };
         let meshes = self.engine.mesh_asset_names();
-        let mut model = inspector::build_with(&self.selection, self.viewed_world(), &staged, &meshes);
+        let mut model = if land_focus {
+            if let Some(id) = entity {
+                inspector::build_entity(self.viewed_world(), id, &staged, &meshes)
+            } else {
+                inspector::terrain_draft(
+                    self.land_width as f64,
+                    self.land_depth as f64,
+                    self.land_spacing as f64,
+                    self.land_chunk as f64,
+                    self.land_height as f64,
+                )
+            }
+        } else {
+            let mut model = inspector::build_with(&self.selection, self.viewed_world(), &staged, &meshes);
+            if let Some(entity) = self.selection.primary_entity() {
+                inspector::attach_joint_context(&mut model, self.viewed_world(), entity);
+            }
+            model
+        };
+        if land_focus && entity.is_some() {
+            inspector::attach_land_workspace(&mut model, self.land_inspector());
+        }
         if self.session_active() {
             if let inspector::InspectorBody::Entity { sections } = &mut model.body {
                 for section in sections {
@@ -1384,7 +1853,8 @@ impl Editor {
             .unwrap_or_default();
         options.uniform_scale = self.uniform_scale;
         options.show_commands = !self.session_active();
-        options.show_add = !self.session_active() && self.selection.count() == 1;
+        let terrain_selected = self.selection.primary_entity() == self.engine.world().terrain_entity() && self.engine.world().terrain_entity().is_some();
+        options.show_add = !self.session_active() && self.selection.count() == 1 && (!self.land_mode || terrain_selected);
         if self.session_active() {
             options.banner = Some(
                 if self.play == PlayPhase::Paused {
@@ -1554,11 +2024,17 @@ impl Editor {
             self.realize_inspector_controls();
             return;
         }
-        if self.inspector_applying || self.selection.count() != 1 {
+        if self.inspector_applying {
             return;
         }
-        let Some(entity) = self.selection.primary_entity() else { return };
         let Some(binding) = self.inspector_controls.iter().find(|control| control.hwnd == hwnd).map(|control| control.binding.clone()) else { return };
+        if self.commit_land_ui(&binding, hwnd) {
+            return;
+        }
+        if self.commit_land_draft(&binding, hwnd) {
+            return;
+        }
+        let Some(entity) = self.inspector_target() else { return };
         match binding {
             inspector::InspectorBinding::Text { type_id, field } => self.commit_inspector_text(entity, type_id, field, &window_text(hwnd)),
             inspector::InspectorBinding::Axis { type_id, field, .. } => self.commit_inspector_axes(entity, type_id, field),
@@ -1728,13 +2204,20 @@ impl Editor {
         }
         match binding {
             inspector::InspectorBinding::Section { title } => self.toggle_inspector_section(&title),
+            inspector::InspectorBinding::Check { field, .. } if inspector::is_land_ui(field) => {
+                let checked = unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) } == 1;
+                self.set_land_check(field, checked);
+            }
             inspector::InspectorBinding::Check { type_id, field } => {
                 let checked = unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) } == 1;
-                let Some(entity) = self.selection.primary_entity() else { return };
+                let Some(entity) = self.inspector_target() else { return };
                 self.commit_inspector_check(entity, type_id, field, checked);
             }
+            inspector::InspectorBinding::Choice { field, .. } if inspector::is_land_ui(field) => {
+                self.set_land_choice(field, &combo_text(hwnd));
+            }
             inspector::InspectorBinding::Choice { type_id, field } => {
-                let Some(entity) = self.selection.primary_entity() else { return };
+                let Some(entity) = self.inspector_target() else { return };
                 self.commit_inspector_choice(entity, type_id, field, &combo_text(hwnd));
             }
             inspector::InspectorBinding::Command { command, type_id } => self.run_inspector_command(command, type_id),
@@ -1765,7 +2248,11 @@ impl Editor {
     }
 
     fn run_inspector_command(&mut self, command: inspector::InspectorCommand, type_id: jarvig_core::TypeId) {
-        let Some(entity) = self.selection.primary_entity() else { return };
+        if command == inspector::InspectorCommand::CreateTerrain {
+            self.create_land_terrain();
+            return;
+        }
+        let Some(entity) = self.inspector_target() else { return };
         match command {
             inspector::InspectorCommand::RemoveComponent => {
                 match self.engine.execute_authoring(AuthoringCommand::RemoveComponent { target: entity, type_id, slot: 0 }) {
@@ -1784,10 +2271,30 @@ impl Editor {
                 self.append("Reflection probes marked for recapture. The camera was not moved.");
                 self.refresh_status();
             }
+            inspector::InspectorCommand::ResetPose => self.reset_character_pose(),
+            inspector::InspectorCommand::CreateTerrain => self.create_land_terrain(),
         }
     }
 
     fn reset_authored_transform(&mut self, entity: EntityUuid) {
+        if let Some(joint) = self.engine.world().authored_joint(entity) {
+            let _ = inspector::submit_property(
+                &mut self.engine,
+                entity,
+                jarvig_core::TYPE_SPATIAL_FRAME,
+                jarvig_core::FIELD_LOCAL_TRANSLATION,
+                PropertyValue::Vec3(joint.rest_translation),
+            );
+            let _ = inspector::submit_property(
+                &mut self.engine,
+                entity,
+                jarvig_core::TYPE_SPATIAL_FRAME,
+                jarvig_core::FIELD_LOCAL_ROTATION,
+                PropertyValue::Quat(joint.rest_rotation),
+            );
+            self.append("Joint returned to its rest pose.");
+            return;
+        }
         let _ = inspector::submit_property(
             &mut self.engine,
             entity,
@@ -2018,11 +2525,27 @@ impl Editor {
                 return;
             };
             let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
-            let row = match key {
-                TreeKey::World => None,
-                TreeKey::Entity(id) => Some(id),
-            };
-            let _ = self.apply_outliner_activation(row, ctrl);
+            match key {
+                TreeKey::Tool(tool) => {
+                    self.land_tool = tool;
+                    match tool {
+                        LandTool::Select => self.select_terrain_actor(),
+                        LandTool::Debug => self.log_terrain_debug(),
+                        _ => {
+                            self.inspector_force_realize = true;
+                            self.request_inspector_refresh();
+                        }
+                    }
+                    self.persist_workspace();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                TreeKey::World => {
+                    let _ = self.apply_outliner_activation(None, ctrl);
+                }
+                TreeKey::Entity(id) => {
+                    let _ = self.apply_outliner_activation(Some(id), ctrl);
+                }
+            }
         }
     }
 
@@ -2033,12 +2556,19 @@ impl Editor {
             CDDS_ITEMPREPAINT => {
                 let mut text = chrome::TEXT;
                 let mut background = chrome::PANEL;
-                if let Some(TreeKey::Entity(id)) = self.tree_key(draw.nmcd.lItemlParam) {
-                    let item = selection::SelectionItem::Entity(id);
-                    if self.selection.contains(item) {
-                        text = chrome::TEXT;
-                        background = if self.selection.primary() == Some(item) { chrome::SELECT } else { chrome::SELECT_SOFT };
+                match self.tree_key(draw.nmcd.lItemlParam) {
+                    Some(TreeKey::Entity(id)) => {
+                        let item = selection::SelectionItem::Entity(id);
+                        if self.selection.contains(item) {
+                            text = chrome::TEXT;
+                            background = if self.selection.primary() == Some(item) { chrome::SELECT } else { chrome::SELECT_SOFT };
+                        }
                     }
+                    Some(TreeKey::Tool(tool)) if tool == self.land_tool => {
+                        text = chrome::TEXT;
+                        background = chrome::SELECT;
+                    }
+                    _ => {}
                 }
                 draw.clrText = text;
                 draw.clrTextBk = background;
@@ -2058,7 +2588,13 @@ impl Editor {
         self.outliner_applying = true;
         self.tree_keys.clear();
         unsafe { SendMessageW(hwnd, TVM_DELETEITEM, 0, TVI_ROOT); }
-        let root = if self.session_active() { "Runtime" } else { "World" };
+        let root = if self.session_active() {
+            "Runtime"
+        } else if self.character_workspace {
+            "Skeleton"
+        } else {
+            "World"
+        };
         let world_item = self.insert_tree_item(TVI_ROOT, root, TreeKey::World);
         let roots = self.outliner.roots().to_vec();
         self.insert_entity_rows(world_item, &roots);
@@ -2190,7 +2726,7 @@ impl Editor {
                 match self.tree_key(view.itemNew.lParam) {
                     Some(TreeKey::World) => self.outliner.set_world_expanded(expanded),
                     Some(TreeKey::Entity(entity)) => self.outliner.set_expanded(entity, expanded),
-                    None => {}
+                    Some(TreeKey::Tool(_)) | None => {}
                 }
             }
             TVN_GETINFOTIPW => {
@@ -2198,6 +2734,7 @@ impl Editor {
                 let text = match self.tree_key(tip.lParam) {
                     Some(TreeKey::World) => "Editor root. Not an entity.".to_string(),
                     Some(TreeKey::Entity(entity)) => entity.to_string(),
+                    Some(TreeKey::Tool(tool)) => tool.tip().to_string(),
                     None => return 0,
                 };
                 self.tooltip = wide(&text);
@@ -2760,6 +3297,16 @@ impl Editor {
         self.maybe_autosave();
         self.publish_gizmo();
         self.sync_meshlet_debug();
+        if self.einstein_debug || self.rfc0002 {
+            self.ensure_einstein_uvs();
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_einstein_debug(self.einstein_debug, self.einstein_seed);
+            renderer.set_micro_surface(self.micro_surface);
+            renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
+        }
+        self.publish_land_view();
+        self.evict_retired_meshes();
         let target = self.target.ok_or("viewport target missing")?;
         let mut outcome = FrameOutcome::TimedOut;
         let rendered = if self.session_active() {
@@ -2790,7 +3337,9 @@ impl Editor {
             self.on_presented()?;
             self.settle_load();
             self.step_lod_capture();
+            self.step_bind_pose_shots();
         }
+        self.submit_micro_request();
         if !self.self_test && self.limit.is_some_and(|limit| self.frames >= limit) {
             unsafe {
                 KillTimer(self.frame, TIMER_FRAME);
@@ -3382,6 +3931,11 @@ impl Editor {
         mark_quality(ID_PRESENT_TONEMAP, self.presentation == PresentationMode::Tonemap);
         mark_quality(ID_PRESENT_QUANTIZED, self.presentation == PresentationMode::Quantized);
         mark_quality(ID_PRESENT_BEFORE, self.presentation == PresentationMode::BeforeCurve);
+        mark_quality(ID_VIEW_CHARACTER, self.character_workspace);
+        mark_quality(ID_VIEW_LAND, self.land_mode);
+        mark_quality(ID_VIEW_JOINTS, self.character_workspace && self.show_joint_debug);
+        mark_quality(ID_VIEW_ALL_JOINTS, self.character_workspace && self.show_all_joints);
+        mark_quality(ID_VIEW_JOINT_LIMITS, self.character_workspace && self.show_joint_limits);
         mark_quality(ID_VIEW_MESHLETS, self.meshlet_debug);
         mark_quality(ID_VIEW_MESHLET_SHADE, self.meshlet_shade);
         mark_quality(ID_VIEW_MESHLET_FRUSTUM, self.meshlet_frustum);
@@ -3389,6 +3943,9 @@ impl Editor {
         mark_quality(ID_VIEW_MESHLET_FREEZE, self.meshlet_freeze);
         mark_quality(ID_VIEW_MESHLET_HIGHLIGHT, self.meshlet_highlight);
         mark_quality(ID_VIEW_CLUSTER_HIERARCHY, self.cluster_hierarchy);
+        mark_quality(ID_VIEW_EINSTEIN, self.einstein_debug);
+        mark_quality(ID_VIEW_MICRO, self.micro_enabled);
+        mark_quality(ID_VIEW_MICRO_COLOR, self.micro_color);
         mark_quality(ID_VIEW_ERROR_HALF, (self.hierarchy_error_px - 0.5).abs() < 0.01);
         mark_quality(ID_VIEW_ERROR_ONE, (self.hierarchy_error_px - 1.0).abs() < 0.01);
         mark_quality(ID_VIEW_ERROR_TWO, (self.hierarchy_error_px - 2.0).abs() < 0.01);
@@ -3770,6 +4327,7 @@ impl Editor {
         } else {
             format!("{}  |  ", self.job_line)
         };
+        let micro = self.micro_status();
         let meshlets = self.meshlet_status();
         let scene = self.gpu_scene_status();
         let meshlets = if meshlets.is_empty() && scene.is_empty() {
@@ -3778,7 +4336,7 @@ impl Editor {
             format!("{meshlets}{scene}  |  ")
         };
         self.set_status(&format!(
-            "{jobs}{meshlets}{progress}{play_state}{}  |  {view_name}  |  {speed}  |  {} {space}  |  Exposure: {exposure:+.1} EV  |  present={} dither={}  |  Env: {}  |  Probe: {}  |  Shadows: {shadows}{debug}{material_view}  |  {observed}  |  {}",
+            "{micro}{jobs}{meshlets}{progress}{play_state}{}  |  {view_name}  |  {speed}  |  {} {space}  |  Exposure: {exposure:+.1} EV  |  present={} dither={}  |  Env: {}  |  Probe: {}  |  Shadows: {shadows}{debug}{material_view}  |  {observed}  |  {}",
             self.status_base,
             self.object_tool.label(),
             self.presentation.label(),
@@ -3833,7 +4391,7 @@ impl Editor {
             return String::new();
         }
         format!(
-            " GPU scene inst {}/{} geom {} meshlets {}/{} fru {} occ {} cons {} tris {} cull {} us {} {}{}{} |",
+            " GPU scene inst {}/{} geom {} meshlets {}/{} fru {} occ {} cons {} tris {} cull {} us {} {}{}{}{} |",
             stats.instances_visible,
             stats.instances,
             stats.geometries,
@@ -3869,7 +4427,8 @@ impl Editor {
                 format!(" hier {}/{}", stats.hierarchy_cut, stats.hierarchy_nodes)
             } else {
                 String::new()
-            }
+            },
+            self.einstein_status()
         )
     }
 
@@ -4761,6 +5320,17 @@ impl Editor {
     }
 
     fn tab_title(&self, panel: PanelId) -> String {
+        if self.character_workspace && !self.session_active() {
+            if panel == OUTLINER {
+                return "Skeleton".into();
+            }
+            if panel == PERSPECTIVE {
+                return "Character Preview".into();
+            }
+        }
+        if self.land_mode && !self.session_active() && panel == OUTLINER {
+            return "Land".into();
+        }
         if panel == PERSPECTIVE {
             return match self.play {
                 PlayPhase::Playing | PlayPhase::StartingPlay => "Perspective  PLAY".into(),
@@ -4925,10 +5495,14 @@ impl Editor {
         }
         self.cancel_gizmo();
         self.end_capture(true, true);
-        let Some(pose) = self.editor_camera.as_ref().map(|controller| controller.pose()) else {
+        let Some(controller) = self.editor_camera.as_ref() else {
             self.append("Play needs the editor camera. It was not started.");
             return;
         };
+        let pose = controller.pose();
+        let fly_yaw = controller.yaw;
+        let fly_pitch = controller.pitch;
+        let fly_position = controller.position;
         let uuid = self.level_uuid.unwrap_or_else(jarvig_core::EntityId::new);
         let name = if self.level_name.is_empty() { "Level" } else { &self.level_name };
         let revision = self.engine.world().revision();
@@ -4958,7 +5532,15 @@ impl Editor {
         let settings = self.play_settings();
         if let Ok(world) = self.game.runtime_world_mut() {
             match jarvig_core::PlayControl::attach(world, &settings) {
-                Ok(control) => {
+                Ok(mut control) => {
+                    let mut seeded = false;
+                    if settings.pawn == jarvig_core::PawnSelection::DefaultFreeFly && settings.startup_camera == jarvig_core::StartupCameraPolicy::Pawn {
+                        if let Some(pawn) = control.pawn() {
+                            if let Ok(local) = world.local_translation_for_world_point(pawn, fly_position) {
+                                seeded = control.place_free_fly_view(world, local, fly_yaw, fly_pitch).is_ok();
+                            }
+                        }
+                    }
                     let camera = control.pawn_camera();
                     let possessed = control.pawn().is_some();
                     self.play_control = control;
@@ -4967,7 +5549,11 @@ impl Editor {
                     }
                     if possessed {
                         self.begin_play_capture();
-                        self.append("Play possessed the project pawn. The mouse is captured. Escape releases it. Click captures it again. The editor camera was not used.");
+                        if seeded {
+                            self.append("Play started the level at this view. WASD moves. The mouse looks. E and Space rise. Q and Ctrl descend. Shift sprints. Escape releases the mouse. Click captures it again. Stop returns to the authored level.");
+                        } else {
+                            self.append("Play possessed the project pawn. The mouse is captured. Escape releases it. Click captures it again. The editor camera was not used.");
+                        }
                     }
                 }
                 Err(error) => self.append(&format!("Play did not possess a pawn: {error}.")),
@@ -5214,6 +5800,94 @@ impl Editor {
         Ok(())
     }
 
+    fn focus_character_body(&mut self) {
+        let Some((origin, radius)) = self.character_bounds(None) else { return };
+        if let Some(camera) = self.editor_camera.as_mut() {
+            let _ = camera.focus_origin(origin, radius);
+        }
+        let _ = self.push_editor_camera();
+    }
+
+    fn character_bounds(&self, root_name: Option<&str>) -> Option<(jarvig_core::Vec3, f64)> {
+        let outline = self.engine.world().entity_outline();
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        let mut any = false;
+        for row in &outline {
+            if let Some(name) = root_name {
+                if !row_under_root(&outline, row.uuid, name) {
+                    continue;
+                }
+            }
+            let Ok(focus) = self.engine.world().entity_focus(row.uuid) else { continue };
+            if !focus.renderable {
+                continue;
+            }
+            let radius = focus.radius_m;
+            min[0] = min[0].min(focus.origin.x - radius);
+            min[1] = min[1].min(focus.origin.y - radius);
+            min[2] = min[2].min(focus.origin.z - radius);
+            max[0] = max[0].max(focus.origin.x + radius);
+            max[1] = max[1].max(focus.origin.y + radius);
+            max[2] = max[2].max(focus.origin.z + radius);
+            any = true;
+        }
+        if !any {
+            return None;
+        }
+        let center = jarvig_core::Vec3::new((min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5, (min[2] + max[2]) * 0.5);
+        let extent_x = max[0] - min[0];
+        let extent_y = max[1] - min[1];
+        let extent_z = max[2] - min[2];
+        let radius = (extent_x * extent_x + extent_y * extent_y + extent_z * extent_z).sqrt() * 0.5;
+        Some((center, radius.max(0.5)))
+    }
+
+    fn step_bind_pose_shots(&mut self) {
+        if self.bind_pose_dir.is_none() || self.frames < 12 || self.bind_pose_index >= 6 {
+            return;
+        }
+        if self.bind_pose_capture_next {
+            let (body, view, _) = bind_shot(self.bind_pose_index);
+            let path = self.bind_pose_dir.as_ref().unwrap().join(format!("{}-{view}.png", body.replace(' ', "-")));
+            match capture_window_image(self.frame).and_then(|image| write_png(&path.display().to_string(), &image)) {
+                Ok(()) => println!("BIND_POSE_SHOT {}", path.display()),
+                Err(error) => {
+                    println!("BIND_POSE_SHOTS_FAIL {error}");
+                    unsafe { PostQuitMessage(1); }
+                    return;
+                }
+            }
+            self.bind_pose_index = self.bind_pose_index.saturating_add(1);
+            if self.bind_pose_index >= 6 {
+                println!("BIND_POSE_SHOTS_OK");
+                unsafe { PostQuitMessage(0); }
+                return;
+            }
+        }
+        if let Err(error) = self.aim_bind_pose_shot() {
+            println!("BIND_POSE_SHOTS_FAIL {error}");
+            unsafe { PostQuitMessage(1); }
+            return;
+        }
+        self.bind_pose_capture_next = true;
+    }
+
+    fn aim_bind_pose_shot(&mut self) -> Result<(), String> {
+        self.show_joint_debug = true;
+        self.show_all_joints = true;
+        self.show_joint_limits = false;
+        let (body, _, yaw) = bind_shot(self.bind_pose_index);
+        let (center, radius) = self.character_bounds(Some(body)).ok_or_else(|| format!("{body} has no mesh bounds"))?;
+        let camera = self.editor_camera.as_mut().ok_or("camera missing")?;
+        camera.yaw = yaw;
+        camera.pitch = -0.05;
+        if !camera.focus_origin(center, radius) {
+            return Err(format!("{body} was not framed"));
+        }
+        self.push_editor_camera()
+    }
+
     fn focus_selected(&mut self) -> bool {
         if self.capture == Some(CaptureKind::Look) {
             return false;
@@ -5292,9 +5966,23 @@ impl Editor {
     }
 
     fn viewport_press(&mut self, hwnd: HWND, x: f64, y: f64, ctrl: bool) {
+        // An axis or ring under the cursor starts a drag before a marker or a mesh can change the selection.
         if let Some(handle) = self.gizmo_handle_at(x, y) {
             self.begin_gizmo_drag(hwnd, handle, x, y);
             return;
+        }
+        // Markers are pick targets only while the Character Editor is choosing a socket.
+        if self.character_workspace {
+            if let Some(entity) = self.joint_pivot_at(x, y) {
+                let item = selection::SelectionItem::Entity(entity);
+                if ctrl {
+                    let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
+                } else {
+                    let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
+                }
+                self.sync_selection_view();
+                return;
+            }
         }
         self.pick_requests = self.pick_requests.saturating_add(1);
         self.pick_broadphase_us = 0;
@@ -5302,7 +5990,8 @@ impl Editor {
         let ray = self.viewport_ray(x, y);
         let hit = ray.and_then(|ray| {
             let snapshot = self.engine.world().extract(RenderFrameId(30)).ok()?;
-            let (hit, timings) = pick_snapshot_timed(ray, &snapshot, self.engine.world().meshes());
+            let hidden = self.land_hidden_entities();
+            let (hit, timings) = pick_snapshot_skipping(ray, &snapshot, self.engine.world().meshes(), &hidden);
             self.pick_broadphase_us = timings.broadphase_us;
             self.pick_mesh_us = timings.mesh_us;
             hit
@@ -5316,7 +6005,8 @@ impl Editor {
         match hit {
             Some(hit) => {
                 self.pick_hits = self.pick_hits.saturating_add(1);
-                let item = selection::SelectionItem::Entity(hit.entity);
+                let entity = self.engine.world().terrain_owner(hit.entity).unwrap_or(hit.entity);
+                let item = selection::SelectionItem::Entity(entity);
                 if ctrl {
                     let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
                 } else {
@@ -5500,6 +6190,1202 @@ impl Editor {
         self.refresh_status();
     }
 
+    fn toggle_microgeometry(&mut self) {
+        self.micro_enabled = !self.micro_enabled;
+        if !self.micro_enabled {
+            self.micro_color = false;
+        }
+        self.sync_view_menu();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
+        }
+        self.append(if self.micro_enabled {
+            "Procedural microgeometry is on. Above 1 px it adds Einstein patches on the selected surface. The ordinary mesh and the hierarchy sidecar stay untouched."
+        } else {
+            "Procedural microgeometry is off. The townshop is the ordinary surface again."
+        });
+        self.refresh_status();
+    }
+
+    fn toggle_micro_color(&mut self) {
+        self.micro_color = !self.micro_color;
+        if self.micro_color {
+            self.micro_enabled = true;
+            self.einstein_debug = false;
+        }
+        self.sync_view_menu();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_einstein_debug(self.einstein_debug, self.einstein_seed);
+            renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
+        }
+        self.append(if self.micro_color {
+            "Microtriangle colors are on. Generated triangles draw orange. The shaded material is still the path when this is off."
+        } else {
+            "Microtriangle colors are off. Generated triangles use the surface material."
+        });
+        self.refresh_status();
+    }
+
+    fn micro_status(&self) -> String {
+        if !self.micro_enabled {
+            return String::new();
+        }
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let base = stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0);
+        let triangles = stats.map(|stats| stats.micro_triangles).unwrap_or(0);
+        let patches = stats.map(|stats| stats.micro_patches).unwrap_or(0);
+        let samples = stats.map(|stats| stats.micro_samples).unwrap_or(0);
+        let vertices = stats.map(|stats| stats.micro_vertices).unwrap_or(0);
+        let generation = stats.map(|stats| stats.micro_generation_us).unwrap_or(0);
+        let upload = stats.map(|stats| stats.micro_upload_us).unwrap_or(0);
+        let fallbacks = stats.map(|stats| stats.micro_fallbacks).unwrap_or(0);
+        let projected = self.shop_detail_px().unwrap_or(0.0);
+        format!(
+            "base tris {} | micro tris +{} | patches {} | samples {} | verts {} | gen {} us | upload {} us | queue {} us | publish {} us | reuse {} | cancelled {} | stale {} | {} | fallback {} | projected {:.2} px | seed {} | ",
+            grouped(base),
+            grouped(triangles),
+            patches,
+            samples,
+            vertices,
+            generation,
+            upload,
+            stats.map(|stats| stats.micro_queue_wait_us).unwrap_or(0),
+            stats.map(|stats| stats.micro_publish_us).unwrap_or(0),
+            stats.map(|stats| stats.micro_reused).unwrap_or(0),
+            stats.map(|stats| stats.micro_cancelled).unwrap_or(0),
+            stats.map(|stats| stats.micro_stale_discarded).unwrap_or(0),
+            self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready"),
+            fallbacks,
+            projected,
+            self.micro_seed
+        )
+    }
+
+    fn micro_distance(&self, name: &str) -> f64 {
+        self.rfc_distances.iter().find(|(label, _)| label == name).map(|(_, distance)| *distance).unwrap_or(2.4)
+    }
+
+    fn micro_publish_settled(&self) -> bool {
+        let job_busy = self.micro_job.as_ref().is_some_and(|job| !job.finished);
+        let ready = self.renderer.as_ref().map(|renderer| renderer.micro_publish_settled()).unwrap_or(true);
+        !job_busy && ready
+    }
+
+    fn await_micro_publish(&mut self) -> bool {
+        if self.micro_publish_settled() {
+            return true;
+        }
+        if self.lod_hold > 1200 {
+            self.transition_reasons.push("\"microgeometry publish did not settle\"".into());
+            self.finish_transition();
+        }
+        false
+    }
+
+    fn micro_operation_stage(&self) -> String {
+        if let Some(job) = &self.micro_job {
+            if !job.finished {
+                if let Some(snap) = self.jobs.snapshots().iter().find(|snap| snap.id == job.id) {
+                    return snap.stage.clone();
+                }
+                return "Queued".into();
+            }
+        }
+        self.renderer.as_ref().map(|renderer| renderer.micro_stage().to_string()).unwrap_or_else(|| "Ready".into())
+    }
+
+    fn step_micro_phases(&mut self) {
+        if self.lod_phase != 50 && !self.micro_publish_settled() {
+            if self.lod_hold > 1200 {
+                println!("RFC0002_MICRO_FAIL publish did not settle");
+                self.finish_lod_capture();
+            }
+            return;
+        }
+        let wait = if matches!(self.lod_phase, 55 | 56 | 57 | 58 | 60) { 10 } else { 6 };
+        if self.lod_hold < wait {
+            return;
+        }
+        match self.lod_phase {
+            50 => {
+                self.micro_seal = self.townshop_seal();
+                self.capture_micro_shot("off-close");
+                self.micro_enabled = true;
+                self.micro_color = false;
+                self.push_micro_state();
+                self.lod_phase = 51;
+            }
+            51 => {
+                self.capture_micro_shot("on-close");
+                self.lod_phase = 52;
+            }
+            52 => {
+                self.capture_micro_shot("on-close-again");
+                if let Some(camera) = self.editor_camera.as_mut() {
+                    camera.yaw += 0.45;
+                    camera.reorbit();
+                }
+                self.lod_phase = 53;
+            }
+            53 => {
+                self.capture_micro_shot("on-orbit");
+                self.place_shop_camera(self.micro_distance("partial"));
+                self.lod_phase = 55;
+            }
+            55 => {
+                self.capture_micro_shot("partial");
+                self.place_shop_camera(self.micro_distance("medium"));
+                self.lod_phase = 56;
+            }
+            56 => {
+                self.capture_micro_shot("medium");
+                self.place_shop_camera(self.micro_distance("far"));
+                self.lod_phase = 57;
+            }
+            57 => {
+                self.capture_micro_shot("far");
+                self.place_shop_camera(self.micro_distance("near"));
+                self.lod_phase = 58;
+            }
+            58 => {
+                self.capture_micro_shot("shaded-near");
+                self.micro_color = true;
+                self.push_micro_state();
+                self.lod_phase = 59;
+            }
+            59 => {
+                self.capture_micro_shot("color-near");
+                self.micro_color = false;
+                self.micro_enabled = false;
+                self.push_micro_state();
+                self.place_shop_camera(self.micro_distance("close"));
+                self.lod_phase = 60;
+            }
+            60 => {
+                self.capture_micro_shot("disabled-close");
+                self.finish_rfc0002_micro();
+                return;
+            }
+            _ => {
+                self.finish_rfc0002_micro();
+                return;
+            }
+        }
+        self.lod_hold = 0;
+    }
+
+    fn push_micro_state(&mut self) {
+        self.sync_view_menu();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_einstein_debug(false, self.einstein_seed);
+            renderer.set_micro_surface(self.micro_surface);
+            renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
+        }
+        self.einstein_debug = false;
+    }
+
+    fn capture_micro_shot(&mut self, name: &str) {
+        self.refresh_status();
+        if !self.status.is_null() {
+            unsafe { UpdateWindow(self.status); }
+        }
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let projected = self.shop_detail_px().unwrap_or(0.0);
+        let directory = format!("{}/../target/rfc0002-micro", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let mut rgba = Vec::new();
+        let mut width = 0;
+        let mut height = 0;
+        let mut region = (0, 0, 1, 1);
+        let mut orange = 0.0;
+        if let Ok(image) = capture_window_image(self.frame) {
+            let _ = write_png(&format!("{directory}/{name}.png"), &image);
+            let (origin_x, origin_y, view_w, view_h) = viewport_origin(self.frame, self.panel_hwnd(PERSPECTIVE));
+            region = shop_region(self.shop_projection().as_ref(), origin_x, origin_y, view_w, view_h, image.width, image.height);
+            orange = orange_fraction(&image.rgba, image.width, region);
+            rgba = image.rgba;
+            width = image.width;
+            height = image.height;
+        }
+        let shot = MicroShot {
+            name: name.into(),
+            base_triangles: stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0),
+            leaves: stats.map(|stats| stats.hierarchy_leaves).unwrap_or(0),
+            leaf_triangles: stats.map(|stats| stats.hierarchy_leaf_triangles).unwrap_or(0),
+            patches: stats.map(|stats| stats.micro_patches).unwrap_or(0),
+            samples: stats.map(|stats| stats.micro_samples).unwrap_or(0),
+            vertices: stats.map(|stats| stats.micro_vertices).unwrap_or(0),
+            triangles: stats.map(|stats| stats.micro_triangles).unwrap_or(0),
+            generation_us: stats.map(|stats| stats.micro_generation_us).unwrap_or(0),
+            upload_us: stats.map(|stats| stats.micro_upload_us).unwrap_or(0),
+            fallbacks: stats.map(|stats| stats.micro_fallbacks).unwrap_or(0),
+            ordinary: stats.map(|stats| stats.micro_ordinary).unwrap_or(0),
+            fingerprint: stats.map(|stats| stats.micro_fingerprint).unwrap_or(0),
+            displacement_um: stats.map(|stats| stats.micro_max_displacement_um).unwrap_or(0),
+            projected_px: projected,
+            orange,
+            rgba,
+            width,
+            height,
+            region,
+        };
+        println!(
+            "RFC0002_MICRO_SHOT {name} base={} micro={} patches={} samples={} verts={} ordinary={} fallback={} gen_us={} upload_us={} disp_um={} fingerprint={:x} projected={projected:.2} orange={orange:.3} leaves={} leaf_tris={} image={}x{}",
+            shot.base_triangles,
+            shot.triangles,
+            shot.patches,
+            shot.samples,
+            shot.vertices,
+            shot.ordinary,
+            shot.fallbacks,
+            shot.generation_us,
+            shot.upload_us,
+            shot.displacement_um,
+            shot.fingerprint,
+            shot.leaves,
+            shot.leaf_triangles,
+            shot.width,
+            shot.height
+        );
+        self.micro_shots.push(shot);
+    }
+
+    fn townshop_seal(&self) -> Option<SourceSeal> {
+        let entity = self.find_named_entity("townshop")?;
+        let snapshot = self.engine.world().extract(jarvig_core::RenderFrameId(77)).ok()?;
+        let instance = snapshot.instances().iter().find(|instance| instance.entity == entity)?;
+        let mesh = self.engine.world().meshes().get(instance.mesh)?;
+        let stream = mesh.streams().first()?;
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let asset = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
+            _ => None,
+        });
+        let (parents_len, parents_modified) = asset
+            .and_then(|asset| self.parent_cache_path(asset))
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_secs())
+                    .unwrap_or(0);
+                (meta.len(), modified)
+            })
+            .unwrap_or((0, 0));
+        Some(SourceSeal {
+            vertices: mesh.vertex_count(),
+            bytes: stream.bytes.len() as u64,
+            hash: hash_bytes(&stream.bytes),
+            leaf_triangles: stats.map(|stats| stats.hierarchy_leaf_triangles).unwrap_or(0),
+            hierarchy_nodes: stats.map(|stats| stats.hierarchy_nodes).unwrap_or(0),
+            parents_len,
+            parents_modified,
+        })
+    }
+
+    fn finish_rfc0002_micro(&mut self) {
+        let directory = format!("{}/../target/rfc0002-micro", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let mut reasons = Vec::new();
+        let shot = |name: &str| self.micro_shots.iter().find(|shot| shot.name == name);
+        let (off, close, again, orbit, partial, medium, far, near, color, disabled) = match (
+            shot("off-close"),
+            shot("on-close"),
+            shot("on-close-again"),
+            shot("on-orbit"),
+            shot("partial"),
+            shot("medium"),
+            shot("far"),
+            shot("shaded-near"),
+            shot("color-near"),
+            shot("disabled-close"),
+        ) {
+            (Some(off), Some(close), Some(again), Some(orbit), Some(partial), Some(medium), Some(far), Some(near), Some(color), Some(disabled)) => {
+                (off, close, again, orbit, partial, medium, far, near, color, disabled)
+            }
+            _ => {
+                println!("RFC0002_MICRO_FAIL missing captures");
+                self.finish_lod_capture();
+                return;
+            }
+        };
+        if off.triangles != 0 || off.vertices != 0 {
+            reasons.push(format!("\"feature off drew {} micro triangles\"", off.triangles));
+        }
+        if close.triangles == 0 || close.triangles > 18432 {
+            reasons.push(format!("\"close generated {} micro triangles\"", close.triangles));
+        }
+        if close.base_triangles != off.base_triangles || close.leaves != off.leaves {
+            reasons.push(format!(
+                "\"close cut changed {}/{} vs {}/{}\"",
+                close.leaves, close.base_triangles, off.leaves, off.base_triangles
+            ));
+        }
+        if partial.triangles == 0 || partial.triangles >= close.triangles {
+            reasons.push(format!("\"partial micro {} did not fall below close {}\"", partial.triangles, close.triangles));
+        }
+        if medium.triangles != 0 {
+            reasons.push(format!("\"medium still generated {} micro triangles\"", medium.triangles));
+        }
+        if far.triangles != 0 {
+            reasons.push(format!("\"far still generated {} micro triangles\"", far.triangles));
+        }
+        if again.fingerprint != close.fingerprint || again.triangles != close.triangles {
+            reasons.push("\"repeat camera changed the generated geometry\"".into());
+        }
+        if orbit.fingerprint != close.fingerprint || orbit.triangles != close.triangles {
+            reasons.push("\"orbit changed the generated geometry\"".into());
+        }
+        for (name, shot) in [("close", close), ("partial", partial), ("near", near)] {
+            if shot.displacement_um > 8000 {
+                reasons.push(format!("\"{name} displacement {} um exceeds 8000\"", shot.displacement_um));
+            }
+        }
+        let end_seal = self.townshop_seal();
+        match (self.micro_seal.as_ref(), end_seal.as_ref()) {
+            (Some(start), Some(end)) => {
+                if start.vertices != end.vertices || start.bytes != end.bytes || start.hash != end.hash {
+                    reasons.push("\"source mesh bytes changed\"".into());
+                }
+                if start.leaf_triangles != end.leaf_triangles || start.hierarchy_nodes != end.hierarchy_nodes {
+                    reasons.push(format!(
+                        "\"hierarchy changed leaves {} nodes {} vs {} {}\"",
+                        start.leaf_triangles, start.hierarchy_nodes, end.leaf_triangles, end.hierarchy_nodes
+                    ));
+                }
+                if start.parents_len != end.parents_len || start.parents_modified != end.parents_modified {
+                    reasons.push("\"jarvigparents changed\"".into());
+                }
+                if start.leaf_triangles != 6_122_214 {
+                    reasons.push(format!("\"leaf triangles are {}\"", start.leaf_triangles));
+                }
+            }
+            _ => reasons.push("\"source seal missing\"".into()),
+        }
+        if disabled.triangles != 0 {
+            reasons.push(format!("\"disable left {} micro triangles\"", disabled.triangles));
+        }
+        if disabled.base_triangles != off.base_triangles {
+            reasons.push(format!("\"disable base {} differs from off {}\"", disabled.base_triangles, off.base_triangles));
+        }
+        let restore = mean_abs_diff(&off.rgba, &disabled.rgba, off.width, off.region, disabled.region);
+        if restore > 8.0 {
+            reasons.push(format!("\"disable pixel delta {restore:.2} is above 8\""));
+        }
+        if color.triangles == 0 || color.fingerprint != near.fingerprint {
+            reasons.push("\"color debug changed or dropped the micro triangles\"".into());
+        }
+        if color.orange <= near.orange || color.orange < near.orange * 2.0 {
+            reasons.push(format!("\"color debug orange {:.3} did not rise above shaded {:.3}\"", color.orange, near.orange));
+        }
+        let passed = reasons.is_empty();
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        let reasons_json = format!("[{}]", reasons.join(","));
+        let seal = self.micro_seal.as_ref();
+        let json = format!(
+            "{{\"verdict\":\"RFC0002_MICRO_{verdict}\",\"seed\":{},\"amplitude_m\":0.008,\"budget_triangles\":18432,\"off_micro\":{},\"close\":{{\"base\":{},\"micro\":{},\"patches\":{},\"samples\":{},\"verts\":{},\"ordinary\":{},\"fallback\":{},\"generation_us\":{},\"upload_us\":{},\"displacement_um\":{},\"projected_px\":{:.2}}},\"repeat_match\":{},\"orbit_match\":{},\"partial_micro\":{},\"medium_micro\":{},\"far_micro\":{},\"near_micro\":{},\"color_orange\":{:.4},\"shaded_orange\":{:.4},\"disabled_micro\":{},\"restore_delta\":{restore:.3},\"mesh_vertices\":{},\"mesh_hash\":\"{:x}\",\"parents_len\":{},\"reasons\":{reasons_json}}}",
+            self.micro_seed,
+            off.triangles,
+            close.base_triangles,
+            close.triangles,
+            close.patches,
+            close.samples,
+            close.vertices,
+            close.ordinary,
+            close.fallbacks,
+            close.generation_us,
+            close.upload_us,
+            close.displacement_um,
+            close.projected_px,
+            again.fingerprint == close.fingerprint,
+            orbit.fingerprint == close.fingerprint,
+            partial.triangles,
+            medium.triangles,
+            far.triangles,
+            near.triangles,
+            color.orange,
+            near.orange,
+            disabled.triangles,
+            seal.map(|seal| seal.vertices).unwrap_or(0),
+            seal.map(|seal| seal.hash).unwrap_or(0),
+            seal.map(|seal| seal.parents_len).unwrap_or(0)
+        );
+        let _ = std::fs::write(format!("{directory}/report.json"), json);
+        println!("RFC0002_MICRO_{verdict} {directory}");
+        println!("RFC0002_MICRO_REASONS {reasons_json}");
+        self.finish_lod_capture();
+    }
+
+    fn step_refine_phases(&mut self) {
+        match self.lod_phase {
+            90 => {
+                if self.lod_hold < 8 {
+                    return;
+                }
+                self.micro_seal = self.townshop_seal();
+                self.transition_off = Some(self.capture_relief_shot("shaded-off"));
+                self.micro_enabled = true;
+                self.micro_surface = false;
+                self.micro_color = false;
+                self.push_micro_state();
+                self.lod_phase = 91;
+                self.lod_hold = 0;
+            }
+            91 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 6 {
+                    return;
+                }
+                self.refine_hat = Some(self.capture_relief_shot("einstein-hat"));
+                self.micro_surface = true;
+                self.push_micro_state();
+                self.lod_phase = 92;
+                self.lod_hold = 0;
+            }
+            92 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 6 {
+                    return;
+                }
+                self.transition_on = Some(self.capture_relief_shot("refined-shaded"));
+                self.micro_color = true;
+                self.push_micro_state();
+                self.lod_phase = 93;
+                self.lod_hold = 0;
+            }
+            93 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 4 {
+                    return;
+                }
+                self.transition_color = Some(self.capture_relief_shot("refined-color"));
+                self.judge_refine();
+                self.micro_color = false;
+                self.micro_surface = true;
+                self.push_micro_state();
+                let near = self.shop_target().map(|target| target.half_z + 0.55).unwrap_or(1.2).clamp(1.05, 2.2);
+                self.place_shop_camera(near * 0.85);
+                if let Some(camera) = self.editor_camera.as_mut() {
+                    camera.pitch = -0.42;
+                    camera.reorbit();
+                }
+                self.lod_phase = 94;
+                self.lod_hold = 0;
+            }
+            94 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 6 {
+                    return;
+                }
+                self.refine_grazing = Some(self.capture_relief_shot("grazing"));
+                if let Some(grazing) = self.refine_grazing.as_ref() {
+                    if grazing.micro_triangles == 0 || grazing.invalid != 0 || grazing.displacement_um > 8000 {
+                        self.transition_reasons.push(format!(
+                            "\"grazing view micro {} invalid {} displacement {} um\"",
+                            grazing.micro_triangles, grazing.invalid, grazing.displacement_um
+                        ));
+                    }
+                }
+                self.transition_index = 0;
+                if let Some(distance) = self.transition_distances.first().copied() {
+                    self.place_shop_camera(distance);
+                }
+                self.lod_phase = 80;
+                self.lod_hold = 0;
+            }
+            _ => self.finish_transition(),
+        }
+    }
+
+    fn judge_refine(&mut self) {
+        let directory = format!("{}/../target/rfc0002-refine", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let gathered = self.transition_off.as_ref().zip(self.refine_hat.as_ref()).zip(self.transition_on.as_ref()).zip(self.transition_color.as_ref()).map(|(((off, hat), refined), color)| {
+            (
+                off.micro_triangles,
+                hat.micro_triangles,
+                refined.micro_triangles,
+                color.micro_triangles,
+                hat.fingerprint,
+                refined.fingerprint,
+                color.fingerprint,
+                refined.invalid,
+                color.invalid,
+                refined.displacement_um,
+                refined.leaf_triangles,
+                off.base_triangles,
+                relief_metrics(off, refined, color),
+                compose_shots(&[off, hat, refined, color]),
+            )
+        });
+        let Some((off_micro, hat_micro, refined_micro, color_micro, hat_fp, refined_fp, color_fp, refined_invalid, color_invalid, displacement_um, leaf_triangles, off_base, metrics, review)) = gathered else {
+            self.transition_reasons.push("\"refine comparison captures missing\"".into());
+            return;
+        };
+        println!("RFC0002_REFINE_COMPARE off={off_micro} hat={hat_micro} refined={refined_micro} color={color_micro} hat_fp={hat_fp:x} refined_fp={refined_fp:x} disp_um={displacement_um} invalid={refined_invalid}");
+        if off_micro != 0 {
+            self.transition_reasons.push(format!("\"feature off drew {off_micro} micro triangles\""));
+        }
+        if hat_micro == 0 {
+            self.transition_reasons.push("\"einstein hat comparison drew no triangles\"".into());
+        }
+        if refined_micro == 0 || refined_micro > 18432 {
+            self.transition_reasons.push(format!("\"refined surface drew {refined_micro} micro triangles\""));
+        }
+        if refined_fp == hat_fp {
+            self.transition_reasons.push("\"refined surface reused the tent fingerprint\"".into());
+        }
+        if refined_invalid != 0 || color_invalid != 0 {
+            self.transition_reasons.push(format!("\"refined surface failed {} validity checks\"", refined_invalid.saturating_add(color_invalid)));
+        }
+        if displacement_um > 8000 {
+            self.transition_reasons.push(format!("\"refined displacement {displacement_um} um exceeds 8000\""));
+        }
+        if color_fp != refined_fp || color_micro != refined_micro {
+            self.transition_reasons.push("\"refined color debug does not match the shaded mesh\"".into());
+        }
+        if leaf_triangles != 6_122_214 || off_base == 0 {
+            self.transition_reasons.push("\"base hierarchy changed during the refine comparison\"".into());
+        }
+        println!(
+            "RFC0002_REFINE_RELIEF mean={:.3} changed={:.4} marks={} overlap={:.3} outside={:.3} hole_ratio={:.4}",
+            metrics.mean_diff, metrics.changed_fraction, metrics.marks, metrics.overlap, metrics.outside_diff, metrics.hole_ratio
+        );
+        if metrics.mean_diff < 0.35 {
+            self.transition_reasons.push(format!("\"refined relief mean diff {:.3} is below 0.35\"", metrics.mean_diff));
+        }
+        if metrics.changed_fraction > 0.35 {
+            self.transition_reasons.push(format!("\"refined relief covers {:.4} of the shop\"", metrics.changed_fraction));
+        }
+        if metrics.marks < 40 || metrics.overlap < 0.20 {
+            self.transition_reasons.push(format!("\"refined marks {} overlap {:.3}\"", metrics.marks, metrics.overlap));
+        }
+        if metrics.solid >= 64 && metrics.hole_ratio > 0.02 {
+            self.transition_reasons.push(format!("\"refined silhouette hole ratio {:.4}\"", metrics.hole_ratio));
+        }
+        if let Some(review) = review {
+            let _ = write_png(&format!("{directory}/review.png"), &review);
+            println!("RFC0002_REFINE_REVIEW {directory}/review.png");
+        }
+    }
+
+    fn evidence_directory(&self) -> String {
+        let name = if self.rfc0002_refine { "rfc0002-refine" } else { "rfc0002-transition" };
+        format!("{}/../target/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn transition_path(&mut self) -> Vec<f64> {
+        let mut forward = Vec::new();
+        let mut pixels = 3.20_f64;
+        while pixels >= 0.50 - 1.0e-9 {
+            forward.push(self.projected_error_distance(0.02, pixels));
+            pixels -= 0.12;
+        }
+        self.transition_forward = forward.len();
+        let mut path = forward.clone();
+        for distance in forward.iter().rev().skip(1) {
+            path.push(*distance);
+        }
+        path
+    }
+
+    fn step_transition_phases(&mut self) {
+        match self.lod_phase {
+            70 => {
+                if self.lod_hold < 8 {
+                    return;
+                }
+                self.micro_seal = self.townshop_seal();
+                self.transition_off = Some(self.capture_relief_shot("shaded-off"));
+                self.micro_enabled = true;
+                self.micro_color = false;
+                self.push_micro_state();
+                self.lod_phase = 71;
+                self.lod_hold = 0;
+            }
+            71 => {
+                if self.transition_align == 1 {
+                    if self.lod_hold < 2 {
+                        return;
+                    }
+                    self.transition_off = Some(self.capture_relief_shot("shaded-off"));
+                    self.micro_enabled = true;
+                    self.micro_color = false;
+                    self.push_micro_state();
+                    self.transition_align = 2;
+                    self.lod_hold = 0;
+                    return;
+                }
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 6 {
+                    return;
+                }
+                let (width, height) = self.frame_window_size();
+                let resized = self.transition_align == 0
+                    && self.transition_off.as_ref().is_some_and(|shot| shot.width != width || shot.height != height);
+                if resized {
+                    println!("RFC0002_TRANSITION_RESIZE {width}x{height}");
+                    self.micro_enabled = false;
+                    self.micro_color = false;
+                    self.push_micro_state();
+                    self.transition_align = 1;
+                    self.lod_hold = 0;
+                    return;
+                }
+                self.transition_on = Some(self.capture_relief_shot("shaded-on"));
+                self.micro_color = true;
+                self.push_micro_state();
+                self.lod_phase = 72;
+                self.lod_hold = 0;
+            }
+            72 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                if self.lod_hold < 4 {
+                    return;
+                }
+                self.transition_color = Some(self.capture_relief_shot("color-on"));
+                self.judge_relief();
+                self.micro_color = false;
+                self.push_micro_state();
+                self.transition_index = 0;
+                if let Some(distance) = self.transition_distances.first().copied() {
+                    self.place_shop_camera(distance);
+                }
+                self.lod_phase = 80;
+                self.lod_hold = 0;
+            }
+            80 => {
+                if !self.await_micro_publish() {
+                    return;
+                }
+                self.record_transition_frame();
+                self.transition_index = self.transition_index.saturating_add(1);
+                if self.transition_index >= self.transition_distances.len() {
+                    self.finish_transition();
+                    return;
+                }
+                if let Some(distance) = self.transition_distances.get(self.transition_index).copied() {
+                    self.place_shop_camera(distance);
+                }
+                self.lod_hold = 0;
+            }
+            _ => self.finish_transition(),
+        }
+    }
+
+    fn frame_window_size(&self) -> (i32, i32) {
+        unsafe {
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if GetWindowRect(self.frame, &mut rect) == 0 {
+                return (0, 0);
+            }
+            (rect.right - rect.left, rect.bottom - rect.top)
+        }
+    }
+
+    fn capture_relief_shot(&mut self, name: &str) -> ReliefShot {
+        self.refresh_status();
+        if !self.status.is_null() {
+            unsafe { UpdateWindow(self.status); }
+        }
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let directory = self.evidence_directory();
+        let _ = std::fs::create_dir_all(&directory);
+        let mut rgba = Vec::new();
+        let mut width = 0;
+        let mut height = 0;
+        let mut region = (0, 0, 1, 1);
+        let mut origin = (0, 0, 1, 1);
+        if let Ok(image) = capture_window_image(self.frame) {
+            let _ = write_png(&format!("{directory}/{name}.png"), &image);
+            origin = viewport_origin(self.frame, self.panel_hwnd(PERSPECTIVE));
+            let (origin_x, origin_y, view_w, view_h) = origin;
+            region = shop_region(self.shop_projection().as_ref(), origin_x, origin_y, view_w, view_h, image.width, image.height);
+            rgba = image.rgba;
+            width = image.width;
+            height = image.height;
+        }
+        let shot = ReliefShot {
+            rgba,
+            width,
+            height,
+            region,
+            origin,
+            base_triangles: stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0),
+            micro_triangles: stats.map(|stats| stats.micro_triangles).unwrap_or(0),
+            vertices: stats.map(|stats| stats.micro_vertices).unwrap_or(0),
+            fingerprint: stats.map(|stats| stats.micro_fingerprint).unwrap_or(0),
+            invalid: stats.map(|stats| stats.micro_invalid).unwrap_or(0),
+            displacement_um: stats.map(|stats| stats.micro_max_displacement_um).unwrap_or(0),
+            projected_px: self.shop_detail_px().unwrap_or(0.0),
+            generation_us: stats.map(|stats| stats.micro_generation_us).unwrap_or(0),
+            upload_us: stats.map(|stats| stats.micro_upload_us).unwrap_or(0),
+            reused: stats.map(|stats| stats.micro_reused).unwrap_or(0),
+            leaf_triangles: stats.map(|stats| stats.hierarchy_leaf_triangles).unwrap_or(0),
+        };
+        println!(
+            "RFC0002_TRANSITION_SHOT {name} base={} micro={} verts={} invalid={} disp_um={} fingerprint={:x} projected={:.2} gen_us={} upload_us={} reuse={} leaf_tris={} image={}x{}",
+            shot.base_triangles,
+            shot.micro_triangles,
+            shot.vertices,
+            shot.invalid,
+            shot.displacement_um,
+            shot.fingerprint,
+            shot.projected_px,
+            shot.generation_us,
+            shot.upload_us,
+            shot.reused,
+            shot.leaf_triangles,
+            shot.width,
+            shot.height
+        );
+        shot
+    }
+
+    fn judge_relief(&mut self) {
+        let directory = self.evidence_directory();
+        let _ = std::fs::create_dir_all(&directory);
+        let compared = self.transition_off.as_ref().zip(self.transition_on.as_ref()).zip(self.transition_color.as_ref()).map(|((off, on), color)| {
+            (
+                off.micro_triangles,
+                on.micro_triangles,
+                on.invalid,
+                color.invalid,
+                on.displacement_um,
+                on.base_triangles,
+                on.leaf_triangles,
+                on.fingerprint,
+                color.fingerprint,
+                color.micro_triangles,
+                relief_metrics(off, on, color),
+                compose_review(off, on, color),
+            )
+        });
+        let Some((off_micro, on_micro, on_invalid, color_invalid, displacement_um, base_triangles, leaf_triangles, on_fingerprint, color_fingerprint, color_micro, metrics, review)) = compared else {
+            self.transition_reasons.push("\"relief captures missing\"".into());
+            return;
+        };
+        if off_micro != 0 {
+            self.transition_reasons.push(format!("\"shaded off drew {off_micro} micro triangles\""));
+        }
+        if on_micro == 0 || on_micro > 18432 {
+            self.transition_reasons.push(format!("\"shaded on drew {on_micro} micro triangles\""));
+        }
+        if on_invalid != 0 || color_invalid != 0 {
+            self.transition_reasons.push(format!("\"generated geometry failed {} validity checks\"", on_invalid.saturating_add(color_invalid)));
+        }
+        if displacement_um > 8000 {
+            self.transition_reasons.push(format!("\"displacement {displacement_um} um exceeds 8000\""));
+        }
+        if base_triangles == 0 || leaf_triangles != 6_122_214 {
+            self.transition_reasons.push(format!("\"base surface {base_triangles} leaf {leaf_triangles}\""));
+        }
+        if color_fingerprint != on_fingerprint || color_micro != on_micro {
+            self.transition_reasons.push("\"color debug does not match the shaded micro mesh\"".into());
+        }
+        println!(
+            "RFC0002_TRANSITION_RELIEF mean={:.3} changed={:.4} marks={} overlap={:.3} outside={:.3} holes={} solid={} hole_ratio={:.4}",
+            metrics.mean_diff,
+            metrics.changed_fraction,
+            metrics.marks,
+            metrics.overlap,
+            metrics.outside_diff,
+            metrics.holes,
+            metrics.solid,
+            metrics.hole_ratio
+        );
+        if metrics.mean_diff < 0.35 || metrics.mean_diff > 8.0 {
+            self.transition_reasons.push(format!("\"shaded relief mean diff {:.3} is outside 0.35..8\"", metrics.mean_diff));
+        }
+        if metrics.changed_fraction < 0.001 || metrics.changed_fraction > 0.20 {
+            self.transition_reasons.push(format!("\"shaded relief covers {:.4} of the shop\"", metrics.changed_fraction));
+        }
+        if metrics.marks < 40 {
+            self.transition_reasons.push(format!("\"color debug marked only {} shop pixels\"", metrics.marks));
+        }
+        if metrics.overlap < 0.20 {
+            self.transition_reasons.push(format!("\"only {:.3} of the color marks sit on shaded relief\"", metrics.overlap));
+        }
+        if metrics.outside_diff > metrics.mean_diff + 0.25 {
+            self.transition_reasons.push(format!("\"relief diff outside the marks {:.3} exceeds the shop mean {:.3}\"", metrics.outside_diff, metrics.mean_diff));
+        }
+        if metrics.solid >= 64 && metrics.hole_ratio > 0.02 {
+            self.transition_reasons.push(format!("\"silhouette hole ratio {:.4} exceeds 0.02\"", metrics.hole_ratio));
+        }
+        if let Some(review) = review {
+            let _ = write_png(&format!("{directory}/review.png"), &review);
+            println!("RFC0002_TRANSITION_REVIEW {directory}/review.png");
+        }
+    }
+
+    fn record_transition_frame(&mut self) {
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let distance = self.transition_distances.get(self.transition_index).copied().unwrap_or(0.0);
+        let row = TransitionRow {
+            distance,
+            projected_px: self.shop_detail_px().unwrap_or(0.0),
+            base_triangles: stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0),
+            micro_triangles: stats.map(|stats| stats.micro_triangles).unwrap_or(0),
+            vertices: stats.map(|stats| stats.micro_vertices).unwrap_or(0),
+            generation_us: stats.map(|stats| stats.micro_generation_us).unwrap_or(0),
+            upload_us: stats.map(|stats| stats.micro_upload_us).unwrap_or(0),
+            reused: stats.map(|stats| stats.micro_reused).unwrap_or(0),
+            fingerprint: stats.map(|stats| stats.micro_fingerprint).unwrap_or(0),
+            invalid: stats.map(|stats| stats.micro_invalid).unwrap_or(0),
+            leaf_triangles: stats.map(|stats| stats.hierarchy_leaf_triangles).unwrap_or(0),
+        };
+        let leg = if self.transition_index < self.transition_forward { "out" } else { "back" };
+        println!(
+            "RFC0002_TRANSITION_FRAME {leg} distance={:.3} projected={:.3} base={} micro={} verts={} gen_us={} upload_us={} queue_us={} publish_us={} reuse={} cancelled={} stale={} partial={} fingerprint={:x} leaves={}",
+            row.distance,
+            row.projected_px,
+            row.base_triangles,
+            row.micro_triangles,
+            row.vertices,
+            row.generation_us,
+            row.upload_us,
+            stats.map(|stats| stats.micro_queue_wait_us).unwrap_or(0),
+            stats.map(|stats| stats.micro_publish_us).unwrap_or(0),
+            row.reused,
+            stats.map(|stats| stats.micro_cancelled).unwrap_or(0),
+            stats.map(|stats| stats.micro_stale_discarded).unwrap_or(0),
+            stats.map(|stats| stats.micro_partial).unwrap_or(0),
+            row.fingerprint,
+            row.leaf_triangles
+        );
+        if leg == "out" && (0.55..1.45).contains(&row.projected_px) {
+            if let Ok(image) = capture_window_image(self.frame) {
+                let directory = self.evidence_directory();
+                let _ = std::fs::create_dir_all(&directory);
+                let _ = write_png(&format!("{directory}/boundary-{:02}-{:.2}.png", self.transition_index, row.projected_px), &image);
+                let (origin_x, origin_y, view_w, view_h) = viewport_origin(self.frame, self.panel_hwnd(PERSPECTIVE));
+                let region = shop_region(self.shop_projection().as_ref(), origin_x, origin_y, view_w, view_h, image.width, image.height);
+                let (crop_w, crop_h, crop) = crop_rgba(&image.rgba, image.width, region);
+                let (scaled_w, scaled_h, scaled) = scale_nearest(&crop, crop_w, crop_h, 160, 120);
+                self.transition_crops.push((row.projected_px, scaled, scaled_w, scaled_h));
+            }
+        }
+        self.transition_rows.push(row);
+    }
+
+    fn finish_transition(&mut self) {
+        let directory = self.evidence_directory();
+        let _ = std::fs::create_dir_all(&directory);
+        let mut lines = vec!["leg,distance,projected_error,base_tris,micro_tris,generated_verts,generation_us,upload_us,reuse,fingerprint".to_string()];
+        for (index, row) in self.transition_rows.iter().enumerate() {
+            let leg = if index < self.transition_forward { "out" } else { "back" };
+            lines.push(format!(
+                "{leg},{:.4},{:.4},{},{},{},{},{},{},{:x}",
+                row.distance, row.projected_px, row.base_triangles, row.micro_triangles, row.vertices, row.generation_us, row.upload_us, row.reused, row.fingerprint
+            ));
+        }
+        let _ = std::fs::write(format!("{directory}/frames.csv"), lines.join("\n"));
+        let forward = self.transition_forward.min(self.transition_rows.len());
+        let outbound = &self.transition_rows[..forward];
+        for pair in outbound.windows(2) {
+            if pair[1].micro_triangles > pair[0].micro_triangles {
+                self.transition_reasons.push(format!(
+                    "\"micro triangles rose from {} to {} while projected error fell from {:.2} to {:.2}\"",
+                    pair[0].micro_triangles, pair[1].micro_triangles, pair[0].projected_px, pair[1].projected_px
+                ));
+            }
+        }
+        if outbound.iter().any(|row| row.projected_px <= 0.55 && row.micro_triangles != 0) {
+            self.transition_reasons.push("\"micro triangles remained below the 1 px threshold\"".into());
+        }
+        if outbound.iter().any(|row| row.projected_px >= 2.2 && row.micro_triangles == 0) {
+            self.transition_reasons.push("\"micro triangles were absent while projected error was above 2.2 px\"".into());
+        }
+        let plateau: Vec<u32> = outbound.iter().filter(|row| row.projected_px >= 2.2).map(|row| row.micro_triangles).collect();
+        if plateau.len() >= 2 && plateau.iter().any(|count| *count != plateau[0]) {
+            self.transition_reasons.push("\"the close plateau did not keep one micro triangle count\"".into());
+        }
+        let back_start = forward;
+        let back_len = self.transition_rows.len().saturating_sub(back_start);
+        for k in 0..back_len {
+            let outbound_index = forward.saturating_sub(2).saturating_sub(k);
+            let Some(outbound_row) = self.transition_rows.get(outbound_index) else { continue };
+            let Some(return_row) = self.transition_rows.get(back_start + k) else { continue };
+            if return_row.fingerprint != outbound_row.fingerprint || return_row.micro_triangles != outbound_row.micro_triangles {
+                self.transition_reasons.push(format!(
+                    "\"return at {:.2} m fingerprint {:x}/{} did not match outbound {:x}/{}\"",
+                    return_row.distance, return_row.fingerprint, return_row.micro_triangles, outbound_row.fingerprint, outbound_row.micro_triangles
+                ));
+                break;
+            }
+        }
+        for index in 1..self.transition_rows.len() {
+            let previous = &self.transition_rows[index - 1];
+            let row = &self.transition_rows[index];
+            if row.fingerprint == previous.fingerprint && row.micro_triangles == previous.micro_triangles && (row.reused != 1 || row.generation_us != 0 || row.upload_us != 0) {
+                self.transition_reasons.push(format!(
+                    "\"frame {index} repeated fingerprint {:x} but regenerated gen {} upload {} reuse {}\"",
+                    row.fingerprint, row.generation_us, row.upload_us, row.reused
+                ));
+                break;
+            }
+            if row.base_triangles < 500_000 {
+                self.transition_reasons.push(format!("\"frame {index} base surface fell to {} triangles\"", row.base_triangles));
+                break;
+            }
+            if index + 1 < self.transition_rows.len() {
+                let next = &self.transition_rows[index + 1];
+                let dipped = row.base_triangles * 100 < previous.base_triangles * 55;
+                let recovered = next.base_triangles * 100 > row.base_triangles * 140 && next.base_triangles * 100 > previous.base_triangles * 80;
+                if dipped && recovered {
+                    self.transition_reasons.push(format!("\"frame {index} dropped the base surface for one frame\""));
+                    break;
+                }
+            }
+            if row.invalid != 0 {
+                self.transition_reasons.push(format!("\"frame {index} had {} invalid micro triangles\"", row.invalid));
+                break;
+            }
+        }
+        let reused = self.transition_rows.iter().filter(|row| row.reused == 1).count();
+        if reused < 3 {
+            self.transition_reasons.push(format!("\"only {reused} frames reused an unchanged patch set\""));
+        }
+        let end_seal = self.townshop_seal();
+        match (self.micro_seal.as_ref(), end_seal.as_ref()) {
+            (Some(start), Some(end)) => {
+                if start.vertices != end.vertices || start.bytes != end.bytes || start.hash != end.hash {
+                    self.transition_reasons.push("\"source mesh bytes changed\"".into());
+                }
+                if start.leaf_triangles != end.leaf_triangles || start.hierarchy_nodes != end.hierarchy_nodes || start.leaf_triangles != 6_122_214 {
+                    self.transition_reasons.push("\"RFC-0001 hierarchy changed\"".into());
+                }
+                if start.parents_len != end.parents_len || start.parents_modified != end.parents_modified {
+                    self.transition_reasons.push("\"jarvigparents changed\"".into());
+                }
+            }
+            _ => self.transition_reasons.push("\"source seal missing\"".into()),
+        }
+        if let Some(strip) = compose_transition_strip(&self.transition_crops) {
+            let _ = write_png(&format!("{directory}/transition-strip.png"), &strip);
+            println!("RFC0002_TRANSITION_STRIP {directory}/transition-strip.png");
+        }
+        let passed = self.transition_reasons.is_empty();
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        let reasons_json = format!("[{}]", self.transition_reasons.join(","));
+        let max_gen = self.transition_rows.iter().map(|row| row.generation_us).max().unwrap_or(0);
+        let max_upload = self.transition_rows.iter().map(|row| row.upload_us).max().unwrap_or(0);
+        let json = format!(
+            "{{\"verdict\":\"RFC0002_TRANSITION_{verdict}\",\"frames\":{},\"reused_frames\":{reused},\"max_generation_us\":{max_gen},\"max_upload_us\":{max_upload},\"reasons\":{reasons_json}}}",
+            self.transition_rows.len()
+        );
+        let _ = std::fs::write(format!("{directory}/report.json"), json);
+        println!("RFC0002_TRANSITION_{verdict} {directory}");
+        if self.rfc0002_refine {
+            println!("RFC0002_REFINE_{verdict} {directory}");
+        }
+        println!("RFC0002_TRANSITION_REASONS {reasons_json}");
+        self.finish_lod_capture();
+    }
+
+    fn toggle_einstein_debug(&mut self) {
+        self.einstein_debug = !self.einstein_debug;
+        self.sync_view_menu();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_einstein_debug(self.einstein_debug, self.einstein_seed);
+        }
+        self.append(if self.einstein_debug {
+            "Einstein detail debug is on. A coarse projected error keeps the ordinary material. A fine error draws the hat sample on the same surface. The hierarchy is unchanged."
+        } else {
+            "Einstein detail debug is off. The ordinary material is drawn."
+        });
+        self.refresh_status();
+    }
+
+    fn ensure_einstein_uvs(&mut self) {
+        if !self.einstein_uvs.is_empty() {
+            return;
+        }
+        let Some(entity) = self.find_named_entity("townshop") else { return };
+        let Ok(snapshot) = self.engine.world().extract(jarvig_core::RenderFrameId(77)) else { return };
+        let Some(instance) = snapshot.instances().iter().find(|instance| instance.entity == entity) else { return };
+        let Some(mesh) = self.engine.world().meshes().get(instance.mesh) else { return };
+        let Some(stream) = mesh.streams().first() else { return };
+        if stream.stride != 60 {
+            return;
+        }
+        let count = stream.bytes.len() / 60;
+        let step = (count / 256).max(1);
+        let mut uvs = Vec::new();
+        for index in (0..count).step_by(step) {
+            let offset = index * 60 + 24;
+            let Some(bytes) = stream.bytes.get(offset..offset + 8) else { break };
+            let u = f32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4]));
+            let v = f32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4]));
+            if u.is_finite() && v.is_finite() {
+                uvs.push([u, v]);
+            }
+            if uvs.len() == 256 {
+                break;
+            }
+        }
+        self.einstein_uvs = uvs;
+    }
+
+    fn shop_detail_px(&self) -> Option<f32> {
+        let target = self.shop_target()?;
+        let camera = self.editor_camera.as_ref()?;
+        let forward = camera.forward();
+        let dx = target.center.x - camera.position.x;
+        let dy = target.center.y - camera.position.y;
+        let dz = target.center.z - camera.position.z;
+        let depth = (dx * forward.x + dy * forward.y + dz * forward.z).max(0.05) as f32;
+        let tan_y = (camera.vertical_fov_radians * 0.5).tan() as f32;
+        Some(jarvig_core::projected_detail_px(jarvig_core::DETAIL_FEATURE_SIZE_M, depth, self.viewport_px.1.max(1) as f32, tan_y))
+    }
+
+    fn capture_einstein_shot(&mut self, name: &str) -> EinsteinCapture {
+        let projected = self.shop_detail_px().unwrap_or(0.0);
+        let probe = jarvig_core::probe_detail(&self.einstein_uvs, self.einstein_seed, projected, self.einstein_debug);
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let draws = stats.map(|stats| stats.einstein_debug_draws).unwrap_or(0);
+        let triangles = stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0);
+        let leaves = stats.map(|stats| stats.hierarchy_leaves).unwrap_or(0);
+        let directory = format!("{}/../target/rfc0002", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let mut rgba = Vec::new();
+        let mut width = 0;
+        let mut height = 0;
+        let mut region = (0, 0, 1, 1);
+        let mut palette = 0.0;
+        if let Ok(image) = capture_window_image(self.frame) {
+            let _ = write_png(&format!("{directory}/{name}.png"), &image);
+            let (origin_x, origin_y, view_w, view_h) = viewport_origin(self.frame, self.panel_hwnd(PERSPECTIVE));
+            region = shop_region(self.shop_projection().as_ref(), origin_x, origin_y, view_w, view_h, image.width, image.height);
+            palette = saturated_fraction(&image.rgba, image.width, region);
+            rgba = image.rgba;
+            width = image.width;
+            height = image.height;
+        }
+        println!(
+            "RFC0002_SHOT {name} palette={palette:.3} samples={} ordinary={} einstein={} gen_us={} draws={draws} tris={triangles} leaves={leaves} projected={projected:.2} image={width}x{height}",
+            probe.samples, probe.ordinary, probe.einstein, probe.generation_us
+        );
+        EinsteinCapture { palette, probe, draws, triangles, leaves, projected_px: projected, rgba, width, height, region }
+    }
+
+    fn finish_rfc0002(&mut self) {
+        let directory = format!("{}/../target/rfc0002", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let mut reasons = Vec::new();
+        let (off, on, again, orbit, far) = match (
+            self.rfc0002_off.as_ref(),
+            self.rfc0002_on.as_ref(),
+            self.rfc0002_again.as_ref(),
+            self.rfc0002_orbit.as_ref(),
+            self.rfc0002_far.as_ref(),
+        ) {
+            (Some(off), Some(on), Some(again), Some(orbit), Some(far)) => (off, on, again, orbit, far),
+            _ => {
+                println!("RFC0002_FAIL missing captures");
+                self.finish_lod_capture();
+                return;
+            }
+        };
+        if off.draws != 0 {
+            reasons.push(format!("\"debug off submitted {} overlay draws\"", off.draws));
+        }
+        if off.probe.einstein != 0 {
+            reasons.push(format!("\"debug off classified {} einstein samples\"", off.probe.einstein));
+        }
+        if off.palette > 0.08 {
+            reasons.push(format!("\"debug off shop saturation {:.3} is above 0.08\"", off.palette));
+        }
+        if on.draws == 0 {
+            reasons.push("\"debug on submitted no overlay\"".into());
+        }
+        if on.projected_px <= 1.0 {
+            reasons.push(format!("\"close projected error {:.2} did not cross 1 px\"", on.projected_px));
+        }
+        if on.probe.einstein == 0 {
+            reasons.push("\"close debug classified no einstein samples\"".into());
+        }
+        if on.palette < 0.20 {
+            reasons.push(format!("\"close debug saturation {:.3} is under 0.20\"", on.palette));
+        }
+        if on.triangles != off.triangles || on.leaves != off.leaves {
+            reasons.push(format!("\"hierarchy cut changed when debug turned on {}/{} vs {}/{}\"", on.leaves, on.triangles, off.leaves, off.triangles));
+        }
+        if on.probe.fingerprint != again.probe.fingerprint {
+            reasons.push("\"repeat capture changed the einstein fingerprint\"".into());
+        }
+        let delta = mean_abs_diff(&on.rgba, &again.rgba, on.width, on.region, again.region);
+        if delta > 6.0 {
+            reasons.push(format!("\"repeat capture pixel delta {delta:.2} is above 6\""));
+        }
+        if orbit.probe.fingerprint != on.probe.fingerprint {
+            reasons.push("\"orbit changed the einstein fingerprint\"".into());
+        }
+        if far.projected_px > 1.0 {
+            reasons.push(format!("\"far projected error {:.2} stayed above 1 px\"", far.projected_px));
+        }
+        if far.probe.einstein != 0 {
+            reasons.push(format!("\"far debug classified {} einstein samples\"", far.probe.einstein));
+        }
+        if far.palette > 0.08 {
+            reasons.push(format!("\"far debug saturation {:.3} is above 0.08\"", far.palette));
+        }
+        let passed = reasons.is_empty();
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        let reasons_json = format!("[{}]", reasons.join(","));
+        let json = format!(
+            "{{\"verdict\":\"RFC0002_{verdict}\",\"seed\":{},\"threshold_px\":{:.1},\"off\":{{\"palette\":{:.4},\"einstein\":{},\"draws\":{},\"triangles\":{},\"projected_px\":{:.2}}},\"close\":{{\"palette\":{:.4},\"einstein\":{},\"ordinary\":{},\"draws\":{},\"triangles\":{},\"projected_px\":{:.2},\"generation_us\":{}}},\"repeat_delta\":{delta:.3},\"orbit_fingerprint_match\":{},\"far\":{{\"palette\":{:.4},\"einstein\":{},\"projected_px\":{:.2}}},\"reasons\":{reasons_json}}}",
+            self.einstein_seed,
+            jarvig_core::DETAIL_ERROR_THRESHOLD_PX,
+            off.palette,
+            off.probe.einstein,
+            off.draws,
+            off.triangles,
+            off.projected_px,
+            on.palette,
+            on.probe.einstein,
+            on.probe.ordinary,
+            on.draws,
+            on.triangles,
+            on.projected_px,
+            on.probe.generation_us,
+            orbit.probe.fingerprint == on.probe.fingerprint,
+            far.palette,
+            far.probe.einstein,
+            far.projected_px
+        );
+        let _ = std::fs::write(format!("{directory}/report.json"), json);
+        println!("RFC0002_{verdict} {directory}");
+        println!("RFC0002_REASONS {reasons_json}");
+        self.finish_lod_capture();
+    }
+
+    fn einstein_status(&self) -> String {
+        if !self.einstein_debug || self.einstein_uvs.is_empty() {
+            return String::new();
+        }
+        let projected = self.shop_detail_px().unwrap_or(0.0);
+        let probe = jarvig_core::probe_detail(&self.einstein_uvs, self.einstein_seed, projected, true);
+        format!(
+            " microdetail samples {} | ordinary {} | einstein {} | threshold {:.1} px | seed {} | gen {} us | projected {:.2} px",
+            probe.samples, probe.ordinary, probe.einstein, jarvig_core::DETAIL_ERROR_THRESHOLD_PX, self.einstein_seed, probe.generation_us, projected
+        )
+    }
+
     fn sync_parent_geometry(&mut self) {
         if !self.cluster_hierarchy {
             return;
@@ -5658,7 +7544,7 @@ impl Editor {
         if let Some(asset) = self.browser.assets.iter().find(|asset| asset.kind == "Model" && asset.name == "townshop").cloned() {
             match self.engine.place_existing_mesh(asset.id, 1.0, 0.0, 1.0) {
                 Ok(entity) => {
-                    self.content_undo.push(entity);
+                    self.content_undo.push(vec![entity]);
                     let before = self.engine.world().entity_count();
                     self.undo_content_drop();
                     if self.engine.world().entity_count() != before.saturating_sub(1) && self.content_undo.is_empty() {
@@ -5748,9 +7634,13 @@ impl Editor {
             return;
         };
         let hit = content_ground_hit(&ray);
+        if asset.kind == "Prefab" {
+            self.place_prefab_asset(&asset, jarvig_core::Vec3::new(hit.x, hit.y, hit.z));
+            return;
+        }
         match self.engine.place_existing_mesh(asset.id, hit.x, hit.y, hit.z) {
             Ok(entity) => {
-                self.content_undo.push(entity);
+                self.content_undo.push(vec![entity]);
                 if let Ok(item) = crate::selection::SelectionItem::entity(entity) {
                     let _ = self.selection.replace(item);
                 }
@@ -5763,33 +7653,920 @@ impl Editor {
         self.refresh_status();
     }
 
+    fn place_prefab_asset(&mut self, asset: &jarvig_core::RegistryAsset, hit: jarvig_core::Vec3) {
+        let Some(project_file) = self.project_file.clone() else {
+            self.append("No project is open.");
+            self.refresh_status();
+            return;
+        };
+        let Some(root) = project_file.parent() else {
+            self.append("The project file has no directory.");
+            self.refresh_status();
+            return;
+        };
+        match self.engine.instantiate_prefab_file(&root.join(&asset.path), hit) {
+            Ok(entities) => {
+                let count = entities.len();
+                if let Some(root_entity) = entities.first().copied() {
+                    if let Ok(item) = crate::selection::SelectionItem::entity(root_entity) {
+                        let _ = self.selection.replace(item);
+                    }
+                }
+                self.content_undo.push(entities);
+                self.sync_outliner();
+                self.refresh_title();
+                self.append(&format!(
+                    "Placed {} ({} parts) at {:.2}, {:.2}, {:.2}. Ctrl+Z removes that actor.",
+                    asset.name, count, hit.x, hit.y, hit.z
+                ));
+            }
+            Err(error) => self.append(&format!("Prefab was not placed. {error}")),
+        }
+        self.refresh_status();
+    }
+
     fn undo_content_drop(&mut self) {
-        let Some(entity) = self.content_undo.pop() else {
+        let Some(group) = self.content_undo.pop() else {
             self.append("No mesh placement to undo.");
             return;
         };
-        match self.engine.execute_authoring(AuthoringCommand::DestroyEntity { target: entity }) {
-            Ok(_) => {
-                self.append(&format!("Undid placement of {entity}."));
+        let count = group.len();
+        for entity in group.into_iter().rev() {
+            if let Err(error) = self.engine.execute_authoring(AuthoringCommand::DestroyEntity { target: entity }) {
+                self.append(&format!("Undo failed: {error}."));
                 self.sync_outliner();
                 self.refresh_title();
+                return;
             }
-            Err(error) => self.append(&format!("Undo failed: {error}.")),
+        }
+        self.append(&format!("Undid placement of {count} actor(s)."));
+        self.sync_outliner();
+        self.refresh_title();
+    }
+
+    fn select_character_root(&mut self) {
+        let outline = self.engine.world().entity_outline();
+        let jointed = |row: &jarvig_core::EntityOutlineInfo| self.engine.world().authored_joint(row.uuid).is_some();
+        let root = outline.iter().find(|row| row.name == "Pelvis" && jointed(row)).map(|row| row.uuid).or_else(|| {
+            outline.iter().find(|row| row.parent.is_none() && jointed(row)).map(|row| row.uuid)
+        }).or_else(|| outline.iter().find(|row| jointed(row)).map(|row| row.uuid));
+        let Some(root) = root else { return };
+        if let Ok(item) = crate::selection::SelectionItem::entity(root) {
+            let _ = self.selection.replace(item);
+        }
+        self.focus_selected();
+    }
+
+    fn editor_mode(&self) -> chrome::WorkspaceMode {
+        if self.character_workspace {
+            chrome::WorkspaceMode::Character
+        } else if self.land_mode {
+            chrome::WorkspaceMode::Land
+        } else {
+            chrome::WorkspaceMode::Level
         }
     }
 
+    fn level_has_rig(&self) -> bool {
+        self.engine.world().entity_outline().iter().any(|row| self.engine.world().authored_joint(row.uuid).is_some())
+    }
+
+    fn workspace_line(mode: chrome::WorkspaceMode) -> &'static str {
+        match mode {
+            chrome::WorkspaceMode::Level => "Level. Characters, props, lights, and terrain stay visible. The terrain grid and rig helpers stay in their own workspaces.",
+            chrome::WorkspaceMode::Land => "Land. The grid follows the terrain. Characters stay hidden until Show Full Level. Wheel over the terrain changes brush radius. Einstein detail does not write height.",
+            chrome::WorkspaceMode::Character => "Character. The rig is isolated over the same level. Terrain and props are hidden here and stay in the level.",
+        }
+    }
+
+    fn enter_mode(&mut self, mode: chrome::WorkspaceMode, persist: bool) {
+        self.switch_editor_mode(mode, persist, true);
+    }
+
+    /// One authored world. `announce` is for a click. Restore and a project template stay quiet.
+    fn switch_editor_mode(&mut self, mode: chrome::WorkspaceMode, persist: bool, announce: bool) {
+        if mode == chrome::WorkspaceMode::Character && !self.level_has_rig() {
+            self.append("Character workspace needs a rig in this level. Level stays on the authored world.");
+            self.sync_view_menu();
+            return;
+        }
+        if self.editor_mode() == mode {
+            return;
+        }
+        self.land_stamp = None;
+        self.land_hover = None;
+        self.land_flatten = None;
+        self.outliner_land = false;
+        self.land_mode = mode == chrome::WorkspaceMode::Land;
+        self.character_workspace = mode == chrome::WorkspaceMode::Character;
+        if mode == chrome::WorkspaceMode::Character {
+            self.select_character_root();
+        }
+        if announce {
+            self.append(Self::workspace_line(mode));
+        }
+        self.inspector_force_realize = true;
+        self.request_inspector_refresh();
+        self.sync_outliner();
+        self.sync_view_menu();
+        self.refresh_title();
+        if persist {
+            self.persist_workspace();
+        }
+        unsafe {
+            InvalidateRect(self.dock_host, std::ptr::null(), 1);
+            InvalidateRect(self.toolbar, std::ptr::null(), 0);
+        }
+    }
+
+    fn set_land_mode(&mut self, enabled: bool) {
+        self.enter_mode(if enabled { chrome::WorkspaceMode::Land } else { chrome::WorkspaceMode::Level }, true);
+    }
+
+    fn realize_land_outliner(&mut self) {
+        let hwnd = self.panel_hwnd(OUTLINER);
+        if hwnd.is_null() {
+            return;
+        }
+        self.outliner_applying = true;
+        self.tree_keys.clear();
+        unsafe { SendMessageW(hwnd, TVM_DELETEITEM, 0, TVI_ROOT); }
+        let root = self.insert_tree_item(TVI_ROOT, "Land", TreeKey::World);
+        for tool in LandTool::ALL {
+            self.insert_tree_item(root, tool.label(), TreeKey::Tool(tool));
+        }
+        if root != 0 {
+            unsafe { SendMessageW(hwnd, TVM_EXPAND, TVE_EXPAND as usize, root); }
+        }
+        let wanted = self.land_tool;
+        if let Some(index) = self.tree_keys.iter().position(|key| matches!(key, TreeKey::Tool(tool) if *tool == wanted)) {
+            let item = self.find_item_by_param(index as isize);
+            if item != 0 {
+                unsafe { SendMessageW(hwnd, TVM_SELECTITEM, TVGN_CARET as usize, item); }
+            }
+        }
+        self.outliner_applying = false;
+    }
+
+    /// Land Mode shows the terrain form even when the tool row is selected.
+    fn inspector_target(&self) -> Option<EntityUuid> {
+        if self.land_mode && !self.session_active() {
+            if let Some(id) = self.engine.world().terrain_entity() {
+                return Some(id);
+            }
+        }
+        if self.selection.count() != 1 {
+            return None;
+        }
+        self.selection.primary_entity()
+    }
+
+    fn land_brush(&self) -> Option<jarvig_core::TerrainBrush> {
+        if !self.land_mode || self.session_active() {
+            return None;
+        }
+        match self.land_tool {
+            LandTool::Sculpt => Some(jarvig_core::TerrainBrush::Sculpt),
+            LandTool::Smooth => Some(jarvig_core::TerrainBrush::Smooth),
+            LandTool::Flatten => Some(jarvig_core::TerrainBrush::Flatten),
+            LandTool::Paint => Some(jarvig_core::TerrainBrush::Paint),
+            _ => None,
+        }
+    }
+
+    fn commit_land_draft(&mut self, binding: &inspector::InspectorBinding, hwnd: HWND) -> bool {
+        if !self.land_mode || self.engine.world().terrain_entity().is_some() {
+            return false;
+        }
+        let inspector::InspectorBinding::Text { type_id, field } = binding else { return false };
+        if *type_id != jarvig_core::TYPE_TERRAIN {
+            return false;
+        }
+        let text = window_text(hwnd);
+        let Some(value) = text.trim().parse::<f64>().ok().filter(|value| value.is_finite()) else {
+            self.append("Terrain size stayed. The text was not a finite number.");
+            self.realize_inspector_controls();
+            return true;
+        };
+        let meters = value as f32;
+        let size = matches!(
+            *field,
+            jarvig_core::FIELD_TERRAIN_WIDTH | jarvig_core::FIELD_TERRAIN_DEPTH | jarvig_core::FIELD_TERRAIN_SPACING | jarvig_core::FIELD_TERRAIN_CHUNK
+        );
+        if size && meters <= 0.0 {
+            self.append("Terrain size stayed. Width, depth, spacing, and chunk size have to be positive.");
+            self.realize_inspector_controls();
+            return true;
+        }
+        match *field {
+            jarvig_core::FIELD_TERRAIN_WIDTH => self.land_width = meters,
+            jarvig_core::FIELD_TERRAIN_DEPTH => self.land_depth = meters,
+            jarvig_core::FIELD_TERRAIN_SPACING => self.land_spacing = meters,
+            jarvig_core::FIELD_TERRAIN_CHUNK => self.land_chunk = meters,
+            jarvig_core::FIELD_TERRAIN_HEIGHT => self.land_height = meters,
+            _ => return false,
+        }
+        true
+    }
+
+    fn create_land_terrain(&mut self) {
+        if self.session_active() {
+            self.append("Stop play before creating terrain.");
+            return;
+        }
+        let record = match jarvig_core::TerrainRecord::flat(self.land_width, self.land_depth, self.land_spacing, self.land_chunk, self.land_height) {
+            Ok(record) => record,
+            Err(_) => {
+                self.append("Terrain size must divide into whole chunks. Width, depth, and chunk size use the vertex spacing.");
+                return;
+            }
+        };
+        let local = self.editor_camera.as_ref().map(|camera| Vec3::new(camera.position.x - jarvig_core::BOOTSTRAP_ROOT_M, 0.0, camera.position.z)).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+        match self.engine.execute_authoring(AuthoringCommand::CreateTerrain { local, record }) {
+            Ok(_) => {
+                self.evict_retired_meshes();
+                if let Some(id) = self.engine.world().terrain_entity() {
+                    if let Ok(item) = selection::SelectionItem::entity(id) {
+                        let _ = self.selection.replace(item);
+                    }
+                    self.aim_at_terrain(id);
+                }
+                self.land_tool = LandTool::Sculpt;
+                self.outliner_land = false;
+                if self.editor_mode() != chrome::WorkspaceMode::Land {
+                    self.enter_mode(chrome::WorkspaceMode::Land, false);
+                }
+                self.persist_workspace();
+                self.append("Created a flat terrain. The heightfield is the ground. Einstein detail is off and does not write height.");
+                self.inspector_force_realize = true;
+                self.sync_outliner();
+                self.refresh_title();
+            }
+            Err(jarvig_core::AuthoringError::InvalidOperation) => {
+                self.append("This world already has a terrain. Select it and sculpt that heightfield.");
+            }
+            Err(error) => self.append(&format!("Create Terrain failed: {error}")),
+        }
+    }
+
+    fn aim_at_terrain(&mut self, id: EntityUuid) {
+        let Ok(pose) = self.engine.world().entity_world_pose(id) else { return };
+        if let Some(camera) = self.editor_camera.as_mut() {
+            camera.orbit_pivot = pose.translation;
+            camera.orbit_distance = 42.0;
+            camera.pitch = -0.65;
+            camera.yaw = 0.0;
+            camera.speed_m_s = 40.0;
+            camera.reorbit();
+        }
+        let _ = self.push_editor_camera();
+    }
+
+    fn select_terrain_actor(&mut self) {
+        let Some(id) = self.engine.world().terrain_entity() else {
+            self.append("There is no terrain in this world.");
+            return;
+        };
+        if let Ok(item) = selection::SelectionItem::entity(id) {
+            let _ = self.selection.replace(item);
+        }
+        self.sync_selection_view();
+    }
+
+    fn log_terrain_debug(&mut self) {
+        let Some(id) = self.engine.world().terrain_entity() else {
+            self.append("There is no terrain in this world. Einstein detail is not generated.");
+            return;
+        };
+        let Some(record) = self.engine.world().authored_terrain(id) else { return };
+        let Ok(pose) = self.engine.world().entity_world_pose(id) else { return };
+        let (local_x, local_z) = self
+            .editor_camera
+            .as_ref()
+            .map(|camera| ((camera.position.x - pose.translation.x) as f32, (camera.position.z - pose.translation.z) as f32))
+            .unwrap_or((0.0, 0.0));
+        self.append(&record.debug_line(local_x, local_z));
+    }
+
+    fn land_inspector(&self) -> inspector::LandInspector {
+        inspector::LandInspector {
+            grid: self.land_grid,
+            minor: self.land_grid_minor as f64,
+            major: self.land_grid_major as f64,
+            snap: self.land_grid_snap,
+            radius: self.land_radius as f64,
+            strength: self.land_delta as f64,
+            falloff: self.land_falloff.label(),
+            world: self.land_overlay_world,
+            vertices: self.land_overlay_vertices,
+            chunks: self.land_overlay_chunks,
+            lod: self.land_overlay_lod,
+            show_terrain: self.land_show_terrain,
+            show_helpers: self.land_show_helpers,
+            show_lighting: self.land_show_lighting,
+            show_characters: self.land_show_characters,
+            show_props: self.land_show_props,
+            show_gameplay: self.land_show_gameplay,
+            show_full: self.land_show_full,
+        }
+    }
+
+    fn commit_land_ui(&mut self, binding: &inspector::InspectorBinding, hwnd: HWND) -> bool {
+        let inspector::InspectorBinding::Text { field, .. } = binding else { return false };
+        if !inspector::is_land_ui(*field) {
+            return false;
+        }
+        let text = window_text(hwnd);
+        let Some(value) = text.trim().parse::<f64>().ok().filter(|value| value.is_finite()) else {
+            self.append("Land control stayed. The text was not a finite number.");
+            self.realize_inspector_controls();
+            return true;
+        };
+        self.set_land_number(*field, value);
+        true
+    }
+
+    fn set_land_number(&mut self, field: jarvig_core::FieldId, value: f64) {
+        let meters = value as f32;
+        match field {
+            inspector::LAND_UI_MINOR if meters > 0.0 => self.land_grid_minor = meters,
+            inspector::LAND_UI_MAJOR if meters > 0.0 => self.land_grid_major = meters.max(self.land_grid_minor),
+            inspector::LAND_UI_RADIUS if meters > 0.0 => self.land_radius = meters,
+            inspector::LAND_UI_STRENGTH if meters >= 0.0 => self.land_delta = meters,
+            _ => {
+                self.append("Land control stayed. Spacing, radius, and strength have to be finite and positive.");
+                self.realize_inspector_controls();
+                return;
+            }
+        }
+        if self.land_grid_major < self.land_grid_minor {
+            self.land_grid_major = self.land_grid_minor;
+        }
+        self.request_inspector_refresh();
+        self.persist_workspace();
+    }
+
+    fn set_land_check(&mut self, field: jarvig_core::FieldId, checked: bool) {
+        match field {
+            inspector::LAND_UI_GRID => self.land_grid = checked,
+            inspector::LAND_UI_SNAP => self.land_grid_snap = checked,
+            inspector::LAND_UI_WORLD => self.land_overlay_world = checked,
+            inspector::LAND_UI_VERTS => self.land_overlay_vertices = checked,
+            inspector::LAND_UI_CHUNKS => self.land_overlay_chunks = checked,
+            inspector::LAND_UI_LOD => self.land_overlay_lod = checked,
+            inspector::LAND_UI_SHOW_TERRAIN => self.land_show_terrain = checked,
+            inspector::LAND_UI_SHOW_HELPERS => self.land_show_helpers = checked,
+            inspector::LAND_UI_SHOW_LIGHTING => self.land_show_lighting = checked,
+            inspector::LAND_UI_SHOW_CHARACTERS => self.land_show_characters = checked,
+            inspector::LAND_UI_SHOW_PROPS => self.land_show_props = checked,
+            inspector::LAND_UI_SHOW_GAMEPLAY => self.land_show_gameplay = checked,
+            inspector::LAND_UI_SHOW_FULL => self.land_show_full = checked,
+            _ => return,
+        }
+        self.request_inspector_refresh();
+        self.persist_workspace();
+    }
+
+    fn set_land_choice(&mut self, field: jarvig_core::FieldId, text: &str) {
+        if field == inspector::LAND_UI_FALLOFF {
+            if let Some(falloff) = jarvig_core::TerrainFalloff::parse(text) {
+                self.land_falloff = falloff;
+                self.request_inspector_refresh();
+                self.persist_workspace();
+                return;
+            }
+        }
+        self.realize_inspector_controls();
+    }
+
+    fn land_hidden_entities(&self) -> Vec<jarvig_core::EntityId> {
+        if !self.land_mode || self.session_active() || self.land_show_full {
+            return Vec::new();
+        }
+        self.engine
+            .world()
+            .land_draw_actors()
+            .into_iter()
+            .filter(|(_, class)| {
+                !match class {
+                    jarvig_core::LandDrawClass::Terrain => self.land_show_terrain,
+                    jarvig_core::LandDrawClass::Character => self.land_show_characters,
+                    jarvig_core::LandDrawClass::Prop => self.land_show_props,
+                    jarvig_core::LandDrawClass::Gameplay => self.land_show_gameplay,
+                }
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn character_hidden_entities(&self) -> Vec<jarvig_core::EntityId> {
+        self.engine
+            .world()
+            .land_draw_actors()
+            .into_iter()
+            .filter(|(_, class)| *class != jarvig_core::LandDrawClass::Character)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn publish_land_view(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+        if self.session_active() || (!self.land_mode && !self.character_workspace) {
+            let renderer = self.renderer.as_mut().expect("renderer");
+            renderer.set_terrain_grid(None);
+            renderer.set_hidden_entities(&[]);
+            renderer.set_land_unlit(false);
+            return;
+        }
+        if self.character_workspace {
+            let hidden = self.character_hidden_entities();
+            let renderer = self.renderer.as_mut().expect("renderer");
+            renderer.set_terrain_grid(None);
+            renderer.set_hidden_entities(&hidden);
+            renderer.set_land_unlit(false);
+            return;
+        }
+        let hidden = self.land_hidden_entities();
+        let unlit = !self.land_show_lighting;
+        let grid = self.land_surface_grid();
+        let renderer = self.renderer.as_mut().expect("renderer");
+        renderer.set_hidden_entities(&hidden);
+        renderer.set_land_unlit(unlit);
+        renderer.set_terrain_grid(grid);
+    }
+
+    fn land_surface_grid(&self) -> Option<TerrainGridDesc> {
+        if !self.land_show_helpers {
+            return None;
+        }
+        let lines = self.land_grid;
+        let brush_enabled = self.land_brush().is_some() && self.land_hover.is_some();
+        let world = lines && self.land_overlay_world;
+        let vertices = lines && self.land_overlay_vertices;
+        let chunks = lines && self.land_overlay_chunks;
+        let lod = lines && self.land_overlay_lod;
+        if !world && !vertices && !chunks && !lod && !brush_enabled {
+            return None;
+        }
+        let metrics = self.engine.world().terrain_surface_metrics()?;
+        let (brush_x, brush_z) = self.land_hover.unwrap_or((0.0, 0.0));
+        Some(TerrainGridDesc {
+            meshes: self.engine.world().terrain_surface_meshes(),
+            minor_m: self.land_grid_minor,
+            major_m: self.land_grid_major.max(self.land_grid_minor),
+            world,
+            vertices,
+            chunks,
+            lod,
+            lod_enabled: metrics.lod_enabled,
+            half_x: metrics.half_x,
+            half_z: metrics.half_z,
+            vertex_spacing: metrics.spacing_m,
+            chunk_m: metrics.chunk_m,
+            brush_x,
+            brush_z,
+            brush_radius: self.land_radius,
+            brush_enabled,
+            brush_strength: self.land_delta.abs(),
+            brush_smooth: self.land_falloff == jarvig_core::TerrainFalloff::Smooth,
+            brush_color: self.land_brush_color(),
+        })
+    }
+
+    fn land_radius_wheel(&self) -> bool {
+        self.land_brush().is_some() && self.land_hover.is_some()
+    }
+
+    fn scale_land_radius(&mut self, notches: i32) {
+        if notches == 0 {
+            return;
+        }
+        let next = (self.land_radius * 1.1_f32.powi(notches)).clamp(0.25, 128.0);
+        if (next - self.land_radius).abs() < 1.0e-4 {
+            return;
+        }
+        self.land_radius = next;
+        self.request_inspector_refresh();
+        self.persist_workspace();
+    }
+
+    fn land_brush_color(&self) -> [f32; 4] {
+        let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
+        match self.land_tool {
+            LandTool::Sculpt if shift => [0.95, 0.42, 0.32, 1.0],
+            LandTool::Sculpt => [0.96, 0.86, 0.34, 1.0],
+            LandTool::Smooth => [0.42, 0.82, 0.95, 1.0],
+            LandTool::Flatten => [0.82, 0.82, 0.82, 1.0],
+            LandTool::Paint => [0.45, 0.78, 0.42, 1.0],
+            _ => [0.9, 0.9, 0.9, 1.0],
+        }
+    }
+
+    fn track_land_hover(&mut self, x: f64, y: f64) {
+        if !self.land_mode || self.session_active() {
+            self.land_hover = None;
+            return;
+        }
+        let Some(id) = self.engine.world().terrain_entity() else {
+            self.land_hover = None;
+            return;
+        };
+        let Some(ray) = self.viewport_ray(x, y) else { return };
+        self.land_hover = self.engine.world().terrain_ray_local(id, ray.origin, ray.direction).map(|hit| (hit.local_x, hit.local_z));
+    }
+
+    fn stamp_land(&mut self, x: f64, y: f64, first: bool) {
+        if self.session_active() {
+            return;
+        }
+        let Some(brush) = self.land_brush() else { return };
+        let Some(id) = self.engine.world().terrain_entity() else {
+            if first {
+                self.append("Create a terrain before using this brush.");
+            }
+            return;
+        };
+        let Some(ray) = self.viewport_ray(x, y) else { return };
+        let Some(hit) = self.engine.world().terrain_ray_local(id, ray.origin, ray.direction) else { return };
+        let (local_x, local_z) = if self.land_grid_snap {
+            let record = self.engine.world().authored_terrain(id);
+            record.map(|record| jarvig_core::snap_terrain_xz(record.width_m, record.depth_m, hit.local_x, hit.local_z, self.land_grid_minor)).unwrap_or((hit.local_x, hit.local_z))
+        } else {
+            (hit.local_x, hit.local_z)
+        };
+        self.land_hover = Some((local_x, local_z));
+        if let Some((previous_x, previous_z)) = self.land_stamp {
+            let dx = local_x - previous_x;
+            let dz = local_z - previous_z;
+            if !first && dx * dx + dz * dz < 0.25 {
+                return;
+            }
+        }
+        self.land_stamp = Some((local_x, local_z));
+        if first {
+            if let Some(record) = self.engine.world().authored_terrain(id) {
+                self.append(&record.debug_line(local_x, local_z));
+            }
+        }
+        let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
+        let delta = if brush == jarvig_core::TerrainBrush::Sculpt && shift { -self.land_delta.abs() } else { self.land_delta.abs() };
+        let flatten_to = if brush == jarvig_core::TerrainBrush::Flatten {
+            if self.land_flatten.is_none() {
+                self.land_flatten = Some(hit.height);
+            }
+            self.land_flatten
+        } else {
+            None
+        };
+        match self.engine.execute_authoring(AuthoringCommand::StampTerrain {
+            target: id,
+            brush,
+            local_x,
+            local_z,
+            radius: self.land_radius,
+            delta,
+            layer: self.land_layer,
+            falloff: self.land_falloff,
+            flatten_to,
+            rebuild_meshes: false,
+        }) {
+            Ok(_) => {
+                let dirty = self.engine.world_mut().take_terrain_dirty();
+                for coord in dirty {
+                    self.bump_land_chunk(coord);
+                }
+                self.queue_land_chunks();
+                self.request_inspector_refresh();
+            }
+            Err(error) => {
+                if first {
+                    self.append(&format!("Terrain brush failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn bump_land_chunk(&mut self, coord: jarvig_core::ChunkCoord) {
+        if let Some(slot) = self.land_chunk_rev.iter_mut().find(|item| item.0 == coord.x && item.1 == coord.z) {
+            slot.2 = slot.2.saturating_add(1);
+        } else {
+            self.land_chunk_rev.push((coord.x, coord.z, 1));
+        }
+    }
+
+    fn land_chunk_revision(&self, x: u32, z: u32) -> u64 {
+        self.land_chunk_rev.iter().find(|item| item.0 == x && item.1 == z).map(|item| item.2).unwrap_or(0)
+    }
+
+    fn note_land_chunk_published(&mut self, x: u32, z: u32, revision: u64) {
+        if let Some(slot) = self.land_chunk_published.iter_mut().find(|item| item.0 == x && item.1 == z) {
+            slot.2 = revision;
+        } else {
+            self.land_chunk_published.push((x, z, revision));
+        }
+    }
+
+    fn cancel_land_chunks(&mut self) {
+        self.land_visual_epoch = self.land_visual_epoch.saturating_add(1);
+        self.land_hover = None;
+        self.land_flatten = None;
+        self.land_stamp = None;
+        self.land_chunk_rev.clear();
+        self.land_chunk_published.clear();
+        if let Some(id) = self.land_chunk_job.take() {
+            self.jobs.cancel(id);
+            let _ = self.jobs.take_result::<LandChunkProduct>(id);
+        }
+    }
+
+    fn queue_land_chunks(&mut self) {
+        if self.land_chunk_job.is_some() {
+            return;
+        }
+        let Some(entity) = self.engine.world().terrain_entity() else { return };
+        let revisions_now = self.land_chunk_rev.clone();
+        let published = self.land_chunk_published.clone();
+        let pending: Vec<jarvig_core::ChunkCoord> = revisions_now
+            .into_iter()
+            .filter(|item| !published.iter().any(|stored| stored.0 == item.0 && stored.1 == item.1 && stored.2 == item.2))
+            .map(|item| jarvig_core::ChunkCoord { x: item.0, z: item.1 })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_terrain(entity) else { return };
+        let revisions: Vec<(u32, u32, u64)> = pending.iter().map(|coord| (coord.x, coord.z, self.land_chunk_revision(coord.x, coord.z))).collect();
+        let epoch = self.land_visual_epoch;
+        let id = self.jobs.submit(
+            jarvig_core::JobDesc {
+                name: "Land / terrain chunks".into(),
+                asset: None,
+                cache_key: None,
+                dependencies: Vec::new(),
+            },
+            move |ctx| {
+                ctx.report(0.2, "Building");
+                if ctx.cancel_requested() {
+                    return Err("cancelled".into());
+                }
+                let built = jarvig_core::build_dirty_chunks(&record, &pending).map_err(|error| error.to_string())?;
+                ctx.report(1.0, "Built");
+                Ok(LandChunkProduct { epoch, entity, revisions, built })
+            },
+        );
+        self.land_chunk_job = Some(id);
+    }
+
+    fn poll_land_chunks(&mut self) {
+        let Some(id) = self.land_chunk_job else { return };
+        let snap = self.jobs.snapshots().into_iter().find(|snap| snap.id == id);
+        let Some(snap) = snap else {
+            self.land_chunk_job = None;
+            return;
+        };
+        if !snap.state.finished() {
+            let seconds = snap.elapsed_ms / 1000;
+            self.job_line = format!("Land / terrain chunks {} {:.0}% {} {:02}:{:02}", snap.state.label(), snap.progress * 100.0, snap.stage, seconds / 60, seconds % 60);
+            return;
+        }
+        self.land_chunk_job = None;
+        if self.job_line.starts_with("Land / terrain chunks") {
+            self.job_line.clear();
+            self.refresh_status();
+        }
+        if snap.state == jarvig_core::JobState::Completed {
+            if let Some(Ok(product)) = self.jobs.take_result::<LandChunkProduct>(id) {
+                if product.epoch == self.land_visual_epoch && self.engine.world().terrain_entity() == Some(product.entity) {
+                    let mut accepted = Vec::new();
+                    let mut notes = Vec::new();
+                    for chunk in product.built {
+                        let revision = product.revisions.iter().find(|item| item.0 == chunk.coord.x && item.1 == chunk.coord.z).map(|item| item.2);
+                        if revision.is_some_and(|revision| revision == self.land_chunk_revision(chunk.coord.x, chunk.coord.z)) {
+                            if let Some(revision) = revision {
+                                notes.push((chunk.coord.x, chunk.coord.z, revision));
+                            }
+                            accepted.push((chunk.coord.x, chunk.coord.z, chunk.mesh));
+                        }
+                    }
+                    if !accepted.is_empty() {
+                        match self.engine.world_mut().install_terrain_chunks(product.entity, accepted) {
+                            Ok(()) => {
+                                for (x, z, revision) in notes {
+                                    self.note_land_chunk_published(x, z, revision);
+                                }
+                                self.evict_retired_meshes();
+                            }
+                            Err(error) => self.append(&format!("Terrain chunk publish failed: {error}")),
+                        }
+                    }
+                }
+            }
+        } else {
+            let _ = self.jobs.take_result::<LandChunkProduct>(id);
+        }
+        self.queue_land_chunks();
+    }
+
+    fn evict_retired_meshes(&mut self) {
+        let retired = self.engine.world_mut().take_retired_meshes();
+        if let Some(renderer) = self.renderer.as_mut() {
+            for mesh in retired {
+                let _ = renderer.evict_gpu_mesh(mesh);
+            }
+        }
+    }
+
+    fn set_character_workspace(&mut self, enabled: bool) {
+        self.enter_mode(if enabled { chrome::WorkspaceMode::Character } else { chrome::WorkspaceMode::Level }, true);
+    }
+
+    fn open_character_asset(&mut self, asset: &jarvig_core::RegistryAsset) {
+        self.browser.selected = Some(asset.id);
+        if !self.level_has_rig() {
+            self.append(&format!("{} was not placed. Drag it into the viewport to instantiate it. Character workspace opens a level that has a rig.", asset.name));
+            return;
+        }
+        self.enter_mode(chrome::WorkspaceMode::Character, true);
+        self.append(&format!("Editing {}. The rig workspace hides terrain and props. They stay in the level.", asset.name));
+    }
+
+    fn reset_character_pose(&mut self) {
+        let pose: Vec<_> = self
+            .engine
+            .world()
+            .entity_outline()
+            .iter()
+            .filter_map(|row| {
+                let joint = self.engine.world().authored_joint(row.uuid)?;
+                Some((row.uuid, joint.rest_translation, joint.rest_rotation))
+            })
+            .collect();
+        if pose.is_empty() {
+            self.append("Reset Pose found no joints.");
+            return;
+        }
+        let count = pose.len();
+        for (id, translation, rotation) in pose {
+            let _ = inspector::submit_property(
+                &mut self.engine,
+                id,
+                jarvig_core::TYPE_SPATIAL_FRAME,
+                jarvig_core::FIELD_LOCAL_TRANSLATION,
+                PropertyValue::Vec3(translation),
+            );
+            let _ = inspector::submit_property(
+                &mut self.engine,
+                id,
+                jarvig_core::TYPE_SPATIAL_FRAME,
+                jarvig_core::FIELD_LOCAL_ROTATION,
+                PropertyValue::Quat(rotation),
+            );
+        }
+        self.sync_outliner();
+        self.append(&format!("Reset {count} joints to their rest poses."));
+    }
+
+    fn submit_micro_request(&mut self) {
+        let Some(request) = self.renderer.as_mut().and_then(|renderer| renderer.take_micro_request()) else { return };
+        if let Some(previous) = self.micro_job.as_ref() {
+            if !previous.finished && !previous.cancel_noted {
+                self.jobs.cancel(previous.id);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.note_micro_cancelled();
+                }
+            }
+        }
+        let queued_at = std::time::Instant::now();
+        let epoch = request.epoch;
+        let key = request.key;
+        let skipped = request.skipped;
+        let anchors = request.anchors;
+        let seed = request.seed;
+        let height = request.height;
+        let tan_half = request.tan_half;
+        let budget = request.budget;
+        let provider = request.provider;
+        let id = self.jobs.submit(
+            jarvig_core::JobDesc {
+                name: "RFC-0002 / townshop / Einstein Surface".into(),
+                asset: None,
+                cache_key: Some(format!("micro:{key:016x}")),
+                dependencies: Vec::new(),
+            },
+            move |ctx| {
+                let queue_wait_us = queued_at.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+                ctx.report(0.05, "Sampling");
+                if ctx.cancel_requested() {
+                    return Err("cancelled".into());
+                }
+                ctx.report(0.2, "Building");
+                let mesh = jarvig_core::build_procedural_microtriangles_cancellable(&anchors, seed, true, height, tan_half, &budget, provider, &|| ctx.cancel_requested())?;
+                Ok(MicroJobProduct { epoch, key, mesh, queue_wait_us, skipped })
+            },
+        );
+        self.micro_job = Some(MicroJob { id, epoch, finished: false, cancel_noted: false });
+    }
+
+    fn poll_micro_job(&mut self) {
+        let Some(id) = self.micro_job.as_ref().map(|job| job.id) else { return };
+        let wanted = self.renderer.as_ref().map(|renderer| renderer.micro_wanted_epoch()).unwrap_or(0);
+        let snap = self.jobs.snapshots().into_iter().find(|snap| snap.id == id);
+        let Some(snap) = snap else { return };
+        if snap.state.finished() {
+            if self.micro_job.as_ref().is_some_and(|job| job.finished) {
+                self.note_micro_job_stage(id);
+                return;
+            }
+            if let Some(job) = self.micro_job.as_mut() {
+                job.finished = true;
+            }
+            match snap.state {
+                jarvig_core::JobState::Completed => match self.jobs.take_result::<MicroJobProduct>(id) {
+                    Some(Ok(product)) => {
+                        let epoch = product.epoch;
+                        let accepted = self.renderer.as_mut().is_some_and(|renderer| {
+                            renderer.accept_micro_build(product.epoch, product.key, product.mesh, product.queue_wait_us, product.skipped)
+                        });
+                        if accepted {
+                            self.jobs.note(id, 0.85, "Uploading");
+                        } else if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.abandon_micro_build(epoch);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.abandon_micro_build(self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0));
+                        }
+                        let noted = self.micro_job.as_ref().is_some_and(|job| job.cancel_noted);
+                        if error != "cancelled" && !noted {
+                            self.append(&format!("Einstein surface job failed: {error}. The published microgeometry stays."));
+                        }
+                    }
+                    None => {}
+                },
+                jarvig_core::JobState::Cancelled => {
+                    let epoch = self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0);
+                    let _ = self.jobs.take_result::<MicroJobProduct>(id);
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.abandon_micro_build(epoch);
+                    }
+                }
+                jarvig_core::JobState::Failed => {
+                    let epoch = self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0);
+                    let error = snap.error.unwrap_or_else(|| "unknown".into());
+                    let _ = self.jobs.take_result::<MicroJobProduct>(id);
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.abandon_micro_build(epoch);
+                    }
+                    self.append(&format!("Einstein surface job failed: {error}. The published microgeometry stays."));
+                }
+                _ => {}
+            }
+            self.note_micro_job_stage(id);
+            return;
+        }
+        let cancel = self.micro_job.as_ref().is_some_and(|job| !job.cancel_noted && job.epoch != wanted);
+        if cancel {
+            self.jobs.cancel(id);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.note_micro_cancelled();
+            }
+            if let Some(job) = self.micro_job.as_mut() {
+                job.cancel_noted = true;
+            }
+        }
+    }
+
+    fn note_micro_job_stage(&mut self, id: jarvig_core::JobId) {
+        let stage = self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready");
+        if stage == "Uploading" {
+            self.jobs.note(id, 0.85, "Uploading");
+        } else if stage == "Ready" {
+            self.jobs.note(id, 1.0, "Ready");
+        }
+    }
 
     fn poll_jobs(&mut self) {
+        self.poll_land_chunks();
         self.poll_registry_job();
+        self.poll_micro_job();
         let snaps = self.jobs.snapshots();
+        let micro_id = self.micro_job.as_ref().map(|job| job.id);
         let registry_id = self.registry_job;
+        let land_id = self.land_chunk_job;
         for snap in &snaps {
             let tracked = self.parent_job.as_ref().map(|job| job.id) == Some(snap.id);
-            if snap.state.finished() && !tracked && Some(snap.id) != registry_id {
+            if snap.state.finished() && !tracked && Some(snap.id) != micro_id && Some(snap.id) != registry_id && Some(snap.id) != land_id {
                 let _ = self.jobs.take_result::<jarvig_core::ParentGeometry>(snap.id);
             }
         }
         let Some(tracked) = self.parent_job.as_ref().map(|job| job.id) else {
+            if self.land_chunk_job.is_some() {
+                self.refresh_status();
+                return;
+            }
             if self.job_line.is_empty() {
                 return;
             }
@@ -5900,11 +8677,250 @@ impl Editor {
         ));
     }
 
+    fn record_async_frame(&mut self) {
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let stage = self.micro_operation_stage();
+        if matches!(stage.as_str(), "Queued" | "Sampling" | "Building" | "Uploading" | "Running") {
+            self.async_busy = self.async_busy.saturating_add(1);
+        }
+        let row = AsyncFrame {
+            base: stats.map(|stats| stats.hierarchy_lod_triangles).unwrap_or(0),
+            leaf: stats.map(|stats| stats.hierarchy_leaf_triangles).unwrap_or(0),
+            tris: stats.map(|stats| stats.micro_triangles).unwrap_or(0),
+            verts: stats.map(|stats| stats.micro_vertices).unwrap_or(0),
+            fingerprint: stats.map(|stats| stats.micro_fingerprint).unwrap_or(0),
+            partial: stats.map(|stats| stats.micro_partial).unwrap_or(0),
+            stage,
+        };
+        println!(
+            "RFC0002_ASYNC_FRAME base={} micro={} verts={} fingerprint={:x} partial={} stage={} leaves={} frames={}",
+            row.base, row.tris, row.verts, row.fingerprint, row.partial, row.stage, row.leaf, self.frames
+        );
+        self.async_frames.push(row);
+    }
+
+    fn fail_async(&mut self, reason: &str) {
+        if self.async_done {
+            return;
+        }
+        self.async_fault = reason.to_string();
+        self.finish_async();
+    }
+
+    fn finish_async(&mut self) {
+        if self.async_done {
+            return;
+        }
+        self.async_done = true;
+        let directory = format!("{}/../target/rfc0002-async", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let mut reasons = Vec::new();
+        if !self.async_fault.is_empty() {
+            reasons.push(format!("\"{}\"", self.async_fault.replace('"', "'")));
+        }
+        if self.async_busy < 2 {
+            reasons.push(format!("\"only {} presented frames occurred while generation was outstanding\"", self.async_busy));
+        }
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let cancelled = stats.map(|stats| stats.micro_cancelled).unwrap_or(0);
+        let stale = stats.map(|stats| stats.micro_stale_discarded).unwrap_or(0);
+        if cancelled.saturating_add(stale) == 0 {
+            reasons.push("\"camera motion did not cancel or discard an obsolete build\"".into());
+        }
+        let mut saw_upload_hold = false;
+        for pair in self.async_frames.windows(2) {
+            let previous = &pair[0];
+            let row = &pair[1];
+            if row.partial != previous.partial || row.partial != 0 {
+                reasons.push(format!("\"partial publication counter moved from {} to {}\"", previous.partial, row.partial));
+                break;
+            }
+            if row.leaf != 6_122_214 {
+                reasons.push(format!("\"leaf triangles became {}\"", row.leaf));
+                break;
+            }
+            if row.base < 500_000 {
+                reasons.push(format!("\"base surface fell to {} triangles\"", row.base));
+                break;
+            }
+            if row.tris == 18432 && row.base != 6_122_214 {
+                reasons.push(format!("\"close detail drew over {} base triangles\"", row.base));
+                break;
+            }
+            let empty = row.tris == 0;
+            if empty != (row.verts == 0) || empty != (row.fingerprint == 0) {
+                reasons.push(format!("\"micro tris {} verts {} fingerprint {:x} is not a complete set\"", row.tris, row.verts, row.fingerprint));
+                break;
+            }
+            if row.tris > 18432 {
+                reasons.push(format!("\"micro tris {} exceeded the surface budget\"", row.tris));
+                break;
+            }
+            let changed = row.tris != previous.tris || row.fingerprint != previous.fingerprint;
+            if changed && !matches!(row.stage.as_str(), "Ready") {
+                reasons.push(format!("\"microgeometry changed to {} during {}\"", row.tris, row.stage));
+                break;
+            }
+            if matches!(previous.stage.as_str(), "Queued" | "Sampling" | "Building" | "Uploading") && row.tris == previous.tris && row.fingerprint == previous.fingerprint {
+                saw_upload_hold = true;
+            }
+        }
+        if !saw_upload_hold {
+            reasons.push("\"the previous microgeometry was not held while a replacement was outstanding\"".into());
+        }
+        let close_rows: Vec<&AsyncFrame> = self.async_frames.iter().filter(|row| row.stage == "Ready" && row.tris == 18432).collect();
+        if close_rows.len() < 2 {
+            reasons.push(format!("\"settled close detail appeared {} times\"", close_rows.len()));
+        } else if close_rows.iter().any(|row| row.fingerprint != close_rows[0].fingerprint) {
+            reasons.push("\"returning to the close camera changed the fingerprint\"".into());
+        }
+        if !self.async_frames.iter().any(|row| row.stage == "Ready" && row.tris == 0 && row.base >= 500_000) {
+            reasons.push("\"the far camera did not settle on zero detail over the base surface\"".into());
+        }
+        let passed = reasons.is_empty();
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        let reasons_json = format!("[{}]", reasons.join(","));
+        let fingerprint = close_rows.first().map(|row| row.fingerprint).unwrap_or(0);
+        let json = format!(
+            "{{\"verdict\":\"RFC0002_ASYNC_{verdict}\",\"frames\":{},\"busy_frames\":{},\"cancelled\":{cancelled},\"stale\":{stale},\"close_fingerprint\":\"{fingerprint:x}\",\"reasons\":{reasons_json}}}",
+            self.async_frames.len(),
+            self.async_busy
+        );
+        let _ = std::fs::write(format!("{directory}/report.json"), json);
+        println!("RFC0002_ASYNC_{verdict} {directory}");
+        println!("RFC0002_ASYNC_REASONS {reasons_json}");
+        self.finish_lod_capture();
+    }
+
+    fn step_async_phases(&mut self) {
+        match self.lod_phase {
+            100 => {
+                if self.lod_hold < 4 {
+                    return;
+                }
+                self.micro_enabled = true;
+                self.micro_surface = true;
+                self.micro_color = false;
+                self.push_micro_state();
+                self.lod_phase = 101;
+                self.lod_hold = 0;
+            }
+            101 => {
+                if !self.micro_publish_settled() {
+                    if self.lod_hold > 1200 {
+                        self.fail_async("far detail did not settle");
+                    }
+                    return;
+                }
+                let tris = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats().micro_triangles).unwrap_or(1);
+                if tris != 0 {
+                    self.fail_async("far camera still showed micro triangles");
+                    return;
+                }
+                self.record_async_frame();
+                self.place_shop_camera(self.async_close);
+                self.async_step = 0;
+                self.lod_phase = 102;
+                self.lod_hold = 0;
+            }
+            102 => {
+                self.record_async_frame();
+                self.async_step = self.async_step.saturating_add(1);
+                if self.async_step >= 36 {
+                    self.place_shop_camera(self.async_far);
+                    self.lod_phase = 103;
+                    self.lod_hold = 0;
+                    return;
+                }
+                let distance = if self.async_step % 2 == 0 { self.async_close } else { self.async_far };
+                self.place_shop_camera(distance);
+            }
+            103 => {
+                self.record_async_frame();
+                if !self.micro_publish_settled() {
+                    if self.lod_hold > 1200 {
+                        self.fail_async("return to zero detail did not settle");
+                    }
+                    return;
+                }
+                let tris = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats().micro_triangles).unwrap_or(1);
+                if tris != 0 {
+                    self.fail_async("settled far view kept micro triangles");
+                    return;
+                }
+                self.place_shop_camera(self.async_close);
+                self.lod_phase = 104;
+                self.lod_hold = 0;
+            }
+            104 => {
+                self.record_async_frame();
+                if !self.micro_publish_settled() {
+                    if self.lod_hold > 1200 {
+                        self.fail_async("close detail did not publish");
+                    }
+                    return;
+                }
+                let tris = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats().micro_triangles).unwrap_or(0);
+                if tris != 18432 {
+                    self.fail_async(&format!("close detail published {tris} triangles"));
+                    return;
+                }
+                self.place_shop_camera(self.async_far);
+                self.lod_phase = 105;
+                self.lod_hold = 0;
+            }
+            105 => {
+                self.record_async_frame();
+                if !self.micro_publish_settled() {
+                    if self.lod_hold > 1200 {
+                        self.fail_async("second far view did not settle");
+                    }
+                    return;
+                }
+                let tris = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats().micro_triangles).unwrap_or(1);
+                if tris != 0 {
+                    self.fail_async("second far view kept micro triangles");
+                    return;
+                }
+                self.place_shop_camera(self.async_close);
+                self.lod_phase = 106;
+                self.lod_hold = 0;
+            }
+            106 => {
+                self.record_async_frame();
+                if !self.micro_publish_settled() {
+                    if self.lod_hold > 1200 {
+                        self.fail_async("second close view did not publish");
+                    }
+                    return;
+                }
+                self.finish_async();
+            }
+            _ => self.finish_async(),
+        }
+    }
+
     fn step_lod_capture(&mut self) {
         if !self.lod_capture {
             return;
         }
         self.lod_hold = self.lod_hold.saturating_add(1);
+        if self.lod_phase >= 100 {
+            self.step_async_phases();
+            return;
+        }
+        if self.lod_phase >= 90 {
+            self.step_refine_phases();
+            return;
+        }
+        if self.lod_phase >= 70 {
+            self.step_transition_phases();
+            return;
+        }
+        if self.lod_phase >= 50 {
+            self.step_micro_phases();
+            return;
+        }
         if self.lod_phase == 0 {
             if self.frames < 45 || self.find_named_entity("townshop").is_none() {
                 return;
@@ -5955,6 +8971,113 @@ impl Editor {
             if self.lod_hold < 20 {
                 return;
             }
+            if self.rfc0002_async {
+                self.einstein_debug = false;
+                self.micro_enabled = false;
+                self.micro_color = false;
+                self.micro_surface = true;
+                self.micro_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                    renderer.set_micro_surface(true);
+                    renderer.set_microgeometry(false, self.micro_seed, false);
+                }
+                self.async_close = self.projected_error_distance(0.02, 3.20);
+                self.async_far = self.projected_error_distance(0.02, 0.50);
+                self.place_shop_camera(self.async_far);
+                self.lod_phase = 100;
+                self.lod_hold = 0;
+                println!("RFC0002_ASYNC_PLAN close={:.2} far={:.2}", self.async_close, self.async_far);
+                return;
+            }
+            if self.rfc0002_refine {
+                self.einstein_debug = false;
+                self.micro_enabled = false;
+                self.micro_color = false;
+                self.micro_surface = true;
+                self.micro_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                    renderer.set_micro_surface(true);
+                    renderer.set_microgeometry(false, self.micro_seed, false);
+                }
+                self.transition_distances = self.transition_path();
+                self.transition_forward = self.transition_distances.len().div_ceil(2);
+                let near = self.shop_target().map(|target| target.half_z + 0.55).unwrap_or(1.2).clamp(1.05, 2.2);
+                self.place_shop_camera(near);
+                self.lod_phase = 90;
+                self.lod_hold = 0;
+                println!("RFC0002_REFINE_PLAN near={near:.2} dolly={}", self.transition_distances.len());
+                return;
+            }
+            if self.rfc0002_transition {
+                self.einstein_debug = false;
+                self.micro_enabled = false;
+                self.micro_color = false;
+                self.micro_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                    renderer.set_microgeometry(false, self.micro_seed, false);
+                }
+                self.transition_distances = self.transition_path();
+                self.transition_forward = self.transition_distances.len().div_ceil(2);
+                let near = self.shop_target().map(|target| target.half_z + 0.55).unwrap_or(1.2).clamp(1.05, 2.2);
+                self.place_shop_camera(near);
+                self.lod_phase = 70;
+                self.lod_hold = 0;
+                println!(
+                    "RFC0002_TRANSITION_PLAN near={near:.2} samples={} forward={}",
+                    self.transition_distances.len(),
+                    self.transition_forward
+                );
+                return;
+            }
+            if self.rfc0002_micro {
+                self.einstein_debug = false;
+                self.micro_enabled = false;
+                self.micro_color = false;
+                self.micro_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                    renderer.set_microgeometry(false, self.micro_seed, false);
+                }
+                let fit = self.shop_fit_distance();
+                let switch_1px = self.projected_error_distance(0.02, 1.0);
+                let close = fit.min(switch_1px * 0.55).clamp(2.4, 7.0);
+                let partial = self.projected_error_distance(0.02, 1.0);
+                let medium = switch_1px * 1.35;
+                let far = switch_1px * 2.4;
+                let near = self.shop_target().map(|target| target.half_z + 0.55).unwrap_or(1.2).clamp(1.05, 2.2);
+                self.rfc_distances = vec![
+                    ("close".into(), close),
+                    ("partial".into(), partial),
+                    ("medium".into(), medium),
+                    ("far".into(), far),
+                    ("near".into(), near),
+                ];
+                self.place_shop_camera(close);
+                self.lod_phase = 50;
+                self.lod_hold = 0;
+                println!("RFC0002_MICRO_PLAN close={close:.2} partial={partial:.2} medium={medium:.2} far={far:.2} near={near:.2}");
+                return;
+            }
+            if self.rfc0002 {
+                self.einstein_debug = false;
+                self.einstein_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                }
+                let fit = self.shop_fit_distance();
+                let switch_1px = self.projected_error_distance(0.02, 1.0);
+                let close = fit.min(switch_1px * 0.55).clamp(2.4, 7.0);
+                let far = switch_1px * 2.4;
+                self.rfc_distances = vec![("close".into(), close), ("far".into(), far)];
+                self.place_shop_camera(close);
+                self.lod_phase = 40;
+                self.lod_hold = 0;
+                println!("RFC0002_PLAN close={close:.2} far={far:.2}");
+                return;
+            }
             if self.rfc_runtime {
                 self.rfc_usable_ms = self.boot_at.elapsed().as_millis();
                 let fit = self.shop_fit_distance();
@@ -5991,6 +9114,61 @@ impl Editor {
             self.place_shop_camera(1.6);
             self.lod_phase = 2;
             self.lod_hold = 0;
+            return;
+        }
+        if self.lod_phase == 40 {
+            if self.lod_hold < 6 {
+                return;
+            }
+            self.rfc0002_off = Some(self.capture_einstein_shot("off-close"));
+            self.einstein_debug = true;
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_einstein_debug(true, self.einstein_seed);
+            }
+            self.lod_phase = 41;
+            self.lod_hold = 0;
+            return;
+        }
+        if self.lod_phase == 41 {
+            if self.lod_hold < 6 {
+                return;
+            }
+            self.rfc0002_on = Some(self.capture_einstein_shot("on-close"));
+            self.lod_phase = 42;
+            self.lod_hold = 0;
+            return;
+        }
+        if self.lod_phase == 42 {
+            if self.lod_hold < 4 {
+                return;
+            }
+            self.rfc0002_again = Some(self.capture_einstein_shot("on-close-again"));
+            self.place_shop_camera(self.rfc_distances.first().map(|(_, distance)| *distance).unwrap_or(2.4));
+            if let Some(camera) = self.editor_camera.as_mut() {
+                camera.yaw += 0.45;
+                camera.reorbit();
+            }
+            self.lod_phase = 43;
+            self.lod_hold = 0;
+            return;
+        }
+        if self.lod_phase == 43 {
+            if self.lod_hold < 4 {
+                return;
+            }
+            self.rfc0002_orbit = Some(self.capture_einstein_shot("on-orbit"));
+            let far = self.rfc_distances.get(1).map(|(_, distance)| *distance).unwrap_or(24.0);
+            self.place_shop_camera(far);
+            self.lod_phase = 44;
+            self.lod_hold = 0;
+            return;
+        }
+        if self.lod_phase == 44 {
+            if self.lod_hold < 6 {
+                return;
+            }
+            self.rfc0002_far = Some(self.capture_einstein_shot("on-far"));
+            self.finish_rfc0002();
             return;
         }
         if self.lod_phase == 20 {
@@ -6686,6 +9864,19 @@ impl Editor {
     }
 
     fn cancel_background_job(&mut self) {
+        if let Some(job) = self.micro_job.as_ref() {
+            if !job.finished {
+                self.jobs.cancel(job.id);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.note_micro_cancelled();
+                }
+                if let Some(job) = self.micro_job.as_mut() {
+                    job.cancel_noted = true;
+                }
+                self.append("Cancel requested for the Einstein surface job. The published microgeometry stays until a newer build is resident.");
+                return;
+            }
+        }
         let Some(job) = self.parent_job.as_ref() else {
             self.append("No background job is queued.");
             return;
@@ -6891,22 +10082,28 @@ impl Editor {
     }
 
     fn gizmo_vertices(&self) -> Option<Vec<jarvig_renderer::OverlayVertex>> {
-        let (entity, pose) = self.gizmo_target()?;
         let camera = self.editor_camera.as_ref()?;
-        let height = self.renderer.as_ref()?.configured_size().1;
-        let distance = vec_len(vec_sub(pose.translation, camera.position));
-        let length = gizmo::visual_length(distance, camera.vertical_fov_radians, height);
-        let _ = entity;
-        Some(gizmo::build_gizmo(
-            pose.translation,
-            camera.position,
-            length,
-            self.transform_space,
-            pose.rotation,
-            self.object_tool == chrome::ToolbarCommand::Rotate,
-            self.gizmo_hover.filter(|handle| handle.is_rotation() == (self.object_tool == chrome::ToolbarCommand::Rotate)),
-            self.gizmo_drag.as_ref().map(|drag| drag.handle),
-        ))
+        let mut vertices = Vec::new();
+        if let (Some((_entity, pose)), Some(renderer)) = (self.gizmo_target(), self.renderer.as_ref()) {
+            let height = renderer.configured_size().1;
+            let distance = vec_len(vec_sub(pose.translation, camera.position));
+            let length = gizmo::visual_length(distance, camera.vertical_fov_radians, height);
+            vertices.extend(gizmo::build_gizmo(
+                pose.translation,
+                camera.position,
+                length,
+                self.transform_space,
+                pose.rotation,
+                self.object_tool == chrome::ToolbarCommand::Rotate,
+                self.gizmo_hover.filter(|handle| handle.is_rotation() == (self.object_tool == chrome::ToolbarCommand::Rotate)),
+                self.gizmo_drag.as_ref().map(|drag| drag.handle),
+            ));
+        }
+        let segments = self.visible_joint_segments();
+        if !segments.is_empty() {
+            vertices.extend(gizmo::joint_debug_vertices(&segments, camera.position));
+        }
+        if vertices.is_empty() { None } else { Some(vertices) }
     }
 
     fn begin_capture(&mut self, hwnd: HWND, kind: CaptureKind) {
@@ -6923,7 +10120,7 @@ impl Editor {
             }
             SetCapture(hwnd);
         }
-        if kind != CaptureKind::Gizmo {
+        if kind != CaptureKind::Gizmo && kind != CaptureKind::Terrain {
             self.hide_cursor();
         }
         self.capture = Some(kind);
@@ -6936,6 +10133,10 @@ impl Editor {
     fn end_capture(&mut self, release: bool, clear_keys: bool) {
         if self.capture == Some(CaptureKind::Gizmo) && self.gizmo_drag.is_some() {
             self.restore_gizmo_drag();
+        }
+        if self.capture == Some(CaptureKind::Terrain) {
+            self.land_stamp = None;
+            self.land_flatten = None;
         }
         let was_active = self.capture.take().is_some() || self.cursor_hidden;
         self.nav.look = false;
@@ -6988,7 +10189,7 @@ impl Editor {
     }
 
     fn sample_captured_mouse(&mut self) {
-        if self.capture.is_none() || self.capture == Some(CaptureKind::Gizmo) {
+        if self.capture.is_none() || matches!(self.capture, Some(CaptureKind::Gizmo | CaptureKind::Terrain)) {
             return;
         }
         unsafe {
@@ -7275,11 +10476,16 @@ impl Editor {
                     }
                     return true;
                 }
-                if matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit)) {
+                if matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit | CaptureKind::Terrain)) {
                     return true;
                 }
                 let x = (lparam & 0xffff) as u16 as i16 as f64;
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                if self.land_brush().is_some() {
+                    self.begin_capture(hwnd, CaptureKind::Terrain);
+                    self.stamp_land(x, y, true);
+                    return true;
+                }
                 let ctrl = (unsafe { GetKeyState(VK_CONTROL as i32) } as u16) & 0x8000 != 0;
                 self.viewport_press(hwnd, x, y, ctrl);
                 true
@@ -7287,7 +10493,7 @@ impl Editor {
             WM_LBUTTONUP => {
                 if self.capture == Some(CaptureKind::Gizmo) {
                     self.commit_gizmo();
-                } else if self.capture == Some(CaptureKind::Orbit) {
+                } else if self.capture == Some(CaptureKind::Orbit) || self.capture == Some(CaptureKind::Terrain) {
                     self.end_capture(true, false);
                 }
                 true
@@ -7297,9 +10503,12 @@ impl Editor {
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
                 if self.capture == Some(CaptureKind::Gizmo) {
                     self.update_gizmo_drag(x, y);
+                } else if self.capture == Some(CaptureKind::Terrain) {
+                    self.stamp_land(x, y, false);
                 } else {
                     self.sample_captured_mouse();
                     self.update_gizmo_hover(x, y);
+                    self.track_land_hover(x, y);
                 }
                 true
             }
@@ -7311,8 +10520,14 @@ impl Editor {
                     let raw = ((wparam >> 16) & 0xffff) as u16 as i16 as i32;
                     let notches = raw / 120;
                     if notches != 0 {
-                        self.nav.wheel_notches = self.nav.wheel_notches.saturating_add(notches);
-                        self.nav.alt = (unsafe { GetKeyState(VK_MENU as i32) } as u16) & 0x8000 != 0;
+                        let alt = (unsafe { GetKeyState(VK_MENU as i32) } as u16) & 0x8000 != 0;
+                        let camera_captured = matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit));
+                        if !alt && !camera_captured && self.land_radius_wheel() {
+                            self.scale_land_radius(notches);
+                        } else {
+                            self.nav.wheel_notches = self.nav.wheel_notches.saturating_add(notches);
+                            self.nav.alt = alt;
+                        }
                     }
                 }
                 true
@@ -7328,7 +10543,7 @@ impl Editor {
                 }
                 true
             }
-            WM_SETCURSOR => self.capture.is_some(),
+            WM_SETCURSOR => self.capture.is_some() && self.capture != Some(CaptureKind::Terrain),
             _ => false,
         }
     }
@@ -7817,6 +11032,45 @@ impl Editor {
         Err("toolbar button missing".into())
     }
 
+    /// Selected joint only, unless View > Show All Joints is checked. Level and Land stay clear of them.
+    fn visible_joint_segments(&self) -> Vec<jarvig_core::JointDebugSegment> {
+        if self.bind_pose_dir.is_none() && !self.character_workspace {
+            return Vec::new();
+        }
+        if !self.show_joint_debug && !self.show_all_joints {
+            return Vec::new();
+        }
+        let selected = self.selection.primary_entity();
+        let limits = if self.show_joint_limits { selected } else { None };
+        let mut segments = self.engine.world().joint_debug_segments(limits);
+        if self.show_all_joints {
+            return segments;
+        }
+        match selected {
+            Some(id) => segments.retain(|segment| segment.entity == id),
+            None => segments.clear(),
+        }
+        segments
+    }
+
+    fn joint_pivot_at(&self, x: f64, y: f64) -> Option<jarvig_core::EntityId> {
+        let mut best: Option<(jarvig_core::EntityId, f64)> = None;
+        for segment in self.visible_joint_segments() {
+            if segment.limits {
+                continue;
+            }
+            let Ok((px, py)) = self.pixel_for_world_point(segment.start) else { continue };
+            let distance = (px - x).hypot(py - y);
+            if distance > 14.0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, nearest)| distance < *nearest) {
+                best = Some((segment.entity, distance));
+            }
+        }
+        best.map(|(entity, _)| entity)
+    }
+
     fn pixel_for_world_point(&self, point: Vec3) -> Result<(f64, f64), String> {
         let camera = self.editor_camera.as_ref().ok_or("camera missing")?;
         let (width, height) = self.renderer.as_ref().ok_or("renderer missing")?.configured_size();
@@ -7892,7 +11146,10 @@ impl Editor {
             return;
         }
         match id {
-            ID_FILE_NEW_PROJECT => self.file_new_project(),
+            ID_FILE_NEW_PROJECT | ID_FILE_TEMPLATE_EMPTY => self.file_new_project(),
+            ID_FILE_TEMPLATE_TERRAIN => self.file_new_from_template("terrain"),
+            ID_FILE_TEMPLATE_THIRD => self.file_new_from_template("third-person"),
+            ID_FILE_TEMPLATE_FPS => self.file_new_from_template("fps"),
             ID_FILE_OPEN_PROJECT => self.file_open_project(),
             ID_FILE_CLOSE_PROJECT => self.file_close_project(),
             ID_FILE_NEW_LEVEL => self.file_new_level(),
@@ -7919,6 +11176,45 @@ impl Editor {
                 unsafe { MessageBoxW(self.frame, text.as_ptr(), title.as_ptr(), MB_OK); }
             }
             ID_VIEW_OUTLINER => self.toggle_panel(OUTLINER),
+            ID_VIEW_CHARACTER => self.set_character_workspace(!self.character_workspace),
+            ID_VIEW_LAND => self.set_land_mode(!self.land_mode),
+            ID_VIEW_RESET_POSE => self.reset_character_pose(),
+            ID_VIEW_JOINTS => {
+                if !self.character_workspace {
+                    self.append("Joint helpers draw in the Character workspace. Level stays clear of them.");
+                } else {
+                    self.show_joint_debug = !self.show_joint_debug;
+                    if !self.show_joint_debug {
+                        self.show_all_joints = false;
+                    }
+                    self.persist_workspace();
+                }
+                self.sync_view_menu();
+                self.refresh_status();
+            }
+            ID_VIEW_ALL_JOINTS => {
+                if !self.character_workspace {
+                    self.append("Joint helpers draw in the Character workspace. Level stays clear of them.");
+                } else {
+                    self.show_all_joints = !self.show_all_joints;
+                    if self.show_all_joints {
+                        self.show_joint_debug = true;
+                    }
+                    self.persist_workspace();
+                }
+                self.sync_view_menu();
+                self.refresh_status();
+            }
+            ID_VIEW_JOINT_LIMITS => {
+                if !self.character_workspace {
+                    self.append("Joint limits draw in the Character workspace. Level stays clear of them.");
+                } else {
+                    self.show_joint_limits = !self.show_joint_limits;
+                    self.persist_workspace();
+                }
+                self.sync_view_menu();
+                self.refresh_status();
+            }
             ID_VIEW_INSPECTOR => self.toggle_panel(INSPECTOR),
             ID_VIEW_CONTENT => self.toggle_panel(CONTENT),
             ID_VIEW_OUTPUT => self.toggle_panel(OUTPUT),
@@ -7942,6 +11238,9 @@ impl Editor {
             ID_VIEW_MESHLET_FREEZE => self.toggle_meshlet_freeze(),
             ID_VIEW_MESHLET_HIGHLIGHT => self.toggle_meshlet_highlight(),
             ID_VIEW_CLUSTER_HIERARCHY => self.toggle_cluster_hierarchy(),
+            ID_VIEW_EINSTEIN => self.toggle_einstein_debug(),
+            ID_VIEW_MICRO => self.toggle_microgeometry(),
+            ID_VIEW_MICRO_COLOR => self.toggle_micro_color(),
             ID_VIEW_ERROR_HALF => self.set_hierarchy_error(0.5),
             ID_VIEW_ERROR_ONE => self.set_hierarchy_error(1.0),
             ID_VIEW_ERROR_TWO => self.set_hierarchy_error(2.0),
@@ -8131,6 +11430,7 @@ impl Editor {
                     self.transform_space == gizmo::TransformSpace::Local,
                     self.play_toolbar(),
                     self.ui_font,
+                    self.editor_mode(),
                 );
             }
             EndPaint(hwnd, &paint);
@@ -8146,6 +11446,9 @@ impl Editor {
             chrome::ToolbarCommand::Scale => {
                 self.append("Scale is unavailable. A spatial frame stores translation and a quaternion, not scale.");
             }
+            chrome::ToolbarCommand::Level => self.enter_mode(chrome::WorkspaceMode::Level, true),
+            chrome::ToolbarCommand::Land => self.enter_mode(chrome::WorkspaceMode::Land, true),
+            chrome::ToolbarCommand::Character => self.enter_mode(chrome::WorkspaceMode::Character, true),
             chrome::ToolbarCommand::Local => {
                 self.transform_space = match self.transform_space {
                     gizmo::TransformSpace::World => gizmo::TransformSpace::Local,
@@ -8166,7 +11469,20 @@ impl Editor {
             chrome::ToolbarCommand::Fly => self.append("Fly is RMB plus WASD. The toolbar icon does not switch a mode."),
             chrome::ToolbarCommand::Pan => self.append("Pan is the middle mouse button."),
             chrome::ToolbarCommand::Orbit => self.append("Orbit is Alt plus the left mouse button."),
-            chrome::ToolbarCommand::Snap => self.append("Grid snap is not implemented."),
+            chrome::ToolbarCommand::Snap => {
+                if self.land_mode && !self.session_active() {
+                    self.land_grid_snap = !self.land_grid_snap;
+                    self.append(if self.land_grid_snap {
+                        "Terrain snap is on. The brush center locks to the minor grid."
+                    } else {
+                        "Terrain snap is off."
+                    });
+                    self.inspector_force_realize = true;
+                    self.request_inspector_refresh();
+                } else {
+                    self.append("Grid snap is the Land Mode brush. Enter Land Mode to snap a sculpt to the terrain grid.");
+                }
+            }
             chrome::ToolbarCommand::Speed => self.append("Camera speed is the mouse wheel, in meters per second. The toolbar icon does not change it."),
             chrome::ToolbarCommand::Maximize => self.append("Maximize viewport is not implemented."),
         }
@@ -8179,7 +11495,11 @@ impl Editor {
             unsafe { DeleteObject(self.ui_font as _); }
             self.ui_font = std::ptr::null_mut();
         }
-        self.renderer.take();
+        let Some(renderer) = self.renderer.take() else { return };
+        // frame_proc cannot unwind. A device-drop panic would abort the process.
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(renderer))) {
+            eprintln!("EDITOR_FRAME renderer release panicked: {}", panic_payload(&payload));
+        }
     }
 }
 
@@ -8244,6 +11564,16 @@ fn describe(error: RenderError) -> String {
     error.to_string()
 }
 
+fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".into()
+    }
+}
+
 fn describe_frame(error: FrameError<String>) -> String {
     match error {
         FrameError::Runtime(error) => format!("runtime {error:?}"),
@@ -8271,7 +11601,7 @@ fn window_text(hwnd: HWND) -> String {
 
 fn key_to_node(key: TreeKey) -> outliner::OutlinerNodeId {
     match key {
-        TreeKey::World => outliner::OutlinerNodeId::WorldRoot,
+        TreeKey::World | TreeKey::Tool(_) => outliner::OutlinerNodeId::WorldRoot,
         TreeKey::Entity(entity) => outliner::OutlinerNodeId::Entity(entity),
     }
 }
@@ -8533,11 +11863,296 @@ fn sky_color(rgba: &[u8], width: i32, origin_x: i32, origin_y: i32, view_w: i32,
     best
 }
 
+struct ReliefMetrics {
+    mean_diff: f32,
+    changed_fraction: f32,
+    marks: u32,
+    overlap: f32,
+    outside_diff: f32,
+    holes: u32,
+    solid: u32,
+    hole_ratio: f32,
+}
 
+fn channel_delta(left: &[u8], right: &[u8]) -> u16 {
+    u16::from((left[0] as i16 - right[0] as i16).unsigned_abs())
+        + u16::from((left[1] as i16 - right[1] as i16).unsigned_abs())
+        + u16::from((left[2] as i16 - right[2] as i16).unsigned_abs())
+}
 
+fn is_micro_mark(pixel: &[u8]) -> bool {
+    pixel[0] > 160 && pixel[2] < 150 && u16::from(pixel[0]) + 30 > u16::from(pixel[1]) && u16::from(pixel[0]) > u16::from(pixel[2]) + 25
+}
 
+fn relief_metrics(off: &ReliefShot, on: &ReliefShot, color: &ReliefShot) -> ReliefMetrics {
+    let empty = ReliefMetrics { mean_diff: 255.0, changed_fraction: 1.0, marks: 0, overlap: 0.0, outside_diff: 255.0, holes: 1, solid: 1, hole_ratio: 1.0 };
+    let (width, height, plain) = crop_rgba(&off.rgba, off.width, off.region);
+    let (_, _, shaded_raw) = crop_rgba(&on.rgba, on.width, on.region);
+    let (_, _, marked_raw) = crop_rgba(&color.rgba, color.width, color.region);
+    let (_, _, shaded) = scale_nearest(&shaded_raw, on.region.2, on.region.3, width, height);
+    let (_, _, marked) = scale_nearest(&marked_raw, color.region.2, color.region.3, width, height);
+    if plain.len() != shaded.len() || plain.len() != marked.len() || width <= 1 || height <= 1 {
+        return empty;
+    }
+    let sky = sky_color(&off.rgba, off.width, off.origin.0, off.origin.1, off.origin.2, off.origin.3);
+    let mut diff_sum = 0u64;
+    let mut changed = 0u32;
+    let mut total = 0u32;
+    let mut marks = 0u32;
+    let mut mark_hit = 0u32;
+    let mut outside_sum = 0u64;
+    let mut outside_count = 0u32;
+    let mut plain_solid = 0u32;
+    let mut shaded_solid = 0u32;
+    for index in (0..plain.len()).step_by(4) {
+        let delta = channel_delta(&plain[index..index + 3], &shaded[index..index + 3]);
+        diff_sum += u64::from(delta);
+        total = total.saturating_add(1);
+        if delta > 24 {
+            changed = changed.saturating_add(1);
+        }
+        if is_micro_mark(&marked[index..index + 3]) {
+            marks = marks.saturating_add(1);
+            if delta > 12 {
+                mark_hit = mark_hit.saturating_add(1);
+            }
+        } else {
+            outside_sum += u64::from(delta);
+            outside_count = outside_count.saturating_add(1);
+        }
+        if !near_sky(&plain[index..index + 3], sky) {
+            plain_solid = plain_solid.saturating_add(1);
+        }
+        if !near_sky(&shaded[index..index + 3], sky) {
+            shaded_solid = shaded_solid.saturating_add(1);
+        }
+    }
+    let hole_gap = plain_solid.abs_diff(shaded_solid);
+    ReliefMetrics {
+        mean_diff: if total == 0 { 255.0 } else { diff_sum as f32 / total as f32 / 3.0 },
+        changed_fraction: if total == 0 { 1.0 } else { changed as f32 / total as f32 },
+        marks,
+        overlap: if marks == 0 { 0.0 } else { mark_hit as f32 / marks as f32 },
+        outside_diff: if outside_count == 0 { 0.0 } else { outside_sum as f32 / outside_count as f32 / 3.0 },
+        holes: hole_gap,
+        solid: plain_solid,
+        hole_ratio: if plain_solid < 64 { 1.0 } else { hole_gap as f32 / plain_solid as f32 },
+    }
+}
 
+fn near_sky(pixel: &[u8], sky: [u8; 3]) -> bool {
+    (pixel[0] as i32 - sky[0] as i32).abs() + (pixel[1] as i32 - sky[1] as i32).abs() + (pixel[2] as i32 - sky[2] as i32).abs() <= 42
+}
 
+fn crop_rgba(rgba: &[u8], width: i32, region: (i32, i32, i32, i32)) -> (i32, i32, Vec<u8>) {
+    let (left, top, region_w, region_h) = region;
+    if region_w <= 0 || region_h <= 0 || width <= 0 {
+        return (1, 1, vec![0, 0, 0, 255]);
+    }
+    let mut out = vec![0u8; (region_w as usize) * (region_h as usize) * 4];
+    for y in 0..region_h {
+        for x in 0..region_w {
+            let src = (((top + y) as usize) * (width as usize) + (left + x) as usize) * 4;
+            let dst = (y as usize * region_w as usize + x as usize) * 4;
+            if let Some(pixel) = rgba.get(src..src + 4) {
+                out[dst..dst + 4].copy_from_slice(pixel);
+            }
+        }
+    }
+    (region_w, region_h, out)
+}
+
+fn scale_nearest(rgba: &[u8], width: i32, height: i32, target_w: i32, target_h: i32) -> (i32, i32, Vec<u8>) {
+    if width <= 0 || height <= 0 || target_w <= 0 || target_h <= 0 {
+        return (1, 1, vec![0, 0, 0, 255]);
+    }
+    let mut out = vec![0u8; (target_w as usize) * (target_h as usize) * 4];
+    for y in 0..target_h {
+        let src_y = (y as i64 * height as i64 / target_h as i64).min(height as i64 - 1) as i32;
+        for x in 0..target_w {
+            let src_x = (x as i64 * width as i64 / target_w as i64).min(width as i64 - 1) as i32;
+            let src = (src_y as usize * width as usize + src_x as usize) * 4;
+            let dst = (y as usize * target_w as usize + x as usize) * 4;
+            if let Some(pixel) = rgba.get(src..src + 4) {
+                out[dst..dst + 4].copy_from_slice(pixel);
+            }
+        }
+    }
+    (target_w, target_h, out)
+}
+
+fn compose_shots(shots: &[&ReliefShot]) -> Option<CapturedWindow> {
+    let first = *shots.first()?;
+    let (crop_w, crop_h, _) = crop_rgba(&first.rgba, first.width, first.region);
+    if crop_w <= 1 || crop_h <= 1 || shots.is_empty() {
+        return None;
+    }
+    let panels: Vec<Vec<u8>> = shots
+        .iter()
+        .map(|shot| {
+            let (_, _, raw) = crop_rgba(&shot.rgba, shot.width, shot.region);
+            let (_, _, scaled) = scale_nearest(&raw, shot.region.2, shot.region.3, crop_w, crop_h);
+            scaled
+        })
+        .collect();
+    let width = crop_w.saturating_mul(panels.len() as i32);
+    let mut rgba = vec![0u8; (width as usize) * (crop_h as usize) * 4];
+    for (panel_index, panel) in panels.iter().enumerate() {
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let src = (y as usize * crop_w as usize + x as usize) * 4;
+                let dst = (y as usize * width as usize + (panel_index * crop_w as usize + x as usize)) * 4;
+                if src + 4 <= panel.len() && dst + 4 <= rgba.len() {
+                    rgba[dst..dst + 4].copy_from_slice(&panel[src..src + 4]);
+                }
+            }
+        }
+    }
+    Some(CapturedWindow { width, height: crop_h, rgba })
+}
+
+fn compose_review(off: &ReliefShot, on: &ReliefShot, color: &ReliefShot) -> Option<CapturedWindow> {
+    let (crop_w, crop_h, plain) = crop_rgba(&off.rgba, off.width, off.region);
+    let (_, _, shaded_raw) = crop_rgba(&on.rgba, on.width, on.region);
+    let (_, _, marked_raw) = crop_rgba(&color.rgba, color.width, color.region);
+    let (_, _, shaded) = scale_nearest(&shaded_raw, on.region.2, on.region.3, crop_w, crop_h);
+    let (_, _, marked) = scale_nearest(&marked_raw, color.region.2, color.region.3, crop_w, crop_h);
+    if plain.len() != shaded.len() || plain.len() != marked.len() || crop_w <= 1 {
+        return None;
+    }
+    let mut diff = vec![0u8; plain.len()];
+    for index in (0..plain.len().min(shaded.len())).step_by(4) {
+        for channel in 0..3 {
+            let delta = u16::from((plain[index + channel] as i16 - shaded[index + channel] as i16).unsigned_abs()).saturating_mul(8);
+            diff[index + channel] = u8::try_from(delta.min(255)).unwrap_or(255);
+        }
+        diff[index + 3] = 255;
+    }
+    let panels = [&plain, &shaded, &marked, &diff];
+    let width = crop_w.saturating_mul(panels.len() as i32);
+    let mut rgba = vec![0u8; (width as usize) * (crop_h as usize) * 4];
+    for (panel_index, panel) in panels.iter().enumerate() {
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let src = (y as usize * crop_w as usize + x as usize) * 4;
+                let dst = (y as usize * width as usize + (panel_index * crop_w as usize + x as usize)) * 4;
+                if src + 4 <= panel.len() && dst + 4 <= rgba.len() {
+                    rgba[dst..dst + 4].copy_from_slice(&panel[src..src + 4]);
+                }
+            }
+        }
+    }
+    Some(CapturedWindow { width, height: crop_h, rgba })
+}
+
+fn compose_transition_strip(crops: &[(f32, Vec<u8>, i32, i32)]) -> Option<CapturedWindow> {
+    if crops.is_empty() {
+        return None;
+    }
+    let height = crops.iter().map(|crop| crop.3).max().unwrap_or(0);
+    let width = crops.iter().map(|crop| crop.2).sum::<i32>();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    let mut x_offset = 0i32;
+    for (_, pixels, crop_w, crop_h) in crops {
+        for y in 0..*crop_h {
+            for x in 0..*crop_w {
+                let src = (y as usize * *crop_w as usize + x as usize) * 4;
+                let dst = (y as usize * width as usize + (x_offset + x) as usize) * 4;
+                if src + 4 <= pixels.len() && dst + 4 <= rgba.len() {
+                    rgba[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+                }
+            }
+        }
+        x_offset += crop_w;
+    }
+    Some(CapturedWindow { width, height, rgba })
+}
+
+fn grouped(value: u32) -> String {
+    let text = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in text.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn orange_fraction(rgba: &[u8], width: i32, region: (i32, i32, i32, i32)) -> f32 {
+    let (left, top, region_w, region_h) = region;
+    if region_w <= 0 || region_h <= 0 || width <= 0 {
+        return 0.0;
+    }
+    let mut orange = 0u32;
+    let mut total = 0u32;
+    for y in top..top + region_h {
+        for x in left..left + region_w {
+            let index = ((y as usize) * (width as usize) + x as usize) * 4;
+            let Some(pixel) = rgba.get(index..index + 3) else { continue };
+            total = total.saturating_add(1);
+            if pixel[0] > 150 && u16::from(pixel[0]) > u16::from(pixel[1]) + 20 && u16::from(pixel[0]) > u16::from(pixel[2]) + 40 {
+                orange = orange.saturating_add(1);
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { orange as f32 / total as f32 }
+}
+
+fn saturated_fraction(rgba: &[u8], width: i32, region: (i32, i32, i32, i32)) -> f32 {
+    let (left, top, region_w, region_h) = region;
+    if region_w <= 0 || region_h <= 0 || width <= 0 {
+        return 0.0;
+    }
+    let mut saturated = 0u32;
+    let mut total = 0u32;
+    for y in top..top + region_h {
+        for x in left..left + region_w {
+            let index = ((y as usize) * (width as usize) + x as usize) * 4;
+            let Some(pixel) = rgba.get(index..index + 3) else { continue };
+            let max = pixel[0].max(pixel[1]).max(pixel[2]);
+            let min = pixel[0].min(pixel[1]).min(pixel[2]);
+            total = total.saturating_add(1);
+            if u16::from(max) - u16::from(min) > 70 {
+                saturated = saturated.saturating_add(1);
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { saturated as f32 / total as f32 }
+}
+
+fn mean_abs_diff(left: &[u8], right: &[u8], width: i32, left_region: (i32, i32, i32, i32), right_region: (i32, i32, i32, i32)) -> f32 {
+    if left_region != right_region || width <= 0 {
+        return 255.0;
+    }
+    let (x0, y0, region_w, region_h) = left_region;
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for y in y0..y0 + region_h {
+        for x in x0..x0 + region_w {
+            let index = ((y as usize) * (width as usize) + x as usize) * 4;
+            let (Some(a), Some(b)) = (left.get(index..index + 3), right.get(index..index + 3)) else { continue };
+            sum += (a[0] as i16 - b[0] as i16).unsigned_abs() as u64;
+            sum += (a[1] as i16 - b[1] as i16).unsigned_abs() as u64;
+            sum += (a[2] as i16 - b[2] as i16).unsigned_abs() as u64;
+            count += 3;
+        }
+    }
+    if count == 0 { 255.0 } else { sum as f32 / count as f32 }
+}
 
 fn count_silhouette_holes(reference: &[u8], candidate: &[u8], width: i32, region: (i32, i32, i32, i32), sky: [u8; 3], slack: i32) -> (u32, u32) {
     let (left, top, region_w, region_h) = region;
@@ -8601,6 +12216,34 @@ fn viewport_origin(frame: HWND, viewport: HWND) -> (i32, i32, i32, i32) {
             return (0, 0, 1, 1);
         }
         (view.left - window.left, view.top - window.top, (view.right - view.left).max(1), (view.bottom - view.top).max(1))
+    }
+}
+
+fn row_under_root(outline: &[jarvig_core::EntityOutlineInfo], uuid: jarvig_core::EntityId, root_name: &str) -> bool {
+    let mut cursor = Some(uuid);
+    let mut guard = 0;
+    while let Some(id) = cursor {
+        guard += 1;
+        if guard > 64 {
+            return false;
+        }
+        let Some(row) = outline.iter().find(|row| row.uuid == id) else { return false };
+        if row.parent.is_none() {
+            return row.name == root_name;
+        }
+        cursor = row.parent;
+    }
+    false
+}
+
+fn bind_shot(index: u8) -> (&'static str, &'static str, f64) {
+    match index {
+        0 => ("Base", "front", 0.0),
+        1 => ("Base", "side", -std::f64::consts::FRAC_PI_2),
+        2 => ("Base", "three-quarter", -0.6),
+        3 => ("Base Male", "front", 0.0),
+        4 => ("Base Male", "side", -std::f64::consts::FRAC_PI_2),
+        _ => ("Base Male", "three-quarter", -0.6),
     }
 }
 
@@ -8929,7 +12572,15 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     }
     let recent_projects = CreatePopupMenu();
     let recent_levels = CreatePopupMenu();
-    append(file, ID_FILE_NEW_PROJECT, "New Project...");
+    let templates = CreatePopupMenu();
+    if templates.is_null() {
+        return Err("project template menu was not created".into());
+    }
+    append(templates, ID_FILE_TEMPLATE_EMPTY, "Empty World");
+    append(templates, ID_FILE_TEMPLATE_TERRAIN, "Terrain World");
+    append(templates, ID_FILE_TEMPLATE_THIRD, "Third Person");
+    append(templates, ID_FILE_TEMPLATE_FPS, "FPS");
+    popup(file, templates, "New Project");
     append(file, ID_FILE_OPEN_PROJECT, "Open Project...");
     append(file, ID_FILE_CLOSE_PROJECT, "Close Project");
     separator(file);
@@ -8947,6 +12598,12 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     append(file, ID_FILE_EXIT, "Exit");
     append(edit, ID_EDIT_UNDO, "Undo Mesh Placement\tCtrl+Z");
     append(view, ID_VIEW_OUTLINER, "World Outliner");
+    append(view, ID_VIEW_CHARACTER, "Character Editor");
+    append(view, ID_VIEW_LAND, "Land Mode");
+    append(view, ID_VIEW_RESET_POSE, "Reset Pose");
+    append(view, ID_VIEW_JOINTS, "Show Joints");
+    append(view, ID_VIEW_ALL_JOINTS, "Show All Joints");
+    append(view, ID_VIEW_JOINT_LIMITS, "Show Joint Limits");
     append(view, ID_VIEW_INSPECTOR, "Inspector");
     append(view, ID_VIEW_CONTENT, "Content Browser");
     append(view, ID_VIEW_OUTPUT, "Output Log");
@@ -8972,6 +12629,9 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     append(view, ID_VIEW_MESHLET_FREEZE, "Freeze Meshlet Visibility");
     append(view, ID_VIEW_MESHLET_HIGHLIGHT, "Highlight Cluster Under Cursor");
     append(view, ID_VIEW_CLUSTER_HIERARCHY, "Cluster Hierarchy");
+    append(view, ID_VIEW_EINSTEIN, "Einstein Detail Debug");
+    append(view, ID_VIEW_MICRO, "Procedural Microgeometry");
+    append(view, ID_VIEW_MICRO_COLOR, "Microtriangle Colors");
     append(view, ID_VIEW_ERROR_HALF, "Hierarchy Error 0.5 px");
     append(view, ID_VIEW_ERROR_ONE, "Hierarchy Error 1 px");
     append(view, ID_VIEW_ERROR_TWO, "Hierarchy Error 2 px");
@@ -9034,6 +12694,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     popup(menu, help, "Help");
     chrome::darken_menu(menu);
     chrome::darken_menu(file);
+    chrome::darken_menu(templates);
     chrome::darken_menu(edit);
     chrome::darken_menu(view);
     chrome::darken_menu(lighting);
@@ -9280,10 +12941,22 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, message: u32, wparam: WPARAM, l
                     }
                     return 0;
                 }
-                if let Err(error) = editor.redraw() {
-                    editor.error = Some(error);
-                    editor.release_renderer();
-                    PostQuitMessage(1);
+                let redrawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| editor.redraw()));
+                match redrawn {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("EDITOR_FRAME {error}");
+                        editor.error = Some(error);
+                        editor.release_renderer();
+                        PostQuitMessage(1);
+                    }
+                    Err(payload) => {
+                        let message = panic_payload(payload.as_ref());
+                        eprintln!("EDITOR_FRAME panicked: {message}");
+                        editor.error = Some(format!("panicked: {message}"));
+                        editor.release_renderer();
+                        PostQuitMessage(1);
+                    }
                 }
             }
             0
@@ -9291,6 +12964,7 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, message: u32, wparam: WPARAM, l
         WM_DOCK_TEST => {
             if let Some(editor) = editor {
                 if let Err(error) = editor.on_dock_test(wparam) {
+                    eprintln!("EDITOR_FRAME {error}");
                     editor.error = Some(error);
                     editor.release_renderer();
                     PostQuitMessage(1);
@@ -9884,6 +13558,22 @@ unsafe extern "system" fn content_proc(hwnd: HWND, message: u32, wparam: WPARAM,
                 if (x - origin_x).abs() + (y - origin_y).abs() > 4 {
                     editor.content_drag = Some(id);
                     editor.update_content_drag();
+                }
+            }
+            0
+        }
+        WM_LBUTTONDBLCLK => {
+            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+            editor.content_press = None;
+            editor.content_drag = None;
+            if let Some(row) = editor.browser.rows(56, 34).into_iter().find(|row| y >= row.y && y < row.y + 34) {
+                let asset = editor.browser.assets[row.index].clone();
+                if asset.kind == "Character" {
+                    if let Err(error) = editor.open_character_document(&asset) {
+                        editor.append(&error);
+                    }
+                } else if asset.kind == "Prefab" {
+                    editor.open_character_asset(&asset);
                 }
             }
             0

@@ -2,7 +2,7 @@
 
 Meshlets are an offline cluster decomposition of a derived JARVIG mesh. The cooker reads that mesh. It does not read glTF, and it does not rebuild clusters on launch or per frame.
 
-JRV-0028 is accepted. Human visual confirmation on 2026-09-25: with meshlet colors off, drawing from meshlets matches the ordinary imported shop. It is not virtual geometry and it is not Nanite. The render flag `virtualGeometry` stays off. Occlusion, GPU-driven draws, page streaming, and procedural detail are later tickets. They are not part of this meshlet pass.
+JRV-0028 is accepted. Human visual confirmation on 2026-09-25: with meshlet colors off, drawing from meshlets matches the ordinary imported shop. It is not virtual geometry and it is not Nanite. The render flag `virtualGeometry` stays off. Occlusion, GPU-driven draws, page streaming, and Einstein detail are later tickets. They are not part of this meshlet pass.
 
 The ordinary indexed mesh remains the shaded reference. `View > Draw From Meshlets` draws the same vertex buffer and the same material through the meshlet index buffer. `View > Show Meshlet Colors` paints one flat color per cluster over that surface. Both are off unless the menu is checked. With an imported mesh selected, the status bar shows the meshlet count, source triangles, average and min/max triangles, average and min/max vertices, derived size, build time, and this process's load time. The output log prints the same line when the project meshes load.
 

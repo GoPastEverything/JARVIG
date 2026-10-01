@@ -2,6 +2,10 @@
 //!
 //! This runs on a runtime world. It does not read the editor camera and it does not
 //! write the authored world. A project that does not select a pawn gets none of it.
+//! [`PlayControl::attach`] spawns the free-fly pawn at local (0, 1.6, 8), looking
+//! toward −Z. Play In Editor may then call [`PlayControl::place_free_fly_view`] so
+//! that pawn starts at the view the user already has. Standalone play leaves the
+//! default spawn. The runtime camera is still the pawn's Camera.
 
 use std::collections::BTreeSet;
 
@@ -66,6 +70,32 @@ impl PlayControl {
         control.pawn = pawn;
         control.captured = pawn.is_some();
         Ok(control)
+    }
+
+    /// Moves the builtin free-fly pawn before the first tick. An authored pawn is left where the level put it.
+    ///
+    /// `local_translation` is the pawn's parent frame, which is the scene. Yaw is about +Y and pitch is about
+    /// local +X, the same composition [`Self::fly`] writes every tick. The default spawn from [`Self::attach`]
+    /// stays local (0, 1.6, 8) until this is called.
+    pub fn place_free_fly_view(&mut self, world: &mut SceneWorld, local_translation: Vec3, yaw: f64, pitch: f64) -> Result<(), String> {
+        if self.settings.pawn != PawnSelection::DefaultFreeFly {
+            return Ok(());
+        }
+        let Some(pawn) = self.pawn else {
+            return Ok(());
+        };
+        if !local_translation.x.is_finite() || !local_translation.y.is_finite() || !local_translation.z.is_finite() || !yaw.is_finite() || !pitch.is_finite()
+        {
+            return Err("free-fly start is not finite".into());
+        }
+        let pitch = pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        let yaw_rotation = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), yaw).map_err(|error| error.to_string())?;
+        let pitch_rotation = Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), pitch).map_err(|error| error.to_string())?;
+        world.set_entity_local_translation(pawn, local_translation).map_err(|error| error.to_string())?;
+        world.set_entity_local_rotation(pawn, yaw_rotation.mul(pitch_rotation)).map_err(|error| error.to_string())?;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        Ok(())
     }
 
     pub fn pawn(&self) -> Option<EntityId> {
@@ -191,11 +221,46 @@ mod tests {
         assert_eq!(control.pawn_camera(), Some(pawn));
         let labels: Vec<_> = runtime.component_stack(pawn).unwrap().iter().map(|item| item.role.label()).collect();
         assert_eq!(labels, vec!["Transform", "Camera", "Pawn", "Free Fly"]);
-        control.device_mut().held.insert(PhysicalControl::KeyW);
         let start = runtime.authored_local_pose(pawn).unwrap().0;
+        assert!(start.x.abs() < 1.0e-9 && (start.y - 1.6).abs() < 1.0e-9 && (start.z - 8.0).abs() < 1.0e-9, "{start:?}");
+        control.device_mut().held.insert(PhysicalControl::KeyW);
         control.tick(&mut runtime, 0.1).unwrap();
         let moved = runtime.authored_local_pose(pawn).unwrap().0;
         assert!(moved.z < start.z - 0.4, "{moved:?}");
+        assert_eq!(authored.revision(), revision);
+        assert!(authored.entity_outline().iter().all(|row| row.name != "Player"));
+    }
+
+    #[test]
+    fn the_editor_can_place_the_free_fly_pawn_without_moving_an_unconfigured_world() {
+        let document = lighting_lab_level();
+        let mut idle = document.instantiate().unwrap();
+        let before = idle.entity_count();
+        let mut idle_control = PlayControl::attach(&mut idle, &GameSettings::inactive()).unwrap();
+        idle_control.place_free_fly_view(&mut idle, Vec3::new(1.0, 2.0, 3.0), 0.0, 0.0).unwrap();
+        assert!(idle_control.pawn().is_none());
+        assert_eq!(idle.entity_count(), before);
+
+        let authored = document.instantiate().unwrap();
+        let revision = authored.revision();
+        let mut runtime = document.instantiate().unwrap();
+        let mut settings = GameSettings::inactive();
+        settings.player_controller = true;
+        settings.pawn = PawnSelection::DefaultFreeFly;
+        settings.mapping_context = Some("JARVIG.Default".into());
+        settings.startup_camera = StartupCameraPolicy::Pawn;
+        let mut control = PlayControl::attach(&mut runtime, &settings).unwrap();
+        let pawn = control.pawn().unwrap();
+        let default_spawn = runtime.authored_local_pose(pawn).unwrap().0;
+        assert!((default_spawn.z - 8.0).abs() < 1.0e-9, "{default_spawn:?}");
+        control.place_free_fly_view(&mut runtime, Vec3::new(2.0, 3.0, 4.0), std::f64::consts::FRAC_PI_2, 0.0).unwrap();
+        let placed = runtime.authored_local_pose(pawn).unwrap().0;
+        assert!((placed.x - 2.0).abs() < 1.0e-9 && (placed.y - 3.0).abs() < 1.0e-9 && (placed.z - 4.0).abs() < 1.0e-9, "{placed:?}");
+        control.device_mut().held.insert(PhysicalControl::KeyW);
+        control.tick(&mut runtime, 0.1).unwrap();
+        let moved = runtime.authored_local_pose(pawn).unwrap().0;
+        assert!(moved.x < placed.x - 0.4, "{moved:?}");
+        assert!((moved.z - placed.z).abs() < 0.05, "{moved:?}");
         assert_eq!(authored.revision(), revision);
         assert!(authored.entity_outline().iter().all(|row| row.name != "Player"));
     }

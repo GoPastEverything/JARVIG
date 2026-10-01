@@ -264,6 +264,12 @@ impl MeshLibrary {
         }
     }
 
+    pub fn remove(&mut self, id: MeshId) -> bool {
+        let before = self.meshes.len();
+        self.meshes.retain(|(stored, _)| *stored != id);
+        self.meshes.len() != before
+    }
+
     pub fn get(&self, id: MeshId) -> Option<&Mesh> {
         self.meshes.iter().find(|(stored, _)| *stored == id).map(|(_, mesh)| mesh)
     }
@@ -682,6 +688,50 @@ pub fn cube_mesh(size_m: f32) -> Mesh {
         }],
     })
     .expect("cube")
+}
+
+/// Capsule along Y, centered on the origin. `cylinder_height_m` is the straight section.
+/// The hemispheres add `radius_m` at each end. JARVIG builds this. It is not an imported asset.
+pub fn capsule_mesh(radius_m: f32, cylinder_height_m: f32) -> Mesh {
+    let radius = if radius_m.is_finite() && radius_m > 1.0e-4 { radius_m } else { 0.05 };
+    let half = if cylinder_height_m.is_finite() && cylinder_height_m >= 0.0 { cylinder_height_m * 0.5 } else { 0.1 };
+    let segments = 8u32;
+    let cap_rings = 3u32;
+    let mut rings: Vec<Vec<[f32; 3]>> = Vec::new();
+    for ring in 0..=cap_rings {
+        let phi = ring as f32 / cap_rings as f32 * std::f32::consts::FRAC_PI_2;
+        rings.push(ring_points(segments, half + radius * phi.cos(), radius * phi.sin()));
+    }
+    for ring in 0..=cap_rings {
+        let phi = std::f32::consts::FRAC_PI_2 + ring as f32 / cap_rings as f32 * std::f32::consts::FRAC_PI_2;
+        rings.push(ring_points(segments, -half + radius * phi.cos(), radius * phi.sin()));
+    }
+    let mut triangles = Vec::new();
+    for (upper, lower) in rings.iter().zip(rings.iter().skip(1)) {
+        for segment in 0..segments as usize {
+            let next = (segment + 1) % segments as usize;
+            let a = upper[segment];
+            let b = upper[next];
+            let c = lower[segment];
+            let d = lower[next];
+            if a != b {
+                triangles.push([a, b, c]);
+            }
+            if c != d {
+                triangles.push([b, d, c]);
+            }
+        }
+    }
+    mesh_from_triangles(&triangles, face_normal)
+}
+
+fn ring_points(segments: u32, y: f32, radial: f32) -> Vec<[f32; 3]> {
+    (0..segments)
+        .map(|segment| {
+            let theta = segment as f32 / segments as f32 * std::f32::consts::TAU;
+            [radial * theta.cos(), y, radial * theta.sin()]
+        })
+        .collect()
 }
 
 fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

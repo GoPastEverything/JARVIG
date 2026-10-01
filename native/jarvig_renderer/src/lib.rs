@@ -12,13 +12,16 @@
 mod output;
 mod probe_capture;
 mod shadow_pass;
+mod detail_private;
 
 pub use shadow_pass::ShadowDiagnostics;
 
 pub use output::{exposure_multiplier, PresentationMode, EXPOSURE_EV_MAX, EXPOSURE_EV_MIN};
 
+use std::collections::HashSet;
+
 use jarvig_core::{
-    instance_gpu_transforms, reflection_probe_packet, render_light_record, select_reflection_probe, Camera, EnvironmentLight,
+    instance_gpu_transforms, reflection_probe_packet, render_light_record, select_reflection_probe, world_grid_phase, Camera, EntityId, EnvironmentLight,
     GpuEnvironmentPacket, GpuLightRecord, GpuReflectionProbePacket, GpuTransforms, Mat4, Mesh, MeshError, MeshId, MeshIndexFormat, MeshLibrary,
     MeshVertexFormat, ProbeId, RenderInstanceId, RenderLight, RenderSceneSnapshot, ResolvedPose, SpaceError, TextureLibrary, DEPTH_CLEAR,
     REFLECTION_PROBE_MIP_COUNT,
@@ -517,6 +520,14 @@ pub struct Renderer {
     shut_down: bool,
     overlay: Option<EditorOverlay>,
     overlay_gpu: Option<OverlayGpu>,
+    /// Editor surface grid. Not a scene object. `None` draws nothing.
+    terrain_grid: Option<TerrainGridDesc>,
+    terrain_grid_meshes: HashSet<MeshId>,
+    /// Authoring ids skipped while drawing, shadowing, and the contact prepass. Not saved visibility.
+    entity_hidden: HashSet<EntityId>,
+    /// Forces the view light mask off for this frame. Does not write the view's lighting debug.
+    land_unlit: bool,
+    terrain_grid_gpu: Option<TerrainGridGpu>,
     hdr: Option<HdrScene>,
     output: Option<OutputGpu>,
     output_views: Vec<OutputView>,
@@ -532,6 +543,38 @@ pub struct Renderer {
     contact_requested: bool,
     meshlet_gpu: Option<MeshletGpu>,
     parent_gpu: Option<ParentGpu>,
+    einstein_debug: bool,
+    einstein_seed: u64,
+    einstein_shader: Option<ShaderModuleId>,
+    einstein_layout: Option<BindGroupLayoutId>,
+    einstein_pipeline: Option<PipelineId>,
+    einstein_uniform: Option<BufferId>,
+    einstein_group: Option<BindGroupId>,
+    micro_enabled: bool,
+    micro_surface: bool,
+    micro_color: bool,
+    micro_seed: u64,
+    micro_live: Vec<MicroGpuChunk>,
+    micro_pending: Option<MicroPending>,
+    micro_request: Option<MicroBuildRequest>,
+    micro_next_epoch: u64,
+    micro_wanted_epoch: u64,
+    micro_published_epoch: u64,
+    micro_wanted_key: u64,
+    micro_inflight_epoch: u64,
+    micro_inflight_key: u64,
+    micro_stage: &'static str,
+    micro_queue_wait_us: u32,
+    micro_publish_us: u32,
+    micro_cancelled: u32,
+    micro_stale_discarded: u32,
+    micro_partial: u32,
+    micro_swapped: bool,
+    micro_index_count: u32,
+    micro_fingerprint: u64,
+    micro_input_key: u64,
+    micro_color_pipeline: Option<PipelineId>,
+    micro_color_shader: Option<ShaderModuleId>,
     gpu_scene: GpuSceneState,
 }
 
@@ -633,6 +676,58 @@ pub struct GpuSceneFrameStats {
     pub gpu_frame_measured: bool,
     pub hierarchy_root_triangles: u32,
     pub hierarchy_empty_parents: u32,
+    pub einstein_debug_draws: u32,
+    pub micro_patches: u32,
+    pub micro_samples: u32,
+    pub micro_vertices: u32,
+    pub micro_triangles: u32,
+    pub micro_generation_us: u32,
+    pub micro_upload_us: u32,
+    pub micro_fallbacks: u32,
+    pub micro_ordinary: u32,
+    pub micro_invalid: u32,
+    pub micro_reused: u32,
+    pub micro_fingerprint: u64,
+    /// Largest normal displacement, in micrometers, so the stat stays an integer.
+    pub micro_max_displacement_um: u32,
+    pub micro_queue_wait_us: u32,
+    pub micro_cancelled: u32,
+    pub micro_stale_discarded: u32,
+    pub micro_publish_us: u32,
+    /// Increments only if a draw would have shown an incomplete patch set. Stays 0 when publication is atomic.
+    pub micro_partial: u32,
+}
+
+const MICRO_CHUNK_VERTEX_BYTES: usize = 256 * 1024;
+
+struct MicroGpuChunk {
+    vertices: BufferId,
+    indices: BufferId,
+    index_count: u32,
+}
+
+struct MicroPending {
+    epoch: u64,
+    key: u64,
+    mesh: jarvig_core::MicroMesh,
+    groups: Vec<jarvig_core::MicroSpan>,
+    next: usize,
+    gpu: Vec<MicroGpuChunk>,
+    upload_us: u32,
+    started: std::time::Instant,
+}
+
+/// One CPU build the editor submits to the job queue. The renderer does not build it.
+pub struct MicroBuildRequest {
+    pub epoch: u64,
+    pub key: u64,
+    pub anchors: Vec<jarvig_core::SurfaceAnchor>,
+    pub seed: u64,
+    pub height: f32,
+    pub tan_half: f32,
+    pub budget: jarvig_core::MicroBudget,
+    pub provider: jarvig_core::DetailProvider,
+    pub skipped: u32,
 }
 
 struct MeshletGpu {
@@ -830,6 +925,244 @@ fn fs(input: OverlayOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Lines on the terrain triangles already drawn this pass. Non-line fragments are discarded.
+/// Minor lines thin until they are gone at about nine pixels apart. Major lines stay farther out.
+/// There is no blend: a faded line is a thinner line. The clip bias is toward the camera in reversed-Z.
+/// Depth write stays off. Derivatives stay outside the per-pixel returns.
+const TERRAIN_GRID_SHADER: &str = r#"
+struct RenderUniforms {
+    projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    model: mat4x4<f32>,
+}
+struct GridUniforms {
+    phase: vec4<f32>,
+    spacing: vec4<f32>,
+    flags: vec4<f32>,
+    metric: vec4<f32>,
+    brush: vec4<f32>,
+    color: vec4<f32>,
+}
+struct GridOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) local_xz: vec2<f32>,
+    @location(1) world_xz: vec2<f32>,
+    @location(2) world_pos: vec3<f32>,
+}
+@group(0) @binding(0) var<uniform> render: RenderUniforms;
+@group(1) @binding(0) var<uniform> grid: GridUniforms;
+@vertex
+fn vs(@location(0) position: vec3<f32>) -> GridOut {
+    var out: GridOut;
+    let world = render.model * vec4<f32>(position, 1.0);
+    out.clip = render.projection * render.view * world;
+    out.clip.z = out.clip.z + out.clip.w * 0.00008;
+    out.local_xz = position.xz;
+    out.world_xz = world.xz;
+    out.world_pos = world.xyz;
+    return out;
+}
+fn dist_to_int(value: f32) -> f32 {
+    let wrapped = fract(value);
+    return min(wrapped, 1.0 - wrapped);
+}
+// Pixel half-width of one axis, or 0 once the line would fill the view.
+fn axis_px(dist: f32, fw: f32, full_px: f32, fade_end: f32) -> f32 {
+    let safe = max(fw, 1e-6);
+    let keep = clamp((fade_end - safe) / fade_end, 0.0, 1.0);
+    let px = full_px * keep;
+    var kept = px;
+    if (safe >= fade_end || px < 0.12 || dist / safe > px) {
+        kept = 0.0;
+    }
+    return kept;
+}
+// 1 near the camera, 0 once the line should be gone. Grazing pulls that distance in.
+fn span_keep(dist: f32, graze: f32, near_m: f32, far_m: f32, pull: f32) -> f32 {
+    let amount = clamp(graze, 0.0, 1.0) * pull;
+    let far = max(far_m * (1.0 - amount), near_m + 1.0);
+    let near = min(near_m * (1.0 - amount * 0.35), far - 1.0);
+    return clamp((far - dist) / (far - near), 0.0, 1.0);
+}
+fn grid_line(coord: vec2<f32>, fw: vec2<f32>, full_px: f32, fade_end: f32, keep: f32) -> bool {
+    if (keep <= 0.02) {
+        return false;
+    }
+    let width = full_px * keep;
+    let px_x = axis_px(dist_to_int(coord.x), fw.x, width, fade_end);
+    let px_z = axis_px(dist_to_int(coord.y), fw.y, width, fade_end);
+    return px_x > 0.0 || px_z > 0.0;
+}
+fn on_dot(coord: vec2<f32>, fw: vec2<f32>) -> bool {
+    let density = max(max(fw.x, fw.y), 1e-6);
+    let keep = clamp((0.18 - density) / 0.18, 0.0, 1.0);
+    let rad = 1.7 * keep;
+    var hit = false;
+    if (rad >= 0.30) {
+        let dx = dist_to_int(coord.x) / max(fw.x, 1e-6);
+        let dz = dist_to_int(coord.y) / max(fw.y, 1e-6);
+        hit = dx * dx + dz * dz <= rad * rad;
+    }
+    return hit;
+}
+fn on_cross(coord: vec2<f32>, fw: vec2<f32>) -> bool {
+    let density = max(max(fw.x, fw.y), 1e-6);
+    let keep = clamp((0.30 - density) / 0.30, 0.0, 1.0);
+    let px = 1.25 * keep;
+    var hit = false;
+    if (px >= 0.20) {
+        let dx = abs(fract(coord.x) - 0.5);
+        let dz = abs(fract(coord.y) - 0.5);
+        let thin_x = dx / max(fw.x, 1e-6) <= px;
+        let thin_z = dz / max(fw.y, 1e-6) <= px;
+        let arm = 0.10 * max(keep, 0.40);
+        hit = (thin_z && dx < arm) || (thin_x && dz < arm);
+    }
+    return hit;
+}
+@fragment
+fn fs(in: GridOut) -> @location(0) vec4<f32> {
+    // Derivatives stay outside the per-pixel returns. Distance and grazing only scale width.
+    let dist = length(in.world_pos);
+    let axis_x = dpdx(in.world_pos);
+    let axis_y = dpdy(in.world_pos);
+    let n = cross(axis_x, axis_y);
+    let nlen = length(n);
+    let facing = select(1.0, abs(dot(n / max(nlen, 1e-6), in.world_pos / max(dist, 1e-4))), nlen > 1e-5 && dist > 0.05);
+    let graze = clamp(1.0 - facing * 1.35, 0.0, 1.0);
+    // Near: minor and major. Middle distance: major. The horizon drops both.
+    let minor_keep = span_keep(dist, graze, 12.0, 40.0, 0.55);
+    let major_keep = span_keep(dist, graze, 28.0, 120.0, 0.40);
+    // Brush, then major, minor, chunk, vertex dots, LOD. Flags are uniform, so each
+    // derivative below runs for every fragment or for none.
+    var brush_hit = false;
+    var brush_rgb = vec3<f32>(0.0);
+    if (grid.brush.w > 0.5 && grid.brush.z > 0.0) {
+        let dist = length(in.local_xz - grid.brush.xy);
+        let fw = max(fwidth(dist), 1e-5);
+        let radius = grid.brush.z;
+        let strength = max(grid.spacing.w, 0.0);
+        var t75 = 0.25;
+        var t25 = 0.75;
+        if (grid.brush.w > 1.5) {
+            t75 = 0.33333334;
+            t25 = 0.6666667;
+        }
+        let contour = clamp(0.45 + strength * 1.8, 0.45, 2.6) * fw;
+        let dot_r = (2.4 + clamp(strength, 0.0, 4.0) * 0.9) * fw;
+        let outer = abs(dist - radius) <= 1.5 * fw;
+        let falloff = strength > 0.02 && (abs(dist - radius * t75) <= contour || abs(dist - radius * 0.5) <= contour || abs(dist - radius * t25) <= contour);
+        let center = dist <= dot_r;
+        if (outer) {
+            brush_hit = true;
+            brush_rgb = grid.color.rgb;
+        } else if (falloff) {
+            brush_hit = true;
+            brush_rgb = grid.color.rgb * 0.78;
+        } else if (center) {
+            brush_hit = true;
+            brush_rgb = grid.color.rgb;
+        }
+    }
+
+    var major_hit = false;
+    var minor_hit = false;
+    if (grid.flags.x > 0.5 && grid.spacing.x > 0.0 && grid.spacing.y > 0.0) {
+        let major = in.world_xz / grid.spacing.y + grid.phase.zw;
+        let minor = in.world_xz / grid.spacing.x + grid.phase.xy;
+        let major_fw = fwidth(major);
+        let minor_fw = fwidth(minor);
+        // Screen spacing still drops a line that would fill the view. Distance does the rest.
+        major_hit = grid_line(major, major_fw, 1.55, 0.34, major_keep);
+        minor_hit = grid_line(minor, minor_fw, 0.85, 0.11, minor_keep);
+    }
+
+    var chunk_hit = false;
+    if (grid.flags.z > 0.5 && grid.metric.w > 0.0) {
+        let coord = (in.local_xz + grid.metric.xy) / grid.metric.w;
+        chunk_hit = grid_line(coord, fwidth(coord), 1.25, 0.25, major_keep);
+    }
+
+    var vertex_hit = false;
+    if (grid.flags.y > 0.5 && grid.metric.z > 0.0) {
+        let coord = (in.local_xz + grid.metric.xy) / grid.metric.z;
+        vertex_hit = on_dot(coord, fwidth(coord)) && minor_keep > 0.35;
+    }
+
+    var lod_hit = false;
+    if (grid.flags.w > 0.5 && grid.metric.w > 0.0) {
+        let coord = (in.local_xz + grid.metric.xy) / grid.metric.w;
+        lod_hit = on_cross(coord, fwidth(coord));
+    }
+
+    if (brush_hit) {
+        return vec4<f32>(brush_rgb, 1.0);
+    }
+    if (major_hit) {
+        return vec4<f32>(0.94, 0.96, 0.90, 1.0);
+    }
+    if (minor_hit) {
+        return vec4<f32>(0.55, 0.62, 0.50, 1.0);
+    }
+    if (chunk_hit) {
+        return vec4<f32>(0.95, 0.62, 0.22, 1.0);
+    }
+    if (vertex_hit) {
+        return vec4<f32>(0.45, 0.78, 0.95, 1.0);
+    }
+    if (lod_hit) {
+        return vec4<f32>(0.62, 0.48, 0.95, 1.0) * grid.spacing.z;
+    }
+    // Discard sits in its own block. FXC still requires a return on that path,
+    // and a return in the same block as discard is rejected by the shader front end.
+    if (grid.phase.x == grid.phase.x) {
+        discard;
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
+"#;
+
+fn terrain_grid_bytes(pose: &ResolvedPose, desc: &TerrainGridDesc) -> [u8; 96] {
+    let mut words = [0f32; 24];
+    words[0] = world_grid_phase(pose.translation.x, desc.minor_m);
+    words[1] = world_grid_phase(pose.translation.z, desc.minor_m);
+    words[2] = world_grid_phase(pose.translation.x, desc.major_m);
+    words[3] = world_grid_phase(pose.translation.z, desc.major_m);
+    words[4] = desc.minor_m;
+    words[5] = desc.major_m;
+    words[6] = if desc.lod_enabled { 1.0 } else { 0.45 };
+    // spacing.w is brush strength in meters. color.a stays 1. The uniform stays 96 bytes.
+    words[7] = desc.brush_strength;
+    words[8] = if desc.world { 1.0 } else { 0.0 };
+    words[9] = if desc.vertices { 1.0 } else { 0.0 };
+    words[10] = if desc.chunks { 1.0 } else { 0.0 };
+    words[11] = if desc.lod { 1.0 } else { 0.0 };
+    words[12] = desc.half_x;
+    words[13] = desc.half_z;
+    words[14] = desc.vertex_spacing;
+    words[15] = desc.chunk_m;
+    words[16] = desc.brush_x;
+    words[17] = desc.brush_z;
+    words[18] = desc.brush_radius;
+    // brush.w: 0 off, 1 linear falloff, 2 smooth falloff.
+    words[19] = if !desc.brush_enabled {
+        0.0
+    } else if desc.brush_smooth {
+        2.0
+    } else {
+        1.0
+    };
+    words[20] = desc.brush_color[0];
+    words[21] = desc.brush_color[1];
+    words[22] = desc.brush_color[2];
+    words[23] = desc.brush_color[3];
+    let mut bytes = [0u8; 96];
+    for (index, word) in words.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
 const MESHLET_SHADER: &str = r#"
 struct RenderUniforms {
     projection: mat4x4<f32>,
@@ -941,6 +1274,51 @@ struct Prepared {
     rect: PixelRect,
     depth: TextureViewId,
     draws: Vec<PreparedDraw>,
+    terrain_grid: Vec<TerrainGridDraw>,
+}
+
+struct TerrainGridDraw {
+    mesh: MeshId,
+    transform: BindGroupId,
+}
+
+/// One editing grid painted on existing terrain meshes. Not a level object and not a second mesh.
+#[derive(Clone, Debug)]
+pub struct TerrainGridDesc {
+    pub meshes: Vec<MeshId>,
+    pub minor_m: f32,
+    pub major_m: f32,
+    pub world: bool,
+    pub vertices: bool,
+    pub chunks: bool,
+    pub lod: bool,
+    pub lod_enabled: bool,
+    pub half_x: f32,
+    pub half_z: f32,
+    pub vertex_spacing: f32,
+    pub chunk_m: f32,
+    pub brush_x: f32,
+    pub brush_z: f32,
+    pub brush_radius: f32,
+    pub brush_enabled: bool,
+    /// Meters at the brush center. Thickens the falloff rings. Does not move a vertex.
+    pub brush_strength: f32,
+    /// Smooth cosine falloff when true. Linear when false. Ignored while the brush is off.
+    pub brush_smooth: bool,
+    pub brush_color: [f32; 4],
+}
+
+struct TerrainGridGpu {
+    shader: ShaderModuleId,
+    layout: BindGroupLayoutId,
+    pipelines: Vec<(u64, PipelineId)>,
+    views: Vec<TerrainGridView>,
+}
+
+struct TerrainGridView {
+    view: RenderViewId,
+    buffer: BufferId,
+    group: BindGroupId,
 }
 
 /// One editor overlay for one view. Not a scene object and not an entity.
@@ -1032,6 +1410,11 @@ impl Renderer {
             shut_down: false,
             overlay: None,
             overlay_gpu: None,
+            terrain_grid: None,
+            terrain_grid_meshes: HashSet::new(),
+            entity_hidden: HashSet::new(),
+            land_unlit: false,
+            terrain_grid_gpu: None,
             hdr: None,
             output: None,
             output_views: Vec::new(),
@@ -1047,6 +1430,38 @@ impl Renderer {
             contact_requested: true,
             meshlet_gpu: None,
             parent_gpu: None,
+            einstein_debug: false,
+            einstein_seed: 1,
+            einstein_shader: None,
+            einstein_layout: None,
+            einstein_pipeline: None,
+            einstein_uniform: None,
+            einstein_group: None,
+            micro_enabled: false,
+            micro_surface: true,
+            micro_color: false,
+            micro_seed: 1,
+            micro_live: Vec::new(),
+            micro_pending: None,
+            micro_request: None,
+            micro_next_epoch: 0,
+            micro_wanted_epoch: 0,
+            micro_published_epoch: 0,
+            micro_wanted_key: 0,
+            micro_inflight_epoch: 0,
+            micro_inflight_key: 0,
+            micro_stage: "Ready",
+            micro_queue_wait_us: 0,
+            micro_publish_us: 0,
+            micro_cancelled: 0,
+            micro_stale_discarded: 0,
+            micro_partial: 0,
+            micro_swapped: false,
+            micro_index_count: 0,
+            micro_fingerprint: 0,
+            micro_input_key: 0,
+            micro_color_pipeline: None,
+            micro_color_shader: None,
             gpu_scene: GpuSceneState {
                 remembered: Vec::new(),
                 instances: None,
@@ -1110,6 +1525,58 @@ impl Renderer {
 
     pub fn set_meshlet_highlight(&mut self, cluster: Option<u32>) {
         self.gpu_scene.highlight = cluster;
+    }
+
+    pub fn set_micro_surface(&mut self, surface: bool) {
+        self.micro_surface = surface;
+    }
+
+    pub fn set_microgeometry(&mut self, enabled: bool, seed: u64, color: bool) {
+        if self.micro_enabled && !enabled {
+            self.publish_micro_absence();
+            self.clear_drawn_micro_stats();
+        }
+        self.micro_enabled = enabled;
+        self.micro_seed = seed;
+        self.micro_color = color;
+    }
+
+    pub fn take_micro_request(&mut self) -> Option<MicroBuildRequest> {
+        self.micro_request.take()
+    }
+
+    pub fn micro_wanted_epoch(&self) -> u64 {
+        self.micro_wanted_epoch
+    }
+
+    pub fn micro_stage(&self) -> &'static str {
+        self.micro_stage
+    }
+
+    pub fn micro_publish_settled(&self) -> bool {
+        !self.micro_enabled
+            || (self.micro_request.is_none()
+                && self.micro_pending.is_none()
+                && self.micro_wanted_epoch == self.micro_published_epoch
+                && self.micro_wanted_key == self.micro_input_key)
+    }
+
+    pub fn note_micro_cancelled(&mut self) {
+        self.micro_cancelled = self.micro_cancelled.saturating_add(1);
+        self.gpu_scene.stats.micro_cancelled = self.micro_cancelled;
+    }
+
+    /// The worker finished without a mesh the renderer kept. The next frame may request that key again.
+    pub fn abandon_micro_build(&mut self, epoch: u64) {
+        if self.micro_inflight_epoch == epoch && self.micro_pending.as_ref().is_none_or(|pending| pending.epoch != epoch) {
+            self.micro_inflight_epoch = 0;
+            self.micro_inflight_key = 0;
+        }
+    }
+
+    pub fn set_einstein_debug(&mut self, enabled: bool, seed: u64) {
+        self.einstein_debug = enabled;
+        self.einstein_seed = seed;
     }
 
     pub fn set_cluster_hierarchy(&mut self, enabled: bool) {
@@ -1907,6 +2374,14 @@ impl Renderer {
             }
             self.device.destroy(ResourceKind::ShaderModule, contact.shader.raw()).map_err(RenderError::Rhi)?;
         }
+        let _ = self.discard_pending(false);
+        self.destroy_live()?;
+        if let Some(pipeline) = self.micro_color_pipeline.take() {
+            self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(shader) = self.micro_color_shader.take() {
+            self.device.destroy(ResourceKind::ShaderModule, shader.raw()).map_err(RenderError::Rhi)?;
+        }
         self.clear_meshlet_debug()?;
         self.clear_parent_geometry()?;
         self.drop_gpu_scene()?;
@@ -2171,6 +2646,28 @@ impl Renderer {
     /// The packet is not a scene object. Positions are camera-relative.
     pub fn set_editor_overlay(&mut self, overlay: Option<EditorOverlay>) {
         self.overlay = overlay.filter(|overlay| !overlay.vertices.is_empty());
+    }
+
+    /// Paint the editing grid on these terrain meshes. `None` draws no grid. Spacing is a uniform, not a mesh rebuild.
+    pub fn set_terrain_grid(&mut self, grid: Option<TerrainGridDesc>) {
+        self.terrain_grid_meshes.clear();
+        if let Some(grid) = grid {
+            self.terrain_grid_meshes.extend(grid.meshes.iter().copied());
+            self.terrain_grid = Some(grid);
+        } else {
+            self.terrain_grid = None;
+        }
+    }
+
+    /// Skip these authoring ids in the color pass, the shadow caster list, and the contact prepass.
+    pub fn set_hidden_entities(&mut self, entities: &[EntityId]) {
+        self.entity_hidden.clear();
+        self.entity_hidden.extend(entities.iter().copied());
+    }
+
+    /// Turn direct light and the lighting terms off for the next frames. The stored view debug is left alone.
+    pub fn set_land_unlit(&mut self, unlit: bool) {
+        self.land_unlit = unlit;
     }
 
     /// Upload cluster indices for one mesh. `None` drops them. The ordinary mesh buffers stay.
@@ -2507,12 +3004,16 @@ impl Renderer {
         }
         let contact_on = prepared.iter().any(|pass| self.slot(pass.id).map(|view| view.settings.contact_shadows).unwrap_or(false));
         if contact_on {
-            for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+            let hidden = self.entity_hidden.clone();
+            for instance in snapshot.instances().iter().filter(|instance| instance.visible && !hidden.contains(&instance.entity)) {
                 let mesh = meshes.get(instance.mesh).ok_or(RenderError::Mesh(MeshError::Empty))?;
                 if let Some(stream) = mesh.streams().first() {
                     self.ensure_contact_pipeline(u64::from(stream.stride))?;
                 }
             }
+        }
+        if let Some(pass) = prepared.last() {
+            self.sync_microtriangles(pass, snapshot, meshes)?;
         }
         let mut encoder = self
             .device
@@ -2563,10 +3064,14 @@ impl Renderer {
                     height: pass.rect.height,
                 })
                 .map_err(RenderError::Rhi)?;
+            self.gpu_scene.stats.einstein_debug_draws = 0;
             for draw in &pass.draws {
                 self.draw_prepared(&mut *encoder, draw)?;
             }
+            self.draw_microtriangles(&mut *encoder, pass)?;
+            self.draw_einstein_debug(&mut *encoder, pass)?;
             self.draw_meshlet_ids(&mut *encoder, pass, meshes)?;
+            self.draw_terrain_grid(&mut *encoder, pass, meshes, snapshot)?;
             encoder.end_render_pass().map_err(RenderError::Rhi)?;
         }
         encoder
@@ -2591,6 +3096,146 @@ impl Renderer {
         self.device
             .submit(self.device.graphics_queue(), &[buffer], None)
             .map_err(RenderError::Rhi)
+    }
+
+    fn draw_terrain_grid(
+        &mut self,
+        encoder: &mut dyn jarvig_rhi::CommandEncoder,
+        pass: &Prepared,
+        meshes: &MeshLibrary,
+        snapshot: &RenderSceneSnapshot,
+    ) -> Result<(), RenderError> {
+        if pass.terrain_grid.is_empty() {
+            return Ok(());
+        }
+        let Some(desc) = self.terrain_grid.clone() else { return Ok(()) };
+        let pose = {
+            let frame = self.slot(pass.id)?.camera.frame;
+            if let Some(pose) = self.slot(pass.id)?.pose_override {
+                pose
+            } else {
+                snapshot.camera(frame).ok_or(RenderError::Space(SpaceError::MissingFrame))?.pose
+            }
+        };
+        let bytes = terrain_grid_bytes(&pose, &desc);
+        let group = self.terrain_grid_group(pass.id)?;
+        let buffer = self
+            .terrain_grid_gpu
+            .as_ref()
+            .and_then(|gpu| gpu.views.iter().find(|slot| slot.view == pass.id))
+            .map(|slot| slot.buffer)
+            .ok_or(RenderError::Rhi(RhiError::InvalidResource("terrain grid")))?;
+        self.device.write_buffer(buffer, 0, &bytes).map_err(RenderError::Rhi)?;
+        for draw in &pass.terrain_grid {
+            let Some(mesh) = meshes.get(draw.mesh) else { continue };
+            let Some(stream) = mesh.streams().first() else { continue };
+            let pipeline = self.terrain_grid_pipeline(u64::from(stream.stride))?;
+            let Some((vertices, indices, index_format, ranges)) = self.gpu_meshes.iter().find(|(id, _)| *id == draw.mesh).and_then(|(_, slot)| match slot {
+                GpuResidency::Resident(gpu) => Some((
+                    gpu.vertices,
+                    gpu.indices,
+                    gpu.index_format,
+                    gpu.submeshes.iter().map(|range| (range.index_count, range.first_index, range.base_vertex)).collect::<Vec<_>>(),
+                )),
+                GpuResidency::Evicted => None,
+            }) else {
+                continue;
+            };
+            encoder.set_pipeline(pipeline).map_err(RenderError::Rhi)?;
+            encoder.set_bind_group(0, draw.transform).map_err(RenderError::Rhi)?;
+            encoder.set_bind_group(1, group).map_err(RenderError::Rhi)?;
+            encoder.set_vertex_buffer(0, vertices, 0).map_err(RenderError::Rhi)?;
+            encoder.set_index_buffer(indices, index_format, 0).map_err(RenderError::Rhi)?;
+            for (index_count, first_index, base_vertex) in ranges {
+                if index_count > 0 {
+                    encoder.draw_indexed(index_count, 1, first_index, base_vertex, 0).map_err(RenderError::Rhi)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn terrain_grid_group(&mut self, view: RenderViewId) -> Result<BindGroupId, RenderError> {
+        self.ensure_terrain_grid_gpu()?;
+        if let Some(found) = self.terrain_grid_gpu.as_ref().and_then(|gpu| gpu.views.iter().find(|slot| slot.view == view)) {
+            return Ok(found.group);
+        }
+        let layout = self.terrain_grid_gpu.as_ref().expect("terrain grid").layout;
+        let buffer = self
+            .device
+            .create_buffer(&BufferDesc {
+                size: 96,
+                usage: BufferUsage::Uniform,
+                label: Some("JARVIG.TerrainGrid".into()),
+                contents: None,
+            })
+            .map_err(RenderError::Rhi)?;
+        let group = self
+            .device
+            .create_bind_group(&BindGroupDesc {
+                layout,
+                entries: vec![BindGroupEntry { binding: 0, resource: jarvig_rhi::BindResource::Buffer(buffer) }],
+                label: Some("JARVIG.TerrainGrid".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.terrain_grid_gpu.as_mut().expect("terrain grid").views.push(TerrainGridView { view, buffer, group });
+        Ok(group)
+    }
+
+    fn terrain_grid_pipeline(&mut self, stride: u64) -> Result<PipelineId, RenderError> {
+        self.ensure_terrain_grid_gpu()?;
+        if let Some(found) = self.terrain_grid_gpu.as_ref().and_then(|gpu| gpu.pipelines.iter().find(|(stored, _)| *stored == stride).map(|(_, pipeline)| *pipeline)) {
+            return Ok(found);
+        }
+        let (shader, layout) = {
+            let gpu = self.terrain_grid_gpu.as_ref().expect("terrain grid");
+            (gpu.shader, gpu.layout)
+        };
+        let camera = self.camera_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("terrain grid camera")))?;
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDesc {
+                shader,
+                vertex_entry: "vs".into(),
+                fragment_entry: "fs".into(),
+                topology: PrimitiveTopology::TriangleList,
+                color_format: HDR_SCENE_FORMAT,
+                layouts: vec![camera, layout],
+                vertex_buffers: vec![VertexBufferLayout {
+                    stride,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: vec![VertexAttribute { shader_location: 0, offset: 0, format: VertexFormat::Float32x3 }],
+                }],
+                depth: Some(DepthState { format: TextureFormat::Depth32Float, write_enabled: false, compare: CompareFunction::GreaterEqual }),
+                cull: CullMode::Back,
+                label: Some(format!("JARVIG.TerrainGrid.Stride{stride}")),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.terrain_grid_gpu.as_mut().expect("terrain grid").pipelines.push((stride, pipeline));
+        Ok(pipeline)
+    }
+
+    fn ensure_terrain_grid_gpu(&mut self) -> Result<(), RenderError> {
+        if self.terrain_grid_gpu.is_some() {
+            return Ok(());
+        }
+        self.ensure_camera_layout()?;
+        let shader = self
+            .device
+            .create_shader_module(&ShaderModuleDesc {
+                source: ShaderSource::Wgsl(TERRAIN_GRID_SHADER.into()),
+                label: Some("JARVIG.TerrainGrid".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        let layout = self
+            .device
+            .create_bind_group_layout(&BindGroupLayoutDesc {
+                entries: vec![BindGroupLayoutEntry { binding: 0, kind: BindingType::UniformBuffer, stage: ShaderStage::VertexFragment }],
+                label: Some("JARVIG.TerrainGrid".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.terrain_grid_gpu = Some(TerrainGridGpu { shader, layout, pipelines: Vec::new(), views: Vec::new() });
+        Ok(())
     }
 
     fn draw_editor_overlay(
@@ -2764,8 +3409,11 @@ impl Renderer {
             snapshot.camera(frame).ok_or(RenderError::Space(SpaceError::MissingFrame))?.pose
         };
         let mut draws = Vec::new();
+        let mut terrain_grid = Vec::new();
         let mut light_group = None;
-        for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+        let hidden = self.entity_hidden.clone();
+        let grid_meshes = self.terrain_grid_meshes.clone();
+        for instance in snapshot.instances().iter().filter(|instance| instance.visible && !hidden.contains(&instance.entity)) {
             let packet = instance_gpu_transforms(instance, &pose, fov, near, aspect).map_err(RenderError::Space)?;
             self.write_binding(id, instance.id, &packet.to_bytes())?;
             let transform = self
@@ -2774,6 +3422,9 @@ impl Renderer {
                 .find(|binding| binding.view == id && binding.instance == instance.id)
                 .expect("binding")
                 .group;
+            if grid_meshes.contains(&instance.mesh) {
+                terrain_grid.push(TerrainGridDraw { mesh: instance.mesh, transform });
+            }
             let mesh = meshes.get(instance.mesh).ok_or(RenderError::Mesh(MeshError::Empty))?;
             for (submesh_index, submesh) in mesh.submeshes().iter().enumerate() {
                 let Some(material_id) = instance.material_for_slot(submesh.material_slot) else {
@@ -2816,11 +3467,13 @@ impl Renderer {
             rect,
             depth: view.depth_view.ok_or(RenderError::Rhi(RhiError::InvalidResource("depth view")))?,
             draws,
+            terrain_grid,
         })
     }
 
     fn ensure_draw_resources(&mut self, snapshot: &RenderSceneSnapshot, meshes: &MeshLibrary) -> Result<(), RenderError> {
-        for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+        let hidden = self.entity_hidden.clone();
+        for instance in snapshot.instances().iter().filter(|instance| instance.visible && !hidden.contains(&instance.entity)) {
             self.ensure_gpu_mesh(instance.mesh, meshes)?;
         }
         Ok(())
@@ -3234,7 +3887,8 @@ impl Renderer {
             return Ok(());
         };
         let mut prepared = Vec::new();
-        for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+        let hidden = self.entity_hidden.clone();
+        for instance in snapshot.instances().iter().filter(|instance| instance.visible && !hidden.contains(&instance.entity)) {
             let Some(group) = self.bindings.iter().find(|binding| binding.view == pass.id && binding.instance == instance.id).map(|binding| binding.group) else {
                 continue;
             };
@@ -3683,7 +4337,10 @@ impl Renderer {
         if channel != 0 {
             mask |= channel << 20;
         }
-        let include_direct = mask == 0 || mask & LIGHTING_DEBUG_DIRECT != 0;
+        if self.land_unlit {
+            mask = LIGHTING_DEBUG_ACTIVE;
+        }
+        let include_direct = !self.land_unlit && (mask == 0 || mask & LIGHTING_DEBUG_DIRECT != 0);
         let layout = self.ensure_light_layout()?;
         let mut storage = Vec::with_capacity(lights.len() * GpuLightRecord::BYTES);
         let mut included = Vec::new();
@@ -4547,8 +5204,66 @@ mod tests {
     use super::*;
     use jarvig_core::{
         bootstrap_pbr_textures, create_mesh, MeshDesc, MeshIndexFormat, MeshTopology, MeshVertexAttribute, MeshVertexFormat,
-        RenderFrameId, SceneWorld, SubmeshDesc, TextureLibrary, VertexStreamDesc,
+        Quat, RenderFrameId, ResolvedPose, SceneWorld, SubmeshDesc, TextureLibrary, Vec3, VertexStreamDesc, world_grid_phase,
     };
+
+    fn grid_words(bytes: &[u8; 96]) -> [f32; 24] {
+        let mut words = [0.0; 24];
+        for (index, word) in words.iter_mut().enumerate() {
+            let start = index * 4;
+            *word = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+        }
+        words
+    }
+
+    #[test]
+    fn terrain_grid_uniform_packs_strength_and_falloff() {
+        let pose = ResolvedPose { translation: Vec3::new(1_000_000_000.25, 2.0, -4.5), rotation: Quat::IDENTITY };
+        let desc = TerrainGridDesc {
+            meshes: Vec::new(),
+            minor_m: 1.0,
+            major_m: 10.0,
+            world: true,
+            vertices: false,
+            chunks: true,
+            lod: false,
+            lod_enabled: true,
+            half_x: 256.0,
+            half_z: 256.0,
+            vertex_spacing: 1.0,
+            chunk_m: 64.0,
+            brush_x: 3.5,
+            brush_z: -2.0,
+            brush_radius: 4.0,
+            brush_enabled: true,
+            brush_strength: 0.35,
+            brush_smooth: true,
+            brush_color: [0.96, 0.86, 0.34, 1.0],
+        };
+        let words = grid_words(&super::terrain_grid_bytes(&pose, &desc));
+        assert_eq!(words.len(), 24);
+        assert!((words[0] - 0.25).abs() < 1.0e-4, "minor phase {}", words[0]);
+        assert_eq!(words[0], world_grid_phase(pose.translation.x, 1.0));
+        assert_eq!(words[4], 1.0);
+        assert_eq!(words[5], 10.0);
+        assert_eq!(words[6], 1.0);
+        assert_eq!(words[7], 0.35);
+        assert_eq!(words[16], 3.5);
+        assert_eq!(words[17], -2.0);
+        assert_eq!(words[18], 4.0);
+        assert_eq!(words[19], 2.0);
+        assert_eq!(words[23], 1.0);
+
+        let mut linear = desc.clone();
+        linear.brush_smooth = false;
+        assert_eq!(grid_words(&super::terrain_grid_bytes(&pose, &linear))[19], 1.0);
+
+        let mut off = desc.clone();
+        off.brush_enabled = false;
+        let hidden = grid_words(&super::terrain_grid_bytes(&pose, &off));
+        assert_eq!(hidden[19], 0.0);
+        assert_eq!(hidden[7], 0.35);
+    }
     use jarvig_material::{ColorSpace, MaterialLibrary, ParameterValue, SamplerState};
     use jarvig_rhi::{create_null_instance, DeviceDesc, SurfaceDesc, SwapchainDesc, TextureFormat};
 

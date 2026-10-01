@@ -63,18 +63,19 @@ The stack lists only what the entity owns, in this order:
 
 1. Transform
 2. Mesh Renderer
-3. Directional Light
-4. Point Light
-5. Spot Light
-6. Reflection Probe
-7. Camera
-8. World Settings
+3. Joint
+4. Directional Light
+5. Point Light
+6. Spot Light
+7. Reflection Probe
+8. Camera
+9. World Settings
 
 Camera is a real component. It is multiplicity One, requires Transform, and stores no second pose. The inspector prints the owned names in stack order. A level names its runtime camera with `world_settings.startup_camera` or it has none. The key is omitted when absent. Nothing selects the first Camera found.
 
 ## Boundaries that stay closed
 
-- Do not put `EntityHandle`, `LightId`, `ProbeId`, `MeshId`, `ObjectId`, or a GPU handle in `.jarviglevel`.
+- Do not put `EntityHandle`, `LightId`, `ProbeId`, `MeshId`, `ObjectId`, `JointId`, `FrameId`, or a GPU handle in `.jarviglevel`.
 - Do not let the renderer iterate actors.
 - Do not save the game into the level, or the level into a save game.
 - Do not treat `Saved/` as content, or a future `Intermediate/` as content.

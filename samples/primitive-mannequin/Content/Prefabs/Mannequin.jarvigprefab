@@ -1,0 +1,2055 @@
+{
+  "schema": "jarvig.prefab",
+  "format_version": 1,
+  "prefab_uuid": "11111111-1111-4111-8111-111111111100",
+  "name": "Primitive Mannequin",
+  "entities": [
+    {
+      "uuid": "11111111-1111-4111-8111-111111111100",
+      "name": "Pelvis",
+      "parent_uuid": null,
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.95,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            0.26,
+            0.14,
+            0.16
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 1
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            0,
+            0.95,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111101",
+      "name": "Spine",
+      "parent_uuid": "11111111-1111-4111-8111-111111111100",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.12,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.07,
+            "height_m": 0.16
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            0,
+            0.12,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 0.20943951023931956,
+          "twist_min_rad": -0.13962634015954636,
+          "twist_max_rad": 0.13962634015954636,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111102",
+      "name": "Chest",
+      "parent_uuid": "11111111-1111-4111-8111-111111111101",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.22,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            0.32,
+            0.2,
+            0.16
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 1
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            0,
+            0.22,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 0.3141592653589793,
+          "twist_min_rad": -0.20943951023931956,
+          "twist_max_rad": 0.20943951023931956,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111103",
+      "name": "Neck",
+      "parent_uuid": "11111111-1111-4111-8111-111111111102",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.18,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.045,
+            "height_m": 0.06
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            0,
+            0.18,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 0.6108652381980153,
+          "twist_min_rad": -0.4363323129985824,
+          "twist_max_rad": 0.4363323129985824,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111104",
+      "name": "Head",
+      "parent_uuid": "11111111-1111-4111-8111-111111111103",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            0.12,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.11,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            0,
+            0.12,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111105",
+      "name": "Shoulder.L",
+      "parent_uuid": "11111111-1111-4111-8111-111111111102",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.16,
+            0.1,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.055,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            0.16,
+            0.1,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 1.3962634015954636,
+          "twist_min_rad": -1.2217304763960306,
+          "twist_max_rad": 1.2217304763960306,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111106",
+      "name": "UpperArm.L",
+      "parent_uuid": "11111111-1111-4111-8111-111111111105",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.12,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.045,
+            "height_m": 0.18
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            0.12,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111107",
+      "name": "Forearm.L",
+      "parent_uuid": "11111111-1111-4111-8111-111111111106",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.24,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.04,
+            "height_m": 0.18
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Hinge",
+          "rest_translation": [
+            0.24,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            0,
+            1
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": 0,
+          "hinge_max_rad": 2.443460952792061,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111108",
+      "name": "Hand.L",
+      "parent_uuid": "11111111-1111-4111-8111-111111111107",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.22,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.04,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Universal",
+          "rest_translation": [
+            0.22,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            0,
+            1
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -0.6108652381980153,
+          "primary_max_rad": 0.6108652381980153,
+          "secondary_min_rad": -0.4363323129985824,
+          "secondary_max_rad": 0.4363323129985824,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111109",
+      "name": "Shoulder.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111102",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -0.16,
+            0.1,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.055,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            -0.16,
+            0.1,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            -1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 1.3962634015954636,
+          "twist_min_rad": -1.2217304763960306,
+          "twist_max_rad": 1.2217304763960306,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110a",
+      "name": "UpperArm.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111109",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -0.12,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.045,
+            "height_m": 0.18
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            -0.12,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            -1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110b",
+      "name": "Forearm.R",
+      "parent_uuid": "11111111-1111-4111-8111-11111111110a",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -0.24,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.04,
+            "height_m": 0.18
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Hinge",
+          "rest_translation": [
+            -0.24,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            0,
+            1
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": 0,
+          "hinge_max_rad": 2.443460952792061,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110c",
+      "name": "Hand.R",
+      "parent_uuid": "11111111-1111-4111-8111-11111111110b",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -0.22,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.04,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Universal",
+          "rest_translation": [
+            -0.22,
+            0,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            0,
+            1
+          ],
+          "secondary_axis": [
+            0,
+            1,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -0.6108652381980153,
+          "primary_max_rad": 0.6108652381980153,
+          "secondary_min_rad": -0.4363323129985824,
+          "secondary_max_rad": 0.4363323129985824,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110d",
+      "name": "Hip.L",
+      "parent_uuid": "11111111-1111-4111-8111-111111111100",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0.08,
+            -0.06,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.06,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            0.08,
+            -0.06,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            -1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 1.2217304763960306,
+          "twist_min_rad": -0.6981317007977318,
+          "twist_max_rad": 0.6981317007977318,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110e",
+      "name": "Thigh.L",
+      "parent_uuid": "11111111-1111-4111-8111-11111111110d",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.08,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.06,
+            "height_m": 0.32
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            0,
+            -0.08,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            -1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-11111111110f",
+      "name": "Shin.L",
+      "parent_uuid": "11111111-1111-4111-8111-11111111110e",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.4,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.05,
+            "height_m": 0.32
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Hinge",
+          "rest_translation": [
+            0,
+            -0.4,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            0,
+            1
+          ],
+          "hinge_min_rad": 0,
+          "hinge_max_rad": 2.443460952792061,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111110",
+      "name": "Foot.L",
+      "parent_uuid": "11111111-1111-4111-8111-11111111110f",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.38,
+            0.04
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            0.08,
+            0.05,
+            0.18
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 1
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Universal",
+          "rest_translation": [
+            0,
+            -0.38,
+            0.04
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            0,
+            1
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -0.5235987755982988,
+          "primary_max_rad": 0.5235987755982988,
+          "secondary_min_rad": -0.3490658503988659,
+          "secondary_max_rad": 0.3490658503988659,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "name": "Hip.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111100",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            -0.08,
+            -0.06,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "sphere",
+            "shading": "smooth",
+            "radius_m": 0.06,
+            "segments": 12,
+            "rings": 8
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Ball",
+          "rest_translation": [
+            -0.08,
+            -0.06,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            -1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 1.2217304763960306,
+          "twist_min_rad": -0.6981317007977318,
+          "twist_max_rad": 0.6981317007977318,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111112",
+      "name": "Thigh.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111111",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.08,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.06,
+            "height_m": 0.32
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Fixed",
+          "rest_translation": [
+            0,
+            -0.08,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            0,
+            -1,
+            0
+          ],
+          "secondary_axis": [
+            1,
+            0,
+            0
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111113",
+      "name": "Shin.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111112",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.4,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "capsule",
+            "radius_m": 0.05,
+            "height_m": 0.32
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Hinge",
+          "rest_translation": [
+            0,
+            -0.4,
+            0
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            0,
+            1
+          ],
+          "hinge_min_rad": 0,
+          "hinge_max_rad": 2.443460952792061,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -3.141592653589793,
+          "primary_max_rad": 3.141592653589793,
+          "secondary_min_rad": -3.141592653589793,
+          "secondary_max_rad": 3.141592653589793,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    },
+    {
+      "uuid": "11111111-1111-4111-8111-111111111114",
+      "name": "Foot.R",
+      "parent_uuid": "11111111-1111-4111-8111-111111111113",
+      "components": [
+        {
+          "type": "Transform",
+          "version": 1,
+          "translation": [
+            0,
+            -0.38,
+            0.04
+          ],
+          "rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "scale": [
+            0.08,
+            0.05,
+            0.18
+          ]
+        },
+        {
+          "type": "MeshRenderer",
+          "version": 1,
+          "visible": true,
+          "cast_shadows": true,
+          "receive_shadows": true,
+          "mesh": {
+            "scheme": "jarvig.builtin",
+            "name": "cube",
+            "size_m": 1
+          },
+          "material": {
+            "scheme": "jarvig.builtin",
+            "name": "standard_white",
+            "base_color": [
+              0.72,
+              0.67,
+              0.6,
+              1
+            ],
+            "metallic": 0,
+            "roughness": 0.65,
+            "emissive": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "type": "Joint",
+          "version": 1,
+          "kind": "Universal",
+          "rest_translation": [
+            0,
+            -0.38,
+            0.04
+          ],
+          "rest_rotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "secondary_axis": [
+            0,
+            0,
+            1
+          ],
+          "hinge_min_rad": -3.141592653589793,
+          "hinge_max_rad": 3.141592653589793,
+          "swing_rad": 3.141592653589793,
+          "twist_min_rad": -3.141592653589793,
+          "twist_max_rad": 3.141592653589793,
+          "primary_min_rad": -0.5235987755982988,
+          "primary_max_rad": 0.5235987755982988,
+          "secondary_min_rad": -0.3490658503988659,
+          "secondary_max_rad": 0.3490658503988659,
+          "linear_min_m": -1,
+          "linear_max_m": 1,
+          "stiffness": 0,
+          "damping": 0
+        }
+      ]
+    }
+  ]
+}

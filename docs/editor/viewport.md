@@ -22,6 +22,8 @@ The perspective panel is one stable child HWND of the frame. The view uses `Norm
 
 Dock layout records the child client size in physical pixels (`GetClientRect` on the perspective HWND). It does not reconfigure the swapchain inside `WM_SIZE`. The next frame, after the previous swapchain texture view has been dropped, configures the existing surface and recreates depth to that size. A minimized or hidden view is suspended at 0×0 and does not configure an empty surface. Projection aspect is the configured width divided by the configured height. The HWND and `RenderViewId` stay. JRV-0070. The transitional host still calls `resize` on its own top-level window.
 
+Releasing the renderer drops an acquired swapchain image, and the views and buffers that still reference it, before the surface and the device. wgpu panics if that image is discarded after the surface is gone, and a Win32 window procedure cannot unwind from that panic. A failed frame prints `EDITOR_FRAME` and then `JARVIG_FAIL` with the same text. It does not abort the process.
+
 The bootstrap left/right split stays in `jarvig_editor_host`. It proved that two views can share one snapshot. The product editor does not show that split. Multi-view is not deleted. Perspective, Top, Front, Side, and Game can each be another `RenderView` later. They are not extra worlds.
 
 The Perspective camera is editor session state on that view. It is not a scene entity. Fly, look, orbit, pan, and focus update a view pose. They do not write a GPU matrix and they do not revise `SceneWorld`. Projection uses the configured drawable aspect above, the bootstrap 60° vertical field of view, and infinite reversed-Z. See [camera.md](camera.md) and [ADR-0033](../adr/ADR-0033-editor-camera-is-not-a-scene-entity.md).

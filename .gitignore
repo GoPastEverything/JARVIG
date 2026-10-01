@@ -17,4 +17,13 @@ Thumbs.db
 .env.*
 !.env.example
 private/
-samples/lighting-lab/Content/Meshes/townshop.glb
+
+# Local Sketchfab Ghost City import. Credits stay in samples/ghost-city/CREDITS.md. Do not publish the mesh.
+samples/ghost-city/third-party/
+samples/ghost-city/Content/
+samples/ghost-city/Intermediate/
+
+# Local Sketchfab base bodies. Credits stay in samples/base-characters/CREDITS.md. Do not publish the meshes.
+samples/base-characters/third-party/
+samples/base-characters/Content/
+samples/base-characters/Intermediate/

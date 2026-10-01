@@ -1,15 +1,15 @@
 //! Project and level files. The editor does not own the world, and the files do not own the GPU.
 //!
 //! Editor camera, dock layout, exposure, and lighting debug stay out of `.jarviglevel`.
-//! A viewport pose may be written under `Saved/Editor` and is not gameplay truth.
+//! A viewport pose and the editor workspace may be written under `Saved/Editor` and are not gameplay truth.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use jarvig_core::{
-    autosave_path, create_project_directories, lighting_lab_level, load_level_file, load_project_file, save_level_atomic,
-    save_project_atomic, EntityId, LevelDocument, ProjectDocument, Vec3,
+    autosave_path, create_project_directories, empty_world_level, load_level_file, load_project_file, parse_character, save_level_atomic,
+    save_project_atomic, EntityId, LevelDocument, ProjectDocument, RegistryAsset, Vec3,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
@@ -153,6 +153,11 @@ impl Editor {
         if self.self_test {
             return Ok(());
         }
+        if let Some(path) = self.startup_project.clone() {
+            self.open_project_at(&path)?;
+            self.append(&format!("Opened project {} from --project.", path.display()));
+            return Ok(());
+        }
         if let Some(path) = find_up("samples/lighting-lab/LightingLab.jarvigproject") {
             match self.open_project_at(&path) {
                 Ok(()) => {
@@ -184,7 +189,11 @@ impl Editor {
             return;
         }
         let star = if self.level_dirty() { "*" } else { "" };
-        let title = if self.level_name.is_empty() {
+        let title = if self.character_workspace && !self.level_name.is_empty() {
+            format!("Character: {}{star} - JARVIGEditor", self.level_name)
+        } else if self.land_mode && !self.level_name.is_empty() {
+            format!("Land: {}{star} - JARVIGEditor", self.level_name)
+        } else if self.level_name.is_empty() {
             "JARVIGEditor".to_string()
         } else if self.project_name.is_empty() {
             format!("{}{star} - JARVIGEditor", self.level_name)
@@ -223,6 +232,11 @@ impl Editor {
     }
 
     pub(super) fn file_new_project(&mut self) {
+        self.file_new_from_template("empty");
+    }
+
+    /// Empty World, Terrain World, Third Person, or FPS. The level is World Settings only.
+    pub(super) fn file_new_from_template(&mut self, template: &str) {
         self.stop_play();
         if !self.confirm_save_or_discard() {
             return;
@@ -243,7 +257,8 @@ impl Editor {
             self.append(&format!("Project file was not written: {error}"));
             return;
         }
-        let level = bootstrap_level(&name);
+        let mut level = empty_world_level();
+        level.name = name;
         let level_path = match project.startup_level_path(&path) {
             Ok(path) => path,
             Err(error) => {
@@ -257,6 +272,7 @@ impl Editor {
         }
         let settings = path.parent().unwrap_or(Path::new(".")).join(&project.settings);
         let _ = fs::write(settings, "JARVIG project settings placeholder. This is not a level and not a GPU resource.\n");
+        write_template_file(&path, &project, template);
         if let Err(error) = self.open_project_at(&path) {
             self.append(&format!("Project was written but did not open: {error}"));
         }
@@ -298,13 +314,16 @@ impl Editor {
         let Some(path) = save_dialog(self.frame, "New JARVIG Level", "JARVIG Level\0*.jarviglevel\0", "jarviglevel") else { return };
         let path = ensure_extension(&path, "jarviglevel");
         let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Level").to_string();
-        let document = bootstrap_level(&name);
+        let mut document = empty_world_level();
+        document.name = name;
         if let Err(error) = self.store_level(&path, &document, true) {
             self.append(&format!("New level was not written: {error}"));
             return;
         }
         if let Err(error) = self.adopt_level(document, Some(path)) {
             self.append(&format!("New level was written but did not become the world: {error}"));
+        } else {
+            self.restore_workspace();
         }
     }
 
@@ -472,7 +491,13 @@ impl Editor {
         self.pump_loading();
         let loaded = load_level_file(path).map_err(|error| format!("the level file was not read. The current world is unchanged. {error}"));
         let result = match loaded {
-            Ok(document) => self.adopt_level(document, Some(path.to_path_buf())),
+            Ok(document) => match self.adopt_level(document, Some(path.to_path_buf())) {
+                Ok(()) => {
+                    self.restore_workspace();
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         if outer {
@@ -497,6 +522,10 @@ impl Editor {
             self.project_file = Some(path.to_path_buf());
             self.project_name = project.display_name.clone();
             self.adopt_level(document, Some(level_path))?;
+            let templated_land = self.apply_saved_template();
+            if !self.restore_workspace() && templated_land {
+                self.append(Self::workspace_line(super::chrome::WorkspaceMode::Land));
+            }
             self.remember_project(path);
             self.append(&format!("Project {} is open. Startup level is {}.", project.display_name, project.startup_level));
             self.queue_asset_registry();
@@ -544,12 +573,44 @@ impl Editor {
         let _ = self.push_editor_camera();
         self.selection.clear_from(crate::selection::SelectionSource::Outliner);
         self.selection_view_ready = false;
+        self.character_workspace = false;
+        self.land_mode = false;
+        self.outliner_land = false;
+        self.cancel_land_chunks();
         self.sync_outliner();
         if let Some(path) = path {
             self.remember_level(&path);
         }
         self.append(&format!("Level {} is the authored world. The editor camera was not loaded from the level.", self.level_name));
         self.refresh_title();
+        Ok(())
+    }
+
+    /// Loads one character asset into the open world and enters the Character Editor.
+    ///
+    /// The character file stays put. Save still writes a `.jarviglevel`.
+    pub(super) fn open_character_document(&mut self, asset: &RegistryAsset) -> Result<(), String> {
+        let project = self.project_file.clone().ok_or("Open a project before opening a character.")?;
+        let root = project.parent().ok_or("project file has no directory")?;
+        let path = root.join(&asset.path);
+        let text = fs::read_to_string(&path).map_err(|error| format!("character file was not read: {error}"))?;
+        let character = parse_character(&text).map_err(|error| error.to_string())?;
+        let (level_uuid, settings_uuid) = if character.name == "Base Male" {
+            (
+                EntityId::parse("33333333-3333-4333-8333-3333333333b2").expect("male level uuid"),
+                EntityId::parse("33333333-3333-4333-8333-3333333333a2").expect("male settings uuid"),
+            )
+        } else {
+            (
+                EntityId::parse("33333333-3333-4333-8333-3333333333b1").expect("base level uuid"),
+                EntityId::parse("33333333-3333-4333-8333-3333333333a1").expect("base settings uuid"),
+            )
+        };
+        let document = character.open_as_level(level_uuid, settings_uuid).map_err(|error| error.to_string())?;
+        self.adopt_level(document, None)?;
+        self.set_character_workspace(true);
+        self.focus_character_body();
+        self.append(&format!("Opened {}. Double-click did not place a copy. Save writes a level, not the character file.", character.name));
         Ok(())
     }
 
@@ -569,6 +630,7 @@ impl Editor {
         self.saved_revision = self.engine.world().revision();
         self.remember_level(path);
         self.write_editor_viewport();
+        self.persist_workspace();
         self.append(&format!("Saved {}. Runtime ids and the editor camera were not written into the level.", path.display()));
         self.refresh_title();
         Ok(())
@@ -622,6 +684,86 @@ impl Editor {
         document.directory(project, "Saved/Editor/viewport.json").ok()
     }
 
+    fn workspace_path(&self) -> Option<PathBuf> {
+        let project = self.project_file.as_ref()?;
+        let document = load_project_file(project).ok()?;
+        document.directory(project, "Saved/Editor/workspace.json").ok()
+    }
+
+    /// Last editor mode and its visualization. Not level data. A self-test writes nothing.
+    pub(super) fn persist_workspace(&self) {
+        if self.self_test || self.project_file.is_none() {
+            return;
+        }
+        let Some(path) = self.workspace_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, format_workspace(&EditorWorkspace::capture(self)));
+    }
+
+    /// A saved workspace wins over the project template. No file leaves the mode adopt just set.
+    fn restore_workspace(&mut self) -> bool {
+        let Some(path) = self.workspace_path() else { return false };
+        let Ok(text) = fs::read_to_string(path) else { return false };
+        let Some(saved) = parse_workspace(&text) else {
+            self.append("Editor workspace file was left unread. The mode stayed.");
+            return false;
+        };
+        if saved.mode == super::chrome::WorkspaceMode::Character && !self.level_has_rig() {
+            self.apply_workspace(&saved);
+            if self.editor_mode() != super::chrome::WorkspaceMode::Level {
+                self.switch_editor_mode(super::chrome::WorkspaceMode::Level, false, false);
+            }
+            self.finish_workspace_restore();
+            self.append("Workspace kept Level. This level has no rig.");
+            return true;
+        }
+        if self.editor_mode() != saved.mode {
+            self.switch_editor_mode(saved.mode, false, false);
+        }
+        self.apply_workspace(&saved);
+        self.finish_workspace_restore();
+        let name = match saved.mode {
+            super::chrome::WorkspaceMode::Level => "Level",
+            super::chrome::WorkspaceMode::Land => "Land",
+            super::chrome::WorkspaceMode::Character => "Character",
+        };
+        self.append(&format!("Workspace restored: {name}."));
+        true
+    }
+
+    fn apply_workspace(&mut self, saved: &EditorWorkspace) {
+        self.land_grid = saved.grid;
+        self.land_grid_minor = saved.minor;
+        self.land_grid_major = saved.major.max(saved.minor);
+        self.land_grid_snap = saved.snap;
+        self.land_overlay_world = saved.world;
+        self.land_overlay_vertices = saved.vertices;
+        self.land_overlay_chunks = saved.chunks;
+        self.land_overlay_lod = saved.lod;
+        self.land_show_terrain = saved.show_terrain;
+        self.land_show_helpers = saved.show_helpers;
+        self.land_show_lighting = saved.show_lighting;
+        self.land_show_characters = saved.show_characters;
+        self.land_show_props = saved.show_props;
+        self.land_show_gameplay = saved.show_gameplay;
+        self.land_show_full = saved.show_full;
+        self.land_radius = saved.radius.clamp(0.25, 128.0);
+        self.land_delta = saved.strength.max(0.0);
+        self.land_falloff = saved.falloff;
+        self.land_tool = saved.tool;
+        self.show_joint_debug = saved.joints;
+        self.show_all_joints = saved.all_joints && saved.joints;
+        self.show_joint_limits = saved.limits;
+    }
+
+    fn finish_workspace_restore(&mut self) {
+        self.inspector_force_realize = true;
+        self.request_inspector_refresh();
+        self.sync_view_menu();
+    }
+
     fn write_editor_viewport(&self) {
         let Some(path) = self.viewport_path() else { return };
         let Some(controller) = self.editor_camera.as_ref() else { return };
@@ -634,6 +776,32 @@ impl Editor {
             position.x, position.y, position.z, controller.yaw, controller.pitch, controller.speed_m_s
         );
         let _ = fs::write(path, text);
+    }
+
+    /// A Terrain World opens in Land when no workspace file has been saved yet.
+    /// The call does not write `workspace.json`, so a later restore still wins.
+    fn apply_saved_template(&mut self) -> bool {
+        let Some(word) = self.read_project_template() else { return false };
+        match word.as_str() {
+            "terrain" | "land" => {
+                self.switch_editor_mode(super::chrome::WorkspaceMode::Land, false, false);
+                true
+            }
+            "third-person" | "fps" => {
+                self.append("This template is an empty world. A pawn is not in this foundation.");
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn read_project_template(&self) -> Option<String> {
+        let project_file = self.project_file.as_ref()?;
+        let project = load_project_file(project_file).ok()?;
+        let path = project.directory(project_file, "Saved/Editor/template.txt").ok()?;
+        let text = fs::read_to_string(path).ok()?;
+        let word = text.lines().next().unwrap_or("").trim().to_ascii_lowercase();
+        if word.is_empty() { None } else { Some(word) }
     }
 
     fn remember_project(&mut self, path: &Path) {
@@ -674,23 +842,10 @@ impl Editor {
     }
 }
 
-fn bootstrap_level(name: &str) -> LevelDocument {
-    let mut document = lighting_lab_level();
-    document.level_uuid = EntityId::new();
-    document.name = name.to_string();
-    document.entities.retain(|entity| !matches!(entity.name.as_str(), "Floor" | "White Cube" | "Metal Sphere" | "Flat Sphere" | "Emissive Panel"));
-    for entity in &mut document.entities {
-        entity.uuid = EntityId::new();
-        for component in &mut entity.components {
-            if let jarvig_core::ComponentRecord::ReflectionProbe(probe) = component {
-                probe.resolution = 32;
-            }
-        }
-    }
-    if let Some(settings) = document.entities.iter().find(|entity| entity.name == "World Settings") {
-        document.world_settings.entity = settings.uuid;
-    }
-    document
+fn write_template_file(project_path: &Path, project: &ProjectDocument, word: &str) {
+    let Ok(directory) = project.directory(project_path, "Saved/Editor") else { return };
+    let _ = fs::create_dir_all(&directory);
+    let _ = fs::write(directory.join("template.txt"), format!("{word}\n"));
 }
 
 fn backup_dir(project_file: &Path) -> PathBuf {
@@ -782,6 +937,173 @@ fn number_after(text: &str, key: &str) -> Option<f64> {
     slice[..end].parse().ok()
 }
 
+fn word_after(text: &str, key: &str) -> Option<String> {
+    let start = text.find(key)? + key.len();
+    let slice = text[start..].trim_start_matches(|character: char| character == ':' || character.is_whitespace());
+    if let Some(rest) = slice.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    let end = slice.find(|character: char| character == ',' || character == '\n' || character == '\r' || character == '}').unwrap_or(slice.len());
+    let word = slice[..end].trim();
+    if word.is_empty() { None } else { Some(word.to_string()) }
+}
+
+fn flag_after(text: &str, key: &str) -> Option<bool> {
+    match word_after(text, key)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn json_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+/// Editor view over one project. The level file does not store this.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EditorWorkspace {
+    mode: super::chrome::WorkspaceMode,
+    grid: bool,
+    minor: f32,
+    major: f32,
+    snap: bool,
+    world: bool,
+    vertices: bool,
+    chunks: bool,
+    lod: bool,
+    show_terrain: bool,
+    show_helpers: bool,
+    show_lighting: bool,
+    show_characters: bool,
+    show_props: bool,
+    show_gameplay: bool,
+    show_full: bool,
+    radius: f32,
+    strength: f32,
+    falloff: jarvig_core::TerrainFalloff,
+    tool: super::LandTool,
+    joints: bool,
+    all_joints: bool,
+    limits: bool,
+}
+
+impl EditorWorkspace {
+    fn capture(editor: &Editor) -> Self {
+        Self {
+            mode: editor.editor_mode(),
+            grid: editor.land_grid,
+            minor: editor.land_grid_minor,
+            major: editor.land_grid_major,
+            snap: editor.land_grid_snap,
+            world: editor.land_overlay_world,
+            vertices: editor.land_overlay_vertices,
+            chunks: editor.land_overlay_chunks,
+            lod: editor.land_overlay_lod,
+            show_terrain: editor.land_show_terrain,
+            show_helpers: editor.land_show_helpers,
+            show_lighting: editor.land_show_lighting,
+            show_characters: editor.land_show_characters,
+            show_props: editor.land_show_props,
+            show_gameplay: editor.land_show_gameplay,
+            show_full: editor.land_show_full,
+            radius: editor.land_radius,
+            strength: editor.land_delta,
+            falloff: editor.land_falloff,
+            tool: editor.land_tool,
+            joints: editor.show_joint_debug,
+            all_joints: editor.show_all_joints,
+            limits: editor.show_joint_limits,
+        }
+    }
+}
+
+fn format_workspace(saved: &EditorWorkspace) -> String {
+    let mode = match saved.mode {
+        super::chrome::WorkspaceMode::Level => "level",
+        super::chrome::WorkspaceMode::Land => "land",
+        super::chrome::WorkspaceMode::Character => "character",
+    };
+    format!(
+        "{{\n  \"schema\": \"jarvig.editor-workspace\",\n  \"format_version\": 1,\n  \"mode\": \"{mode}\",\n  \"grid\": {grid},\n  \"minor\": {minor},\n  \"major\": {major},\n  \"snap\": {snap},\n  \"world\": {world},\n  \"vertices\": {vertices},\n  \"chunks\": {chunks},\n  \"lod\": {lod},\n  \"show_terrain\": {show_terrain},\n  \"show_helpers\": {show_helpers},\n  \"show_lighting\": {show_lighting},\n  \"show_characters\": {show_characters},\n  \"show_props\": {show_props},\n  \"show_gameplay\": {show_gameplay},\n  \"show_full\": {show_full},\n  \"radius\": {radius},\n  \"strength\": {strength},\n  \"falloff\": \"{falloff}\",\n  \"tool\": \"{tool}\",\n  \"joints\": {joints},\n  \"all_joints\": {all_joints},\n  \"limits\": {limits}\n}}\n",
+        grid = json_bool(saved.grid),
+        minor = saved.minor,
+        major = saved.major,
+        snap = json_bool(saved.snap),
+        world = json_bool(saved.world),
+        vertices = json_bool(saved.vertices),
+        chunks = json_bool(saved.chunks),
+        lod = json_bool(saved.lod),
+        show_terrain = json_bool(saved.show_terrain),
+        show_helpers = json_bool(saved.show_helpers),
+        show_lighting = json_bool(saved.show_lighting),
+        show_characters = json_bool(saved.show_characters),
+        show_props = json_bool(saved.show_props),
+        show_gameplay = json_bool(saved.show_gameplay),
+        show_full = json_bool(saved.show_full),
+        radius = saved.radius,
+        strength = saved.strength,
+        falloff = saved.falloff.label(),
+        tool = saved.tool.key(),
+        joints = json_bool(saved.joints),
+        all_joints = json_bool(saved.all_joints),
+        limits = json_bool(saved.limits),
+    )
+}
+
+fn parse_workspace(text: &str) -> Option<EditorWorkspace> {
+    if word_after(text, "\"schema\"")?.as_str() != "jarvig.editor-workspace" {
+        return None;
+    }
+    if number_after(text, "\"format_version\"")? != 1.0 {
+        return None;
+    }
+    let mode = match word_after(text, "\"mode\"")?.as_str() {
+        "level" => super::chrome::WorkspaceMode::Level,
+        "land" => super::chrome::WorkspaceMode::Land,
+        "character" => super::chrome::WorkspaceMode::Character,
+        _ => return None,
+    };
+    let minor = number_after(text, "\"minor\"")? as f32;
+    let major = number_after(text, "\"major\"")? as f32;
+    let radius = number_after(text, "\"radius\"")? as f32;
+    let strength = number_after(text, "\"strength\"")? as f32;
+    if !minor.is_finite() || !major.is_finite() || !radius.is_finite() || !strength.is_finite() {
+        return None;
+    }
+    if minor <= 0.0 || major <= 0.0 || radius <= 0.0 || strength < 0.0 {
+        return None;
+    }
+    let falloff = jarvig_core::TerrainFalloff::parse(&word_after(text, "\"falloff\"")?)?;
+    let tool = super::LandTool::from_key(&word_after(text, "\"tool\"")?)?;
+    Some(EditorWorkspace {
+        mode,
+        grid: flag_after(text, "\"grid\"")?,
+        minor,
+        major,
+        snap: flag_after(text, "\"snap\"")?,
+        world: flag_after(text, "\"world\"")?,
+        vertices: flag_after(text, "\"vertices\"")?,
+        chunks: flag_after(text, "\"chunks\"")?,
+        lod: flag_after(text, "\"lod\"")?,
+        show_terrain: flag_after(text, "\"show_terrain\"")?,
+        show_helpers: flag_after(text, "\"show_helpers\"")?,
+        show_lighting: flag_after(text, "\"show_lighting\"")?,
+        show_characters: flag_after(text, "\"show_characters\"")?,
+        show_props: flag_after(text, "\"show_props\"")?,
+        show_gameplay: flag_after(text, "\"show_gameplay\"")?,
+        show_full: flag_after(text, "\"show_full\"")?,
+        radius,
+        strength,
+        falloff,
+        tool,
+        joints: flag_after(text, "\"joints\"")?,
+        all_joints: flag_after(text, "\"all_joints\"")?,
+        limits: flag_after(text, "\"limits\"")?,
+    })
+}
+
 fn open_dialog(owner: windows_sys::Win32::Foundation::HWND, title: &str, filter: &str) -> Option<PathBuf> {
     dialog(owner, title, filter, None, true)
 }
@@ -810,4 +1132,57 @@ fn dialog(owner: windows_sys::Win32::Foundation::HWND, title: &str, filter: &str
     }
     let length = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
     Some(PathBuf::from(String::from_utf16_lossy(&file[..length])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_workspace, parse_workspace, EditorWorkspace};
+
+    #[test]
+    fn workspace_file_roundtrips_and_rejects_a_bad_schema() {
+        let saved = EditorWorkspace {
+            mode: crate::chrome::WorkspaceMode::Land,
+            grid: true,
+            minor: 1.0,
+            major: 10.0,
+            snap: false,
+            world: true,
+            vertices: false,
+            chunks: false,
+            lod: false,
+            show_terrain: true,
+            show_helpers: true,
+            show_lighting: true,
+            show_characters: false,
+            show_props: false,
+            show_gameplay: false,
+            show_full: false,
+            radius: 4.0,
+            strength: 0.35,
+            falloff: jarvig_core::TerrainFalloff::Smooth,
+            tool: crate::LandTool::Sculpt,
+            joints: true,
+            all_joints: false,
+            limits: true,
+        };
+        let text = format_workspace(&saved);
+        let parsed = parse_workspace(&text).expect("workspace");
+        assert_eq!(parsed.mode, saved.mode);
+        assert_eq!(parsed.tool, saved.tool);
+        assert_eq!(parsed.falloff, saved.falloff);
+        assert_eq!(parsed.grid, true);
+        assert_eq!(parsed.snap, false);
+        assert_eq!(parsed.show_characters, false);
+        assert_eq!(parsed.show_full, false);
+        assert_eq!(parsed.joints, true);
+        assert_eq!(parsed.all_joints, false);
+        assert_eq!(parsed.limits, true);
+        assert!((parsed.minor - saved.minor).abs() < 1.0e-5);
+        assert!((parsed.major - saved.major).abs() < 1.0e-5);
+        assert!((parsed.radius - saved.radius).abs() < 1.0e-5);
+        assert!((parsed.strength - saved.strength).abs() < 1.0e-5);
+        assert!(parse_workspace(&text.replace("jarvig.editor-workspace", "jarvig.other")).is_none());
+        assert!(parse_workspace(&text.replace("\"tool\": \"sculpt\"", "\"tool\": \"nope\"")).is_none());
+        assert!(parse_workspace(&text.replace("  \"mode\": \"land\",\n", "")).is_none());
+    }
 }

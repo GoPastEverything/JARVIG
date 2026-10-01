@@ -1,3 +1,5 @@
 # Surface detail research
 
-Procedural detail defaults off. The included providers are a disabled provider and a flat reference triangle. No distribution rule is specified here.
+This note is withheld.
+
+The public engine runs with procedural detail disabled, or with the flat reference provider. No distribution rule is specified here.

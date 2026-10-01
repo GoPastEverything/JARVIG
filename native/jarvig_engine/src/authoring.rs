@@ -12,8 +12,8 @@ use jarvig_core::{
     FIELD_METALLIC_FACTOR, FIELD_NORMAL_SCALE, FIELD_ROUGHNESS_FACTOR, FIELD_SHADOW_DISTANCE, FIELD_SHADOW_FILTER, FIELD_SHADOW_NORMAL_BIAS,
     FIELD_SHADOW_RESOLUTION, FIELD_SHADOW_SLOPE_BIAS, FIELD_UPPER_COLOR, FIELD_UV_SCALE,
     FIELD_FAR_PLANE, FIELD_NEAR_PLANE, FIELD_ORTHO_HEIGHT, FIELD_PARENT, FIELD_PROJECTION, FIELD_RESOLUTION, FIELD_UPDATE_MODE, FIELD_VERTICAL_FOV, FIELD_VIEWPORT, FIELD_VISIBLE,
-    TYPE_CAMERA, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_MESH_RENDERER, TYPE_POINT_LIGHT, TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME,
-    TYPE_SPOT_LIGHT,
+    TYPE_CAMERA, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_JOINT, TYPE_MESH_RENDERER, TYPE_POINT_LIGHT, TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME,
+    TYPE_SPOT_LIGHT, TYPE_TERRAIN,
 };
 
 use crate::EngineSession;
@@ -30,6 +30,23 @@ pub enum AuthoringCommand {
     AddComponent { target: EntityId, type_id: TypeId },
     /// Drops one component and its subsystem record. Slot 0 is the only slot these types use.
     RemoveComponent { target: EntityId, type_id: TypeId, slot: u32 },
+    /// Flat chunked heightfield centered at a scene-local point. One terrain actor.
+    CreateTerrain { local: jarvig_core::Vec3, record: jarvig_core::TerrainRecord },
+    /// Writes the heightfield. Does not generate Einstein detail.
+    /// `rebuild_meshes` builds the derived chunk visuals on this thread. Land Mode passes false
+    /// and publishes those meshes from the job queue.
+    StampTerrain {
+        target: EntityId,
+        brush: jarvig_core::TerrainBrush,
+        local_x: f32,
+        local_z: f32,
+        radius: f32,
+        delta: f32,
+        layer: u8,
+        falloff: jarvig_core::TerrainFalloff,
+        flatten_to: Option<f32>,
+        rebuild_meshes: bool,
+    },
 }
 
 impl EngineSession {
@@ -66,6 +83,22 @@ impl EngineSession {
             }
             AuthoringCommand::RemoveComponent { target, type_id, slot } => {
                 self.world.remove_component(target, type_id, slot)?;
+                Ok(AuthoringResult::Applied)
+            }
+            AuthoringCommand::CreateTerrain { local, record } => {
+                let master = if self.runtime.profile().renders() {
+                    Some(self.current_material_master().map_err(|_| AuthoringError::InvalidOperation)?)
+                } else {
+                    None
+                };
+                self.world.create_terrain(local, record)?;
+                if let Some(master) = master {
+                    self.bind_new_chunk_materials(master).map_err(|_| AuthoringError::InvalidOperation)?;
+                }
+                Ok(AuthoringResult::Applied)
+            }
+            AuthoringCommand::StampTerrain { target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes } => {
+                self.world.stamp_terrain(target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes)?;
                 Ok(AuthoringResult::Applied)
             }
             AuthoringCommand::SetProperty { target, type_id, field, value } => {
@@ -244,6 +277,16 @@ impl EngineSession {
                     (TYPE_CAMERA, FIELD_VIEWPORT) => {
                         let PropertyValue::String(viewport) = value else { return Err(AuthoringError::WrongType) };
                         self.world.set_authored_camera_viewport(target, &viewport)
+                    }
+                    (TYPE_JOINT, _) => {
+                        let Some(current) = self.world.authored_joint(target) else { return Err(AuthoringError::InvalidOperation) };
+                        let next = jarvig_core::apply_joint_property(&current, field, value)?;
+                        self.world.set_authored_joint(target, next)
+                    }
+                    (TYPE_TERRAIN, _) => {
+                        let Some(current) = self.world.authored_terrain(target) else { return Err(AuthoringError::InvalidOperation) };
+                        let next = jarvig_core::apply_terrain_property(&current, field, value)?;
+                        self.world.set_authored_terrain(target, next)
                     }
                     _ => Err(AuthoringError::ReadOnly),
                 }

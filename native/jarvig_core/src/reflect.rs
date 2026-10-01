@@ -6,7 +6,7 @@
 use crate::{EntityId, Quat, Vec3};
 
 /// Independent of `JARVIG_API_VERSION`. Bump it when a field meaning changes.
-pub const TYPE_REGISTRY_VERSION: u32 = 4;
+pub const TYPE_REGISTRY_VERSION: u32 = 6;
 
 /// JARVIG schema id. Stable for this registry version. Not a Rust `TypeId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,6 +28,8 @@ pub const TYPE_COMPONENT_STACK: TypeId = TypeId(9);
 pub const TYPE_CAMERA: TypeId = TypeId(10);
 pub const TYPE_PAWN: TypeId = TypeId(11);
 pub const TYPE_FREE_FLY: TypeId = TypeId(12);
+pub const TYPE_JOINT: TypeId = TypeId(13);
+pub const TYPE_TERRAIN: TypeId = TypeId(14);
 
 pub const FIELD_NAME: FieldId = FieldId(1);
 pub const FIELD_UUID: FieldId = FieldId(2);
@@ -73,6 +75,45 @@ pub const FIELD_VIEWPORT: FieldId = FieldId(45);
 pub const FIELD_CLEAR_POLICY: FieldId = FieldId(46);
 pub const FIELD_OBJECT_SCALE: FieldId = FieldId(47);
 pub const FIELD_VISIBLE: FieldId = FieldId(48);
+pub const FIELD_JOINT_KIND: FieldId = FieldId(49);
+pub const FIELD_JOINT_REST_TRANSLATION: FieldId = FieldId(50);
+pub const FIELD_JOINT_REST_ROTATION: FieldId = FieldId(51);
+pub const FIELD_JOINT_HINGE_MIN: FieldId = FieldId(52);
+pub const FIELD_JOINT_HINGE_MAX: FieldId = FieldId(53);
+pub const FIELD_JOINT_SWING: FieldId = FieldId(54);
+pub const FIELD_JOINT_TWIST_MIN: FieldId = FieldId(55);
+pub const FIELD_JOINT_TWIST_MAX: FieldId = FieldId(56);
+pub const FIELD_JOINT_PRIMARY_MIN: FieldId = FieldId(57);
+pub const FIELD_JOINT_PRIMARY_MAX: FieldId = FieldId(58);
+pub const FIELD_JOINT_SECONDARY_MIN: FieldId = FieldId(59);
+pub const FIELD_JOINT_SECONDARY_MAX: FieldId = FieldId(60);
+pub const FIELD_JOINT_LINEAR_MIN: FieldId = FieldId(61);
+pub const FIELD_JOINT_LINEAR_MAX: FieldId = FieldId(62);
+pub const FIELD_JOINT_STIFFNESS: FieldId = FieldId(63);
+pub const FIELD_JOINT_DAMPING: FieldId = FieldId(64);
+pub const FIELD_JOINT_AXIS: FieldId = FieldId(65);
+pub const FIELD_JOINT_SECONDARY_AXIS: FieldId = FieldId(66);
+pub const FIELD_TERRAIN_WIDTH: FieldId = FieldId(67);
+pub const FIELD_TERRAIN_DEPTH: FieldId = FieldId(68);
+pub const FIELD_TERRAIN_SPACING: FieldId = FieldId(69);
+pub const FIELD_TERRAIN_CHUNK: FieldId = FieldId(70);
+pub const FIELD_TERRAIN_HEIGHT: FieldId = FieldId(71);
+pub const FIELD_TERRAIN_HEIGHT_MIN: FieldId = FieldId(72);
+pub const FIELD_TERRAIN_HEIGHT_MAX: FieldId = FieldId(73);
+pub const FIELD_TERRAIN_COLLISION: FieldId = FieldId(74);
+pub const FIELD_TERRAIN_LOD: FieldId = FieldId(75);
+pub const FIELD_TERRAIN_MATERIAL: FieldId = FieldId(76);
+pub const FIELD_TERRAIN_EINSTEIN: FieldId = FieldId(77);
+pub const FIELD_TERRAIN_SEED: FieldId = FieldId(78);
+pub const FIELD_TERRAIN_DENSITY: FieldId = FieldId(79);
+pub const FIELD_TERRAIN_DISPLACEMENT: FieldId = FieldId(80);
+pub const FIELD_TERRAIN_ERROR: FieldId = FieldId(81);
+pub const FIELD_TERRAIN_DISTANCE: FieldId = FieldId(82);
+pub const FIELD_TERRAIN_CLASS: FieldId = FieldId(83);
+pub const FIELD_TERRAIN_CLIFF: FieldId = FieldId(84);
+pub const FIELD_TERRAIN_DEBUG: FieldId = FieldId(85);
+pub const FIELD_TERRAIN_DEBUG_COLORS: FieldId = FieldId(86);
+pub const FIELD_TERRAIN_EINSTEIN_COLLISION: FieldId = FieldId(87);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueKind {
@@ -136,6 +177,7 @@ const REQUIRES_TRANSFORM: &[TypeId] = &[TYPE_SPATIAL_FRAME];
 const REJECTS_TRANSFORM: &[TypeId] = &[TYPE_SPATIAL_FRAME];
 const MESH_PRIMITIVES: &[&str] = &["Cube", "Sphere", "Plane"];
 const CAMERA_PROJECTIONS: &[&str] = &["Perspective", "Orthographic"];
+const JOINT_KINDS: &[&str] = &["Fixed", "Hinge", "Ball", "Universal", "Prismatic"];
 const PROBE_POLICIES: &[&str] = &["Static", "On Demand", "On Transform", "On Lighting", "Time Sliced"];
 const PROBE_RESOLUTIONS: &[&str] = &["32", "64", "128", "256"];
 const SHADOW_RESOLUTIONS: &[&str] = &["Default", "256", "512", "1024", "2048", "4096"];
@@ -411,6 +453,65 @@ fn camera_fields() -> &'static [FieldInfo] {
     ]))
 }
 
+fn euler_field(mut field: FieldInfo) -> FieldInfo {
+    field.hint = "euler-degrees";
+    field.units = "deg";
+    field.precision = 2;
+    field.step = 1.0;
+    field
+}
+
+fn joint_fields() -> &'static [FieldInfo] {
+    Box::leak(Box::new([
+        with_choices(component_field(FIELD_JOINT_KIND, "kind", "Kind", ValueKind::String, true, "Joint", ""), JOINT_KINDS),
+        component_field(FIELD_JOINT_REST_TRANSLATION, "rest_translation", "Rest Location", ValueKind::Vec3F64, true, "Joint", "m"),
+        euler_field(component_field(FIELD_JOINT_REST_ROTATION, "rest_rotation", "Rest Rotation", ValueKind::QuatF64, true, "Joint", "deg")),
+        component_field(FIELD_JOINT_AXIS, "axis", "Axis", ValueKind::Vec3F64, true, "Joint", ""),
+        component_field(FIELD_JOINT_SECONDARY_AXIS, "secondary_axis", "Secondary Axis", ValueKind::Vec3F64, true, "Joint", ""),
+        component_field(FIELD_JOINT_HINGE_MIN, "hinge_min_deg", "Hinge Min", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_HINGE_MAX, "hinge_max_deg", "Hinge Max", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_SWING, "swing_deg", "Swing Cone", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_TWIST_MIN, "twist_min_deg", "Twist Min", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_TWIST_MAX, "twist_max_deg", "Twist Max", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_PRIMARY_MIN, "primary_min_deg", "Primary Min", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_PRIMARY_MAX, "primary_max_deg", "Primary Max", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_SECONDARY_MIN, "secondary_min_deg", "Secondary Min", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_SECONDARY_MAX, "secondary_max_deg", "Secondary Max", ValueKind::Float64, true, "Limits", "deg"),
+        component_field(FIELD_JOINT_LINEAR_MIN, "linear_min_m", "Slide Min", ValueKind::Float64, true, "Limits", "m"),
+        component_field(FIELD_JOINT_LINEAR_MAX, "linear_max_m", "Slide Max", ValueKind::Float64, true, "Limits", "m"),
+        component_field(FIELD_JOINT_STIFFNESS, "stiffness", "Stiffness", ValueKind::Float64, true, "Joint", ""),
+        component_field(FIELD_JOINT_DAMPING, "damping", "Damping", ValueKind::Float64, true, "Joint", ""),
+    ]))
+}
+
+const TERRAIN_CLIFFS: &[&str] = &["Horizontal XZ", "Dominant Axis"];
+
+fn terrain_fields() -> &'static [FieldInfo] {
+    Box::leak(Box::new([
+        component_field(FIELD_TERRAIN_WIDTH, "width_m", "Width", ValueKind::Float64, false, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_DEPTH, "depth_m", "Depth", ValueKind::Float64, false, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_SPACING, "spacing_m", "Meters Per Vertex", ValueKind::Float64, false, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_CHUNK, "chunk_m", "Chunk Size", ValueKind::Float64, false, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_HEIGHT, "height_m", "Height", ValueKind::Float64, false, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_HEIGHT_MIN, "height_min_m", "Height Min", ValueKind::Float64, true, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_HEIGHT_MAX, "height_max_m", "Height Max", ValueKind::Float64, true, "Terrain", "m"),
+        component_field(FIELD_TERRAIN_COLLISION, "collision", "Collision", ValueKind::Bool, true, "Terrain", ""),
+        component_field(FIELD_TERRAIN_LOD, "lod", "LOD", ValueKind::Bool, true, "Terrain", ""),
+        component_field(FIELD_TERRAIN_MATERIAL, "material", "Material", ValueKind::String, false, "Terrain", ""),
+        component_field(FIELD_TERRAIN_EINSTEIN, "einstein", "Einstein Detail", ValueKind::Bool, true, "Einstein Detail", ""),
+        component_field(FIELD_TERRAIN_SEED, "einstein_seed", "Einstein Seed", ValueKind::Float64, true, "Einstein Detail", ""),
+        component_field(FIELD_TERRAIN_DENSITY, "einstein_density", "Density", ValueKind::Float64, true, "Einstein Detail", ""),
+        component_field(FIELD_TERRAIN_DISPLACEMENT, "einstein_displacement_m", "Maximum Displacement", ValueKind::Float64, true, "Einstein Detail", "m"),
+        component_field(FIELD_TERRAIN_ERROR, "einstein_error_px", "Projected Error", ValueKind::Float64, true, "Einstein Detail", "px"),
+        component_field(FIELD_TERRAIN_DISTANCE, "einstein_distance_m", "Detail Distance", ValueKind::Float64, true, "Einstein Detail", "m"),
+        component_field(FIELD_TERRAIN_CLASS, "einstein_surface_class", "Surface Class", ValueKind::Float64, true, "Einstein Detail", ""),
+        with_choices(component_field(FIELD_TERRAIN_CLIFF, "cliff", "Cliff Projection", ValueKind::String, true, "Einstein Detail", ""), TERRAIN_CLIFFS),
+        component_field(FIELD_TERRAIN_DEBUG, "debug", "Debug Visualization", ValueKind::Bool, true, "Terrain", ""),
+        component_field(FIELD_TERRAIN_DEBUG_COLORS, "einstein_debug_colors", "Debug Colors", ValueKind::Bool, true, "Einstein Detail", ""),
+        component_field(FIELD_TERRAIN_EINSTEIN_COLLISION, "einstein_collision", "Einstein Collision", ValueKind::Bool, false, "Einstein Detail", ""),
+    ]))
+}
+
 fn described(
     id: TypeId,
     canonical_name: &'static str,
@@ -436,6 +537,8 @@ fn registry() -> &'static [TypeInfo] {
         described(TYPE_CAMERA, "camera", "Camera", camera_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
         described(TYPE_PAWN, "pawn", "Pawn", NO_FIELDS, ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
         described(TYPE_FREE_FLY, "free_fly", "Free Fly", NO_FIELDS, ComponentMultiplicity::One, REQUIRES_PAWN, NO_TYPES),
+        described(TYPE_JOINT, "joint", "Joint", joint_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
+        described(TYPE_TERRAIN, "terrain", "Terrain", terrain_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
         described(TYPE_COMPONENT_STACK, "component_stack", "Components", stack_fields(), ComponentMultiplicity::NotAComponent, NO_TYPES, NO_TYPES),
     ]))
 }
@@ -565,7 +668,12 @@ mod tests {
 
     #[test]
     fn registry_ids_are_deterministic_and_not_rust_type_ids() {
-        assert_eq!(TYPE_REGISTRY_VERSION, 4);
+        assert_eq!(TYPE_REGISTRY_VERSION, 6);
+        let terrain = find_type(TYPE_TERRAIN).unwrap();
+        assert_eq!(terrain.canonical_name, "terrain");
+        assert!(!find_field(TYPE_TERRAIN, FIELD_TERRAIN_WIDTH).unwrap().editable);
+        assert!(!find_field(TYPE_TERRAIN, FIELD_TERRAIN_EINSTEIN_COLLISION).unwrap().editable);
+        assert!(find_field(TYPE_TERRAIN, FIELD_TERRAIN_EINSTEIN).unwrap().editable);
         let types = type_registry();
         assert!(types.len() >= 2);
         for (index, info) in types.iter().enumerate() {

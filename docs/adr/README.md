@@ -60,5 +60,11 @@ Do not edit an Accepted ADR in place to change the decision. Write a new ADR and
 | [0050](ADR-0050-authored-world-is-source-runtime-world-is-instance.md) | The authored world is source data; the runtime world is an instance | Accepted |
 | [0051](ADR-0051-imported-mesh-is-an-asset.md) | An imported mesh is an asset, not a level | Accepted |
 | [0052](ADR-0052-in-process-job-queue.md) | An in-process job queue is not a second engine | Accepted |
+| [0053](ADR-0053-a-joint-rides-on-the-local-frame.md) | A joint rides on the local frame | Accepted |
+| [0054](ADR-0054-character-editor-uses-the-joint.md) | The character editor edits the joint | Accepted, level-open sentence partially superseded by 0056 |
+| [0055](ADR-0055-a-character-is-rigid-parts-on-the-joint.md) | A character document is rigid parts on the joint | Accepted, pivot sentence partially superseded by 0056 |
+| [0056](ADR-0056-sockets-sit-on-the-ball-and-the-level-editor-is-the-default.md) | Sockets sit on the ball, and the level editor is the default | Accepted, pivot-click sentence partially superseded by 0057 |
+| [0057](ADR-0057-joint-markers-are-picked-in-the-character-editor.md) | Joint markers are picked in the Character Editor | Accepted |
+| [0058](ADR-0058-terrain-is-a-local-heightfield.md) | Terrain is a local heightfield in the existing world | Accepted |
 
 RFCs are not in this list. See [../rfc/README.md](../rfc/README.md).

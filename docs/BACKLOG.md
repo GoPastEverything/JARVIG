@@ -2,7 +2,7 @@
 
 Tickets are the founding list in `designdoc.html` section 33, numbered `JRV-`. Status is Done only when the acceptance line was met by a command named in Validation. "In progress" means a real subset landed and the exit is not met.
 
-Next: RFC-0001 is Accepted. Procedural detail defaults off. JRV-0088 stays open. Do not start page streaming, a GPU depth pyramid, GPU compute, or the parent-sidecar size pass. RFC-0001's measured performance follow-ups stay open.
+Next: RFC-0001 is Accepted. Procedural detail stays off in this repository, and its surface rule is not included. JRV-0088 stays open. Do not start page streaming, a GPU depth pyramid, GPU compute, or the parent-sidecar size pass. RFC-0001's measured performance follow-ups stay open.
 
 ## JRV-0001 — Freeze dependency rules
 
@@ -630,6 +630,55 @@ Next: RFC-0001 is Accepted. Procedural detail defaults off. JRV-0088 stays open.
 - Acceptance Criteria: The floor is Tiles101 at a readable UV scale. A plane, cube, and sphere share that set. Gravel035 uses the same path and no set-specific shader. Base color, normal, roughness, AO, and metallic can be isolated without saving that view. DirectX versus OpenGL is proven from the tangent frame and the Tiles101 files, not from DX12. Roughness multiplier, UV scale, and normal strength change the shading without a recompile. AO does not darken direct light. Normal maps do not move shadow silhouettes. Mips and anisotropy stay viable on Intel UHD. Height stays metadata. Save and reload keep the set name and the instance factors, not the pixels.
 - Validation: On 2026-09-24 the Tiles101 DirectX and OpenGL files matched as one green flip, and the floor frame shaded the DirectX texel the same way as the flipped OpenGL texel. `cargo test --offline` passed for core, material, rhi, renderer, and engine. The editor test decoded both normal files. Not human-accepted. The self-test still does not open the Lighting Lab.
 - Documentation: `docs/rendering/material-sets.md`.
+
+## JRV-0089 — Native joint pose and primitive mannequin
+
+- Status: Regression fixture. The human saw the hierarchy on 2026-09-30. It stays the joint test. It is not the character product and it is not Done.
+- Milestone: P1
+- Subsystem: core, engine, editor
+- Dependencies: ADR-0049, ADR-0053, JRV-0085
+- Goal: One character pose, which is the entity's local frame, plus a JARVIG-owned humanoid saved as an ordinary prefab.
+- Acceptance Criteria: Joint kinds are Fixed, Hinge, Ball, Universal, and Prismatic. Rest pose, limits, stiffness, and damping are stored. Stiffness and damping are not solved. Shoulders and hips are ball joints. Elbows and knees are hinges. Wrists and ankles are present. Fingers are not. The hierarchy shows in the World Outliner. Selecting a joint shows its type, rest pose, limits, and current local rotation. Editor rotation clamps to those limits and children follow the existing frame parent. Debug draws pivots, axes, and the selected joint's swing or hinge range. The mannequin round-trips as `jarvig.prefab`. Editing one pose does not change an unrelated actor. Physics, ragdoll, IK, skinning, clips, root motion, and FBX skeletons are absent.
+- Validation: On 2026-09-30, `cargo test --offline --manifest-path native/Cargo.toml -p jarvig_core --lib -- joint:: prefab::` passed 7 tests. `bad_levels_do_not_instantiate` passed after a version-4 file was rejected and a `jarvig.asset` mesh with no id was rejected as corrupt. `cargo test --offline --manifest-path native/Cargo.toml -p jarvig_engine --lib` passed 8 tests. `cargo check --offline --manifest-path native/Cargo.toml -p jarvig_editor` exited 0. The sample files are under `samples/primitive-mannequin/`. Human visual acceptance has not been recorded. No GPU frame of the mannequin was run.
+- Documentation: ADR-0053, `docs/animation/overview.md`, `docs/architecture/game-framework.md`.
+
+## JRV-0090 — Kinematic FPS pawn
+
+- Status: Not started. Do not start until JRV-0089 is accepted on screen.
+- Milestone: P1
+- Subsystem: core, engine, editor
+- Dependencies: JRV-0089, ADR-0053
+- Goal: A kinematic first-person pawn for the Quake-style example.
+- Acceptance Criteria: Mouse look, WASD, jump, gravity, ground detection, step and slope handling, and collision. The pawn drives the existing local frame. Physics, ragdoll, IK, skinning, animation clips, root motion, and FBX skeletons stay out. Ghost City is a map sample and is not the character definition.
+- Validation: Not run.
+- Documentation: ADR-0053 names the pawn as a later consumer. This entry records the milestone. It does not authorize the work.
+
+## JRV-0091 — Character editor workspace
+
+- Status: Implemented. Not human-accepted. The imported ball-joint doll is not this ticket. FBX is not an importer.
+- Milestone: P1
+- Subsystem: editor
+- Dependencies: JRV-0089, ADR-0053, ADR-0054
+- Goal: A character workspace over the same spatial frames and joints. The level editor stays the world tool.
+- Acceptance Criteria: A joint-only level opens with a Skeleton tree, a Character Preview, and the joint inspector. The tree suffix is the joint kind. Parent and child are shown. Reset Pose restores every rest pose. Show Joints and Show Joint Limits toggle the overlay. Double-clicking the prefab does not place a second copy. Dragging it still does. Animation, IK, skinning, and ragdoll controls are absent.
+- Validation: On 2026-09-30, `cargo check --offline --manifest-path native/Cargo.toml -p jarvig_editor` exited 0. The on-screen character workspace has not been accepted.
+- Documentation: ADR-0054.
+
+## JRV-0092 — Default base character meshes
+
+- Status: Implemented. Not human-accepted. Base and Base Male are rigid parts on Joint and SpatialFrame. They are not skinned.
+- Milestone: P1
+- Subsystem: core, editor
+- Dependencies: JRV-0022, ADR-0053, ADR-0055
+- Goal: The engine's default bodies are Base and Base Male, in the same role as Unreal's mannequin and female mannequin. The primitive mannequin stays the joint fixture.
+- Acceptance Criteria: Each source contributes one standing body, reconstructed from the source node transforms. Disconnected posed copies and the outline shell stay out. Base Male includes `upperArmMesh.002` and `shoulderMesh.002` and excludes `foreArmMesh.002`. Feet sit near y = 0. The character file is `jarvig.character` version 1 in source space. Each rigid part's frame origin is the ball that joins it to its parent, and the mesh stays in the source world place. The startup level adds one root translation and opens in the level editor. View > Character Editor, or a double-click, opens the character workspace and does not place a copy. A click on a part selects that part. A joint-debug marker selects that joint only in the Character Editor, and the gizmo handle is tested before either pick. Limits are wide defaults. Collision and the animation set are null. FBX is not an importer. Skinning, clips, IK, and ragdoll are absent. The meshes stay local and credited. Lighting Lab is unchanged.
+- Validation: On 2026-10-01 the first bind-pose import passed at 35 and 38 parts and six GPU frames were written. Those frames stacked every shared-node pivot at the feet. The human rejected that. Later the same day, `cargo test --offline --manifest-path native/Cargo.toml -p jarvig_core --lib base_characters_import_as_bind_pose_meshes -- --ignored --nocapture --test-threads=1` passed in 100.09 s. Base is 66 parts, 158,224 triangles, feet y = −0.000359. Base Male is 66 parts, 150,752 triangles, feet y = 0.002134. Lighting Lab bytes were unchanged. `JARVIGEditor --project samples/base-characters/BaseCharacters.jarvigproject --bind-pose-shots samples/base-characters/bind-pose` printed `BIND_POSE_SHOTS_OK` on Intel UHD DX12 and rewrote the six PNGs with joint debug on. The window is the level editor. The human has not accepted those frames. Later the same day, `cargo test --offline --manifest-path native/Cargo.toml -p jarvig_core --lib play::` passed 3 tests. `cargo build --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor` exited 0 with the existing unread `EinsteinCapture.height` warning. `JARVIGEditor --self-test` printed `JARVIG_OK editor frames=41` and `JRV-0065 probe pick=PASS centimeter=PASS` on Intel UHD DX12. That self-test does not open Base Characters and does not click a joint marker. The same day, `cargo test --offline --manifest-path native/Cargo.toml -p jarvig_core --lib the_joint_marker_is_a_small_cross_and_a_short_axis` passed, and the editor build exited 0. Show Joints now draws the selected joint as a 2.4 cm cross. View > Show All Joints draws the rest and defaults off. No new GPU frame of that overlay was captured.
+- Documentation: ADR-0055, ADR-0056, ADR-0057, `docs/animation/overview.md`, `docs/architecture/play-in-editor.md`, `samples/base-characters/CREDITS.md`, `samples/base-characters/bind-pose-report.txt`.
+
+## Terrain foundation
+
+- Status: Implemented under ADR-0058. Not a numbered ticket. Not human-accepted. Einstein terrain detail is stored and does not generate geometry. The Land grid is painted on the terrain surface and is waiting for a human look.
+- The authoritative ground is one chunked heightfield. Empty World is World Settings only. Level, Land, and Character are editor views of that same world. The toolbar shows those words. Land creates and sculpts the heightfield. The grid is a depth-tested pass on the chunk triangles, not a saved object. Minor lines fade with camera distance and grazing angle before major lines, and both are gone at the horizon. Vertex marks are dots. The brush cursor shows radius, falloff, and strength. Land hides characters, props, and gameplay actors until Show Full Level. The mode and those overlay settings are remembered in `Saved/Editor/workspace.json` and stay out of Level. A sculpt writes samples immediately and rebuilds only the dirty chunk meshes on the background job queue. Page streaming, foliage, erosion, water, voxel terrain, and procedural world generation stay out. JRV-0090, JRV-0091, and JRV-0092 are unchanged.
 
 ## JRV-0087 — Renderer presentation and lighting stability
 

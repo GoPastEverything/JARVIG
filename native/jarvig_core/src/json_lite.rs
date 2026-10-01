@@ -366,6 +366,15 @@ fn push_number(out: &mut String, value: f64) {
     out.push_str(&format!("{value}"));
 }
 
+/// The f64 this writer will read back. Exact f32 values often print as a shorter
+/// spelling, and that spelling is a different f64. Callers that compare a parsed
+/// document with `PartialEq` store this value.
+pub(crate) fn round_trip_number(value: f64) -> f64 {
+    let mut text = String::new();
+    push_number(&mut text, value);
+    text.parse::<f64>().unwrap_or(value)
+}
+
 fn push_string(out: &mut String, value: &str) {
     out.push('"');
     for character in value.chars() {
@@ -393,5 +402,23 @@ fn utf8_width(byte: u8) -> Option<usize> {
         Some(4)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_number_is_stable_for_exact_f32_values() {
+        for bits in [0xbe40000000000000_u64, 0x3feecf1180000000, 0xc000305160000000] {
+            let value = f64::from_bits(bits);
+            let once = round_trip_number(value);
+            assert_eq!(round_trip_number(once), once);
+            let text = Json::number(once).write();
+            assert_eq!(parse_json(&text).expect("number"), Json::number(once), "{text}");
+        }
+        assert_eq!(Json::number(1.5).write().trim(), "1.5");
+        assert_eq!(Json::number(100.0).write().trim(), "100");
     }
 }

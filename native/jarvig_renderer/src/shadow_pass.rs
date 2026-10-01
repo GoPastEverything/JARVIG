@@ -393,7 +393,8 @@ impl Renderer {
             shadow.point_far = point_far;
             shadow.passes_budget = SHADOW_PASS_BUDGET;
         }
-        let visible = visible_ids(snapshot, meshes);
+        let hidden: Vec<jarvig_core::EntityId> = self.entity_hidden.iter().copied().collect();
+        let visible = visible_ids(snapshot, meshes, &hidden);
         self.shadow_casters = visible.len() as u32;
         self.ensure_caster_slots(visible.len())?;
         if spot.is_some() && self.shadow_maps_updated < SHADOW_PASS_BUDGET {
@@ -449,7 +450,8 @@ impl Renderer {
             return Ok(());
         }
         self.ensure_directional_atlas(view)?;
-        let visible = visible_ids(snapshot, meshes);
+        let hidden: Vec<jarvig_core::EntityId> = self.entity_hidden.iter().copied().collect();
+        let visible = visible_ids(snapshot, meshes, &hidden);
         self.shadow_casters = self.shadow_casters.max(visible.len() as u32);
         self.ensure_caster_slots(visible.len())?;
         let started = std::time::Instant::now();
@@ -792,13 +794,14 @@ fn light_has_map(kind: LightKind, cascades_ready: bool) -> bool {
     }
 }
 
-fn visible_ids(snapshot: &RenderSceneSnapshot, meshes: &jarvig_core::MeshLibrary) -> Vec<usize> {
+fn visible_ids(snapshot: &RenderSceneSnapshot, meshes: &jarvig_core::MeshLibrary, hidden: &[jarvig_core::EntityId]) -> Vec<usize> {
     snapshot
         .instances()
         .iter()
         .enumerate()
         .filter(|(_, instance)| {
             instance.visible
+                && !hidden.contains(&instance.entity)
                 && instance.cast_shadows
                 && jarvig_core::casts_into_shadow_map(meshes.get(instance.mesh).map(|mesh| mesh.index_count() / 3).unwrap_or(0))
         })

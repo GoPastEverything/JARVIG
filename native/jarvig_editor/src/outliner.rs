@@ -161,6 +161,13 @@ impl WorldOutlinerModel {
         self.world_expanded = expanded;
     }
 
+    /// Replaces the class suffix. The entity id stays the row.
+    pub fn set_category(&mut self, entity: EntityUuid, category: &str) {
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.entity == entity) {
+            node.category = category.to_string();
+        }
+    }
+
     pub fn caret(&self) -> Option<OutlinerNodeId> {
         self.caret
     }

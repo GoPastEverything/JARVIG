@@ -201,6 +201,15 @@ pub fn build_gizmo(
     vertices
 }
 
+/// Joint pivots, axes, and the selected joint's limit marks. Not a scene entity.
+pub fn joint_debug_vertices(segments: &[jarvig_core::JointDebugSegment], camera: Vec3) -> Vec<OverlayVertex> {
+    let mut vertices = Vec::new();
+    for segment in segments {
+        push_box(&mut vertices, segment.start, camera, segment.end, 0.0025, segment.color);
+    }
+    vertices
+}
+
 fn color_for(handle: GizmoHandle, hover: Option<GizmoHandle>, active: Option<GizmoHandle>) -> [f32; 4] {
     let base = match handle {
         GizmoHandle::AxisX | GizmoHandle::RingX => [0.90, 0.16, 0.14, 1.0],

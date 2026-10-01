@@ -7,7 +7,7 @@
 use jarvig_core::{
     find_type, type_registry, AuthoringClass, ComponentMultiplicity, ComponentRole, EntityInspection, EntityUuid, FieldId, PropertyValue, Quat, TypeId,
     ValueKind, FIELD_CAPTURE_STATE, FIELD_MATERIAL_SLOT, FIELD_NAME, FIELD_OBJECT_SCALE, FIELD_PARENT, FIELD_SURFACE, FIELD_UUID,
-    TYPE_COMPONENT_STACK, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_FREE_FLY, TYPE_MESH_RENDERER, TYPE_PAWN, TYPE_POINT_LIGHT,
+    TYPE_COMPONENT_STACK, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_FREE_FLY, TYPE_MESH_RENDERER, TYPE_PAWN, TYPE_POINT_LIGHT, TYPE_TERRAIN,
     TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME, TYPE_SPOT_LIGHT,
 };
 use jarvig_engine::EngineSession;
@@ -33,6 +33,10 @@ pub enum InspectorCommand {
     ResetMaterial,
     SetStartupCamera,
     Recapture,
+    /// Writes every joint in the open world back to its rest pose.
+    ResetPose,
+    /// Creates one flat heightfield from the Land Mode draft. Not a component command.
+    CreateTerrain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +226,7 @@ fn headers(world: &jarvig_core::SceneWorld, id: EntityUuid) -> (String, String) 
         AuthoringClass::ReflectionProbe => "Reflection Probe",
         AuthoringClass::Camera => "Camera",
         AuthoringClass::WorldSettings => "World Settings",
+        AuthoringClass::Terrain => "Terrain",
         AuthoringClass::Empty => "Actor",
     };
     (name, kind.into())
@@ -381,7 +386,7 @@ fn attach_commands(sections: &mut [InspectorSection], present: &[TypeId]) {
 
 fn can_remove(type_id: TypeId, present: &[TypeId]) -> bool {
     let Some(info) = find_type(type_id) else { return false };
-    if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) || type_id == TYPE_ENVIRONMENT {
+    if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) || type_id == TYPE_ENVIRONMENT || type_id == TYPE_TERRAIN {
         return false;
     }
     !present.iter().any(|other| *other != type_id && find_type(*other).is_some_and(|existing| existing.requires.contains(&type_id)))
@@ -443,7 +448,7 @@ pub fn add_component_choices(owned: &[TypeId]) -> Vec<(TypeId, &'static str)> {
         if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) {
             continue;
         }
-        if matches!(info.id, TYPE_ENVIRONMENT | TYPE_MESH_RENDERER | TYPE_PAWN | TYPE_FREE_FLY | TYPE_ENTITY | TYPE_COMPONENT_STACK) {
+        if matches!(info.id, TYPE_ENVIRONMENT | TYPE_MESH_RENDERER | TYPE_TERRAIN | TYPE_PAWN | TYPE_FREE_FLY | TYPE_ENTITY | TYPE_COMPONENT_STACK) {
             continue;
         }
         if matches!(info.multiplicity, ComponentMultiplicity::One) && owned.contains(&info.id) {
@@ -476,6 +481,8 @@ fn type_for_role(role: ComponentRole) -> Option<TypeId> {
         ComponentRole::Camera => jarvig_core::TYPE_CAMERA,
         ComponentRole::Pawn => TYPE_PAWN,
         ComponentRole::FreeFly => TYPE_FREE_FLY,
+        ComponentRole::Joint => jarvig_core::TYPE_JOINT,
+        ComponentRole::Terrain => jarvig_core::TYPE_TERRAIN,
         ComponentRole::WorldSettings => TYPE_ENVIRONMENT,
     })
 }
@@ -599,7 +606,10 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
 }
 
 fn command_in_header(command: InspectorCommand) -> bool {
-    matches!(command, InspectorCommand::RemoveComponent | InspectorCommand::ResetTransform | InspectorCommand::ResetMaterial)
+    matches!(
+        command,
+        InspectorCommand::RemoveComponent | InspectorCommand::ResetTransform | InspectorCommand::ResetMaterial | InspectorCommand::ResetPose
+    )
 }
 
 pub fn command_label(command: InspectorCommand) -> &'static str {
@@ -609,6 +619,304 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::ResetMaterial => "Reset",
         InspectorCommand::SetStartupCamera => "Set as Startup Camera",
         InspectorCommand::Recapture => "Recapture",
+        InspectorCommand::ResetPose => "Reset Pose",
+        InspectorCommand::CreateTerrain => "Create Terrain",
+    }
+}
+
+/// Terrain actor inspection when Land Mode is showing that actor instead of the tool row.
+pub fn build_entity(world: &jarvig_core::SceneWorld, id: EntityUuid, staged: &[String], mesh_assets: &[String]) -> InspectorModel {
+    let selection_revision = 0;
+    let world_revision = world.revision();
+    match world.inspect_entity(id) {
+        Ok(inspection) => {
+            let (header_name, header_kind) = headers(world, id);
+            InspectorModel {
+                selection_revision,
+                world_revision,
+                header_name,
+                header_kind,
+                body: InspectorBody::Entity { sections: sections_from(inspection, world, staged, mesh_assets) },
+            }
+        }
+        Err(_) => InspectorModel::empty(),
+    }
+}
+
+/// Editor-local size form. These numbers are not a terrain until Create Terrain runs.
+pub fn terrain_draft(width: f64, depth: f64, spacing: f64, chunk: f64, height: f64) -> InspectorModel {
+    let size = |field, label, value| draft_number(field, label, value, Some(0.01));
+    InspectorModel {
+        selection_revision: 0,
+        world_revision: 0,
+        header_name: "Create Terrain".into(),
+        header_kind: "Terrain".into(),
+        body: InspectorBody::Entity {
+            sections: vec![InspectorSection {
+                title: "Terrain".into(),
+                type_id: TYPE_TERRAIN,
+                fields: vec![
+                    size(jarvig_core::FIELD_TERRAIN_WIDTH, "Width", width),
+                    size(jarvig_core::FIELD_TERRAIN_DEPTH, "Depth", depth),
+                    size(jarvig_core::FIELD_TERRAIN_SPACING, "Meters Per Vertex", spacing),
+                    size(jarvig_core::FIELD_TERRAIN_CHUNK, "Chunk Size", chunk),
+                    draft_number(jarvig_core::FIELD_TERRAIN_HEIGHT, "Height", height, None),
+                ],
+                commands: vec![InspectorCommand::CreateTerrain],
+            }],
+        },
+    }
+}
+
+/// Editor-only Land controls. These field ids are not in the type registry and are not saved.
+pub const LAND_UI_GRID: FieldId = FieldId(220);
+pub const LAND_UI_MINOR: FieldId = FieldId(221);
+pub const LAND_UI_MAJOR: FieldId = FieldId(222);
+pub const LAND_UI_SNAP: FieldId = FieldId(224);
+pub const LAND_UI_RADIUS: FieldId = FieldId(225);
+pub const LAND_UI_STRENGTH: FieldId = FieldId(226);
+pub const LAND_UI_FALLOFF: FieldId = FieldId(227);
+pub const LAND_UI_WORLD: FieldId = FieldId(228);
+pub const LAND_UI_VERTS: FieldId = FieldId(229);
+pub const LAND_UI_CHUNKS: FieldId = FieldId(230);
+pub const LAND_UI_LOD: FieldId = FieldId(231);
+pub const LAND_UI_SHOW_TERRAIN: FieldId = FieldId(232);
+pub const LAND_UI_SHOW_HELPERS: FieldId = FieldId(233);
+pub const LAND_UI_SHOW_LIGHTING: FieldId = FieldId(234);
+pub const LAND_UI_SHOW_CHARACTERS: FieldId = FieldId(235);
+pub const LAND_UI_SHOW_PROPS: FieldId = FieldId(236);
+pub const LAND_UI_SHOW_GAMEPLAY: FieldId = FieldId(237);
+pub const LAND_UI_SHOW_FULL: FieldId = FieldId(238);
+
+pub fn is_land_ui(field: FieldId) -> bool {
+    (220..=238).contains(&field.0)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LandInspector {
+    pub grid: bool,
+    pub minor: f64,
+    pub major: f64,
+    pub snap: bool,
+    pub radius: f64,
+    pub strength: f64,
+    pub falloff: &'static str,
+    pub world: bool,
+    pub vertices: bool,
+    pub chunks: bool,
+    pub lod: bool,
+    pub show_terrain: bool,
+    pub show_helpers: bool,
+    pub show_lighting: bool,
+    pub show_characters: bool,
+    pub show_props: bool,
+    pub show_gameplay: bool,
+    pub show_full: bool,
+}
+
+/// Grid, brush, and debug overlay. Editor state. Not a terrain component and not a level entity.
+pub fn attach_land_workspace(model: &mut InspectorModel, land: LandInspector) {
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    sections.push(InspectorSection {
+        title: "Grid".into(),
+        type_id: TYPE_TERRAIN,
+        fields: vec![
+            land_check(LAND_UI_GRID, "Grid Overlay", land.grid),
+            land_check(LAND_UI_WORLD, "World Units", land.world),
+            land_number(LAND_UI_MINOR, "Minor Spacing", land.minor, Some(0.05)),
+            land_number(LAND_UI_MAJOR, "Major Spacing", land.major, Some(0.05)),
+            land_check(LAND_UI_SNAP, "Snap", land.snap),
+        ],
+        commands: Vec::new(),
+    });
+    sections.push(InspectorSection {
+        title: "Brush".into(),
+        type_id: TYPE_TERRAIN,
+        fields: vec![
+            land_number(LAND_UI_RADIUS, "Radius", land.radius, Some(0.05)),
+            land_number(LAND_UI_STRENGTH, "Strength", land.strength, Some(0.0)),
+            land_choice(LAND_UI_FALLOFF, "Falloff", land.falloff, &["Smooth", "Linear"]),
+        ],
+        commands: Vec::new(),
+    });
+    sections.push(InspectorSection {
+        title: "Debug Overlay".into(),
+        type_id: TYPE_TERRAIN,
+        fields: vec![
+            land_check(LAND_UI_VERTS, "Vertex Dots", land.vertices),
+            land_check(LAND_UI_CHUNKS, "Chunk Boundaries", land.chunks),
+            land_check(LAND_UI_LOD, "LOD Boundaries", land.lod),
+        ],
+        commands: Vec::new(),
+    });
+    sections.push(InspectorSection {
+        title: "Visibility".into(),
+        type_id: TYPE_TERRAIN,
+        fields: vec![
+            land_check(LAND_UI_SHOW_TERRAIN, "Terrain", land.show_terrain),
+            land_check(LAND_UI_SHOW_HELPERS, "Landscape Helpers", land.show_helpers),
+            land_check(LAND_UI_SHOW_LIGHTING, "Lighting", land.show_lighting),
+            land_check(LAND_UI_SHOW_CHARACTERS, "Characters", land.show_characters),
+            land_check(LAND_UI_SHOW_PROPS, "Props", land.show_props),
+            land_check(LAND_UI_SHOW_GAMEPLAY, "Gameplay Actors", land.show_gameplay),
+            land_check(LAND_UI_SHOW_FULL, "Show Full Level", land.show_full),
+        ],
+        commands: Vec::new(),
+    });
+}
+
+fn land_check(field: FieldId, label: &str, checked: bool) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_TERRAIN,
+        field,
+        label: label.into(),
+        units: String::new(),
+        display: if checked { "true".into() } else { "false".into() },
+        components: Vec::new(),
+        editable: true,
+        kind: ValueKind::Bool,
+        widget: WidgetKind::Check,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices: Vec::new(),
+        asset_type: String::new(),
+    }
+}
+
+fn land_number(field: FieldId, label: &str, value: f64, minimum: Option<f64>) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_TERRAIN,
+        field,
+        label: label.into(),
+        units: "m".into(),
+        display: format!("{value}"),
+        components: Vec::new(),
+        editable: true,
+        kind: ValueKind::Float64,
+        widget: WidgetKind::Number,
+        minimum,
+        maximum: None,
+        precision: 3,
+        step: 0.1,
+        choices: Vec::new(),
+        asset_type: String::new(),
+    }
+}
+
+fn land_choice(field: FieldId, label: &str, selected: &str, choices: &[&str]) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_TERRAIN,
+        field,
+        label: label.into(),
+        units: String::new(),
+        display: selected.into(),
+        components: Vec::new(),
+        editable: true,
+        kind: ValueKind::String,
+        widget: WidgetKind::Choice,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
+        asset_type: String::new(),
+    }
+}
+
+fn draft_number(field: FieldId, label: &str, value: f64, minimum: Option<f64>) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_TERRAIN,
+        field,
+        label: label.into(),
+        units: "m".into(),
+        display: format!("{value}"),
+        components: Vec::new(),
+        editable: true,
+        kind: ValueKind::Float64,
+        widget: WidgetKind::Number,
+        minimum,
+        maximum: None,
+        precision: 3,
+        step: 1.0,
+        choices: Vec::new(),
+        asset_type: String::new(),
+    }
+}
+
+/// Parent and child names for the selected joint. Display only. The pose stays the local frame.
+pub fn attach_joint_context(model: &mut InspectorModel, world: &jarvig_core::SceneWorld, entity: EntityUuid) {
+    let Some(joint) = world.authored_joint(entity) else { return };
+    model.header_kind = format!("{} joint", joint.kind.label());
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    let parent = world
+        .entity_parent(entity)
+        .ok()
+        .flatten()
+        .and_then(|id| world.entity_outline().into_iter().find(|row| row.uuid == id).map(|row| row.name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "World".into());
+    let children: Vec<String> = world
+        .entity_outline()
+        .into_iter()
+        .filter(|row| row.parent == Some(entity))
+        .map(|row| if row.name.is_empty() { "Unnamed".into() } else { row.name })
+        .collect();
+    let child = if children.is_empty() { "None".into() } else { children.join(", ") };
+    let kind = joint.kind;
+    if let Some(section) = sections.iter_mut().find(|section| section.title == "Joint") {
+        section.fields.retain(|field| match kind {
+            jarvig_core::JointKind::Fixed => !matches!(field.label.as_str(), "Axis" | "Secondary Axis"),
+            jarvig_core::JointKind::Universal => true,
+            _ => field.label != "Secondary Axis",
+        });
+        section.fields.insert(1, readonly_line(jarvig_core::FieldId(6701), "Parent", parent));
+        section.fields.insert(2, readonly_line(jarvig_core::FieldId(6702), "Child", child));
+        section.commands.insert(0, InspectorCommand::ResetPose);
+    }
+    if let Some(section) = sections.iter_mut().find(|section| section.title == "Limits") {
+        section.fields.retain(|field| limit_applies(kind, &field.label));
+    }
+    sections.retain(|section| section.title != "Limits" || !section.fields.is_empty());
+    let rank = |title: &str| match title {
+        "Joint" => 0,
+        "Limits" => 1,
+        "Actor" => 2,
+        "Transform" => 3,
+        "Mesh Renderer" => 4,
+        _ => 5,
+    };
+    sections.sort_by_key(|section| rank(&section.title));
+}
+
+fn limit_applies(kind: jarvig_core::JointKind, label: &str) -> bool {
+    match kind {
+        jarvig_core::JointKind::Fixed => false,
+        jarvig_core::JointKind::Hinge => matches!(label, "Hinge Min" | "Hinge Max"),
+        jarvig_core::JointKind::Ball => matches!(label, "Swing Cone" | "Twist Min" | "Twist Max"),
+        jarvig_core::JointKind::Universal => matches!(label, "Primary Min" | "Primary Max" | "Secondary Min" | "Secondary Max"),
+        jarvig_core::JointKind::Prismatic => matches!(label, "Slide Min" | "Slide Max"),
+    }
+}
+
+fn readonly_line(field: FieldId, label: &str, display: String) -> InspectorField {
+    InspectorField {
+        type_id: jarvig_core::TYPE_JOINT,
+        field,
+        label: label.to_string(),
+        units: String::new(),
+        display,
+        components: Vec::new(),
+        editable: false,
+        kind: ValueKind::String,
+        widget: WidgetKind::Readonly,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices: Vec::new(),
+        asset_type: String::new(),
     }
 }
 

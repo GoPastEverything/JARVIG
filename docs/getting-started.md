@@ -24,11 +24,13 @@ The editor opens on the Lighting Lab sample when it can find `samples/lighting-l
 
 ## Create a project
 
-1. Choose **File > New Project...**
+1. Choose **File > New Project**, then **Empty World**, **Terrain World**, **Third Person**, or **FPS**.
 2. Pick a folder and a name. The file must end in `.jarvigproject`.
 3. JARVIG writes the project file, `Content/`, `Config/`, and a startup level at `Content/Levels/<name>.jarviglevel`.
 
-A new level starts with World Settings, a directional light, a blue point light, a warm spot light, and a reflection probe. It does not start with a floor or a character. You add those.
+Empty World is World Settings only. Third Person and FPS are that same empty world. A pawn is not added yet. Terrain World opens in Land so you can create a heightfield.
+
+The toolbar words **Level**, **Land**, and **Character** are three views of that one level. Level shows the authored world. Land is where you create and sculpt terrain. The grid follows the ground, and characters stay hidden until Show Full Level. Character isolates a rig when the level has one. A level with no rig stays where it is.
 
 **File > Open Project...** opens an existing `.jarvigproject`. **File > Save** writes the open level. Save after you place anything you want to keep. Importing a mesh does not, by itself, rewrite the level file.
 

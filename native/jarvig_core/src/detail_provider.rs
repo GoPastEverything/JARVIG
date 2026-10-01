@@ -1,7 +1,9 @@
 //! Generic procedural-detail seam.
 //!
 //! Hosts ask this module for a detail provider. The default provider draws nothing.
-//! `ReferenceDetail` is a flat marker with no surface rule.
+//! `ReferenceDetail` is a flat marker with no surface rule. A private build may
+//! register another provider behind [`ProceduralMicrogeometry`] without putting
+//! that provider's source in a public tree.
 
 use crate::microgeometry::{
     projected_detail_px, MicroBudget, MicroMesh, MicroSpan, SurfaceAnchor, DETAIL_ERROR_THRESHOLD_PX, DETAIL_FEATURE_SIZE_M,
@@ -126,7 +128,7 @@ impl ProceduralMicrogeometry for ReferenceDetail {
     }
 }
 
-/// Selects the disabled provider or the flat reference marker.
+/// Public resolver. Private builds replace the meaning of `surface` in their own module.
 pub fn public_detail(surface: bool) -> Box<dyn ProceduralMicrogeometry> {
     if surface {
         Box::new(ReferenceDetail)

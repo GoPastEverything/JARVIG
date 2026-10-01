@@ -8,6 +8,8 @@
 //! Camera-relative float32 is not baked here. Each view subtracts its own origin
 //! later. This module does not know the renderer, the RHI, or wgpu.
 
+use std::collections::HashSet;
+
 use jarvig_material::MaterialInstanceId;
 
 use crate::level::{CameraRecord, LightRecord, MaterialAssetRef, MeshAssetRef, ProbeRecord, WorldSettingsRecord};
@@ -37,6 +39,20 @@ pub struct RenderFrameId(pub u64);
 /// Runtime camera record. Not [`EntityUuid`] and not the editor camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CameraId(pub u64);
+
+/// Runtime joint record. Not saved. The pose stays on the entity frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JointId(pub u64);
+
+/// One joint debug segment in root space. The editor turns it into an overlay.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointDebugSegment {
+    pub entity: EntityId,
+    pub start: Vec3,
+    pub end: Vec3,
+    pub color: [f32; 4],
+    pub limits: bool,
+}
 
 struct WorldObject {
     id: ObjectId,
@@ -104,7 +120,9 @@ pub struct EntityCapabilities {
     pub spot_light: bool,
     pub reflection_probe: bool,
     pub camera: bool,
+    pub joint: bool,
     pub world_settings: bool,
+    pub terrain: bool,
 }
 
 impl EntityCapabilities {
@@ -133,6 +151,8 @@ impl EntityCapabilities {
             crate::AuthoringClass::ReflectionProbe
         } else if self.camera {
             crate::AuthoringClass::Camera
+        } else if self.terrain {
+            crate::AuthoringClass::Terrain
         } else {
             crate::AuthoringClass::Empty
         }
@@ -151,6 +171,8 @@ pub enum ComponentRole {
     Camera,
     Pawn,
     FreeFly,
+    Joint,
+    Terrain,
     WorldSettings,
 }
 
@@ -166,6 +188,8 @@ impl ComponentRole {
             Self::Camera => "Camera",
             Self::Pawn => "Pawn",
             Self::FreeFly => "Free Fly",
+            Self::Joint => "Joint",
+            Self::Terrain => "Terrain",
             Self::WorldSettings => "World Settings",
         }
     }
@@ -180,11 +204,12 @@ pub struct ComponentBinding {
     pub light: Option<LightId>,
     pub probe: Option<ProbeId>,
     pub camera: Option<CameraId>,
+    pub joint: Option<JointId>,
 }
 
 impl ComponentBinding {
     fn role_only(role: ComponentRole) -> Self {
-        Self { role, object: None, mesh: None, light: None, probe: None, camera: None }
+        Self { role, object: None, mesh: None, light: None, probe: None, camera: None, joint: None }
     }
 }
 
@@ -205,6 +230,7 @@ pub struct EntityOwnership {
     pub light: Option<LightId>,
     pub probe: Option<ProbeId>,
     pub camera: Option<CameraId>,
+    pub joint: Option<JointId>,
 }
 
 const FOCUS_DEFAULT_RADIUS_M: f64 = 1.0;
@@ -223,6 +249,14 @@ pub struct SceneWorld {
     lights: Vec<WorldLight>,
     probes: Vec<WorldProbe>,
     game_cameras: Vec<WorldCamera>,
+    joints: Vec<WorldJoint>,
+    terrains: Vec<WorldTerrain>,
+    /// Chunk entities. Hidden from the outline and from the save.
+    derived_visuals: HashSet<EntityHandle>,
+    /// Mesh ids replaced by a sculpt. The editor evicts the GPU copy.
+    retired_meshes: Vec<MeshId>,
+    /// Chunks whose height samples changed and whose visual mesh may still be old.
+    terrain_dirty: Vec<crate::ChunkCoord>,
     environment: EnvironmentLight,
     environment_entity: EntityHandle,
     front: Camera,
@@ -240,6 +274,48 @@ pub struct SceneWorld {
     next_light: u64,
     next_probe: u64,
     next_camera: u64,
+    next_joint: u64,
+}
+
+/// Joint limits and rest pose. The live pose stays on the entity frame.
+struct WorldJoint {
+    id: JointId,
+    handle: EntityHandle,
+    record: crate::joint::JointRecord,
+}
+
+struct WorldTerrain {
+    handle: EntityHandle,
+    frame: FrameId,
+    record: crate::TerrainRecord,
+    chunks: Vec<TerrainChunk>,
+}
+
+struct TerrainChunk {
+    cx: u32,
+    cz: u32,
+    handle: EntityHandle,
+    object: ObjectId,
+    mesh: MeshId,
+}
+
+/// What a Land workspace draw is. Editor policy only. Not a saved class and not an outliner row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandDrawClass {
+    Terrain,
+    Character,
+    Prop,
+    Gameplay,
+}
+
+/// Heightfield numbers the surface grid needs. Not the samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainSurfaceMetrics {
+    pub half_x: f32,
+    pub half_z: f32,
+    pub spacing_m: f32,
+    pub chunk_m: f32,
+    pub lod_enabled: bool,
 }
 
 /// Sphere reflection probe. A frame owns the position. Not an entity and not a mesh.
@@ -364,6 +440,11 @@ impl SceneWorld {
             lights: Vec::new(),
             probes: Vec::new(),
             game_cameras: Vec::new(),
+            joints: Vec::new(),
+            terrains: Vec::new(),
+            derived_visuals: HashSet::new(),
+            retired_meshes: Vec::new(),
+            terrain_dirty: Vec::new(),
             environment: EnvironmentLight::bootstrap(),
             environment_entity: EntityHandle::INVALID,
             front: shared.front,
@@ -379,6 +460,7 @@ impl SceneWorld {
             next_light: 0,
             next_probe: 0,
             next_camera: 0,
+            next_joint: 0,
         };
         let near = world.insert_object(near_mesh, shared.near_object, Vec3::new(1.0, 1.0, 1.0));
         let far = world.insert_object(far_mesh, shared.far_object, Vec3::new(1.0, 1.0, 1.0));
@@ -507,6 +589,12 @@ impl SceneWorld {
         if type_id == crate::TYPE_FREE_FLY {
             return ComponentBinding::role_only(ComponentRole::FreeFly);
         }
+        if type_id == crate::TYPE_JOINT {
+            return ComponentBinding { role: ComponentRole::Joint, joint: ownership.joint, ..ComponentBinding::role_only(ComponentRole::Joint) };
+        }
+        if type_id == crate::TYPE_TERRAIN {
+            return ComponentBinding::role_only(ComponentRole::Terrain);
+        }
         ComponentBinding::role_only(ComponentRole::WorldSettings)
     }
 
@@ -547,7 +635,7 @@ impl SceneWorld {
         if type_id == crate::TYPE_ENVIRONMENT {
             return Err(AuthoringError::ProtectedEntity);
         }
-        if type_id == crate::TYPE_MESH_RENDERER {
+        if type_id == crate::TYPE_MESH_RENDERER || type_id == crate::TYPE_TERRAIN {
             return Err(AuthoringError::Unsupported);
         }
         if type_id == crate::TYPE_SPATIAL_FRAME {
@@ -574,6 +662,13 @@ impl SceneWorld {
             self.next_camera += 1;
             self.game_cameras.push(WorldCamera::default_on(CameraId(self.next_camera), handle));
         } else if type_id == crate::TYPE_PAWN || type_id == crate::TYPE_FREE_FLY {
+        } else if type_id == crate::TYPE_JOINT {
+            let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+            let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
+            let record = crate::joint::JointRecord::fixed_at(pose.translation, pose.rotation);
+            self.next_joint += 1;
+            self.joints.push(WorldJoint { id: JointId(self.next_joint), handle, record });
+            self.align_joint_frame(handle)?;
         } else if type_id == crate::TYPE_REFLECTION_PROBE {
             let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
             self.next_probe += 1;
@@ -605,6 +700,9 @@ impl SceneWorld {
         if self.is_world_settings(handle) && type_id == crate::TYPE_ENVIRONMENT {
             return Err(AuthoringError::ProtectedEntity);
         }
+        if type_id == crate::TYPE_TERRAIN {
+            return Err(AuthoringError::Unsupported);
+        }
         let owned = self.entities.membership(handle).map_err(|_| AuthoringError::NotFound)?.to_vec();
         if !owned.iter().any(|entry| entry.type_id == type_id && entry.slot == slot) {
             return Err(AuthoringError::NotFound);
@@ -621,6 +719,9 @@ impl SceneWorld {
             self.probes.retain(|probe| probe.handle != handle);
         } else if type_id == crate::TYPE_CAMERA {
             self.game_cameras.retain(|camera| camera.handle != handle);
+        } else if type_id == crate::TYPE_JOINT {
+            self.release_joint_to_scene(handle)?;
+            self.joints.retain(|joint| joint.handle != handle);
         } else if type_id == crate::TYPE_SPATIAL_FRAME {
             self.anchors.retain(|(anchor, _)| *anchor != handle);
         }
@@ -691,8 +792,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             }
         }
         let camera = self.game_cameras.iter().find(|camera| camera.handle == handle);
+        let joint = self.joints.iter().find(|joint| joint.handle == handle);
         capabilities.reflection_probe = probe.is_some();
         capabilities.camera = camera.is_some();
+        capabilities.joint = joint.is_some();
+        capabilities.terrain = self.terrains.iter().any(|terrain| terrain.handle == handle);
         capabilities.world_settings = handle == self.environment_entity;
         EntityOwnership {
             capabilities,
@@ -701,6 +805,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             light: light.map(|light| light.id),
             probe: probe.map(|probe| probe.id),
             camera: camera.map(|camera| camera.id),
+            joint: joint.map(|joint| joint.id),
         }
     }
 
@@ -721,6 +826,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.entities
             .outline()
             .into_iter()
+            .filter(|row| self.entities.find(row.uuid).ok().is_none_or(|handle| !self.derived_visuals.contains(&handle)))
             .map(|mut row| {
                 if let Ok(handle) = self.entities.find(row.uuid) {
                     row.class = self.class_of(handle);
@@ -777,6 +883,12 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             });
         }
         if let Some(section) = self.component_section(handle) {
+            sections.push(section);
+        }
+        if let Some(section) = self.joint_section(handle) {
+            sections.push(section);
+        }
+        if let Some(section) = self.terrain_section(handle) {
             sections.push(section);
         }
         let stack = self.stack_of_handle(handle);
@@ -935,6 +1047,77 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         None
     }
 
+    fn joint_section(&self, handle: EntityHandle) -> Option<InspectedSection> {
+        let joint = self.joints.iter().find(|joint| joint.handle == handle)?;
+        let info = crate::find_type(crate::TYPE_JOINT).expect("joint type");
+        let record = joint.record;
+        let limits = record.limits;
+        let kind = record.kind.label().to_string();
+        let degrees = |field, radians: f64| {
+            let value = radians.to_degrees();
+            inspected(info, field, PropertyValue::F64(value), crate::format_f64(value))
+        };
+        Some(InspectedSection {
+            type_info: *info,
+            fields: vec![
+                inspected(info, crate::FIELD_JOINT_KIND, PropertyValue::String(kind.clone()), kind),
+                inspected(info, crate::FIELD_JOINT_REST_TRANSLATION, PropertyValue::Vec3(record.rest_translation), crate::format_vec3(record.rest_translation)),
+                inspected(info, crate::FIELD_JOINT_REST_ROTATION, PropertyValue::Quat(record.rest_rotation), crate::format_quat(record.rest_rotation)),
+                inspected(info, crate::FIELD_JOINT_AXIS, PropertyValue::Vec3(limits.axis), crate::format_vec3(limits.axis)),
+                inspected(info, crate::FIELD_JOINT_SECONDARY_AXIS, PropertyValue::Vec3(limits.secondary_axis), crate::format_vec3(limits.secondary_axis)),
+                degrees(crate::FIELD_JOINT_HINGE_MIN, limits.hinge_min),
+                degrees(crate::FIELD_JOINT_HINGE_MAX, limits.hinge_max),
+                degrees(crate::FIELD_JOINT_SWING, limits.swing),
+                degrees(crate::FIELD_JOINT_TWIST_MIN, limits.twist_min),
+                degrees(crate::FIELD_JOINT_TWIST_MAX, limits.twist_max),
+                degrees(crate::FIELD_JOINT_PRIMARY_MIN, limits.primary_min),
+                degrees(crate::FIELD_JOINT_PRIMARY_MAX, limits.primary_max),
+                degrees(crate::FIELD_JOINT_SECONDARY_MIN, limits.secondary_min),
+                degrees(crate::FIELD_JOINT_SECONDARY_MAX, limits.secondary_max),
+                inspected(info, crate::FIELD_JOINT_LINEAR_MIN, PropertyValue::F64(limits.linear_min), crate::format_f64(limits.linear_min)),
+                inspected(info, crate::FIELD_JOINT_LINEAR_MAX, PropertyValue::F64(limits.linear_max), crate::format_f64(limits.linear_max)),
+                inspected(info, crate::FIELD_JOINT_STIFFNESS, PropertyValue::F64(record.stiffness), crate::format_f64(record.stiffness)),
+                inspected(info, crate::FIELD_JOINT_DAMPING, PropertyValue::F64(record.damping), crate::format_f64(record.damping)),
+            ],
+        })
+    }
+
+    fn terrain_section(&self, handle: EntityHandle) -> Option<InspectedSection> {
+        let terrain = self.terrains.iter().find(|terrain| terrain.handle == handle)?;
+        let info = crate::find_type(crate::TYPE_TERRAIN).expect("terrain type");
+        let record = &terrain.record;
+        let detail = &record.einstein;
+        let height = record.sample_height(0.0, 0.0).unwrap_or(0.0) as f64;
+        let number = |field, value: f64| inspected(info, field, PropertyValue::F64(value), crate::format_f64(value));
+        let flag = |field, value: bool| inspected(info, field, PropertyValue::Bool(value), bool_text(value));
+        Some(InspectedSection {
+            type_info: *info,
+            fields: vec![
+                number(crate::FIELD_TERRAIN_WIDTH, record.width_m as f64),
+                number(crate::FIELD_TERRAIN_DEPTH, record.depth_m as f64),
+                number(crate::FIELD_TERRAIN_SPACING, record.spacing_m as f64),
+                number(crate::FIELD_TERRAIN_CHUNK, record.chunk_m as f64),
+                number(crate::FIELD_TERRAIN_HEIGHT, height),
+                number(crate::FIELD_TERRAIN_HEIGHT_MIN, record.height_min as f64),
+                number(crate::FIELD_TERRAIN_HEIGHT_MAX, record.height_max as f64),
+                flag(crate::FIELD_TERRAIN_COLLISION, record.collision),
+                flag(crate::FIELD_TERRAIN_LOD, record.lod_enabled),
+                inspected(info, crate::FIELD_TERRAIN_MATERIAL, PropertyValue::String(record.material_name.clone()), record.material_name.clone()),
+                flag(crate::FIELD_TERRAIN_EINSTEIN, detail.enabled),
+                number(crate::FIELD_TERRAIN_SEED, detail.seed as f64),
+                number(crate::FIELD_TERRAIN_DENSITY, detail.density as f64),
+                number(crate::FIELD_TERRAIN_DISPLACEMENT, detail.max_displacement_m as f64),
+                number(crate::FIELD_TERRAIN_ERROR, detail.error_threshold_px as f64),
+                number(crate::FIELD_TERRAIN_DISTANCE, detail.distance_m as f64),
+                number(crate::FIELD_TERRAIN_CLASS, detail.surface_class as f64),
+                inspected(info, crate::FIELD_TERRAIN_CLIFF, PropertyValue::String(detail.cliff.label().into()), detail.cliff.label().into()),
+                flag(crate::FIELD_TERRAIN_DEBUG, record.debug_visualization),
+                flag(crate::FIELD_TERRAIN_DEBUG_COLORS, detail.debug_colors),
+                flag(crate::FIELD_TERRAIN_EINSTEIN_COLLISION, false),
+            ],
+        })
+    }
+
     pub fn set_entity_name(&mut self, id: EntityId, name: &str) -> Result<AuthoringResult, AuthoringError> {
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         if self.entities.name(handle).map_err(|_| AuthoringError::NotFound)? == name {
@@ -946,6 +1129,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     /// Local frame translation in meters. Binary64. Not a GPU matrix.
+    /// A joint clamps this through the same limits as a rotation edit.
     pub fn set_entity_local_translation(&mut self, id: EntityId, translation: Vec3) -> Result<AuthoringResult, AuthoringError> {
         if !translation.x.is_finite() || !translation.y.is_finite() || !translation.z.is_finite() {
             return Err(AuthoringError::InvalidValue);
@@ -953,24 +1137,44 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
         let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
-        if pose.translation == translation {
-            return Ok(AuthoringResult::Unchanged);
-        }
-        self.frames.set_local_translation(frame, translation).map_err(|_| AuthoringError::InvalidOperation)?;
-        self.revise();
-        Ok(AuthoringResult::Applied)
+        self.write_clamped_pose(handle, frame, pose.translation, pose.rotation, translation, pose.rotation)
     }
 
-    /// Local quaternion. Finite and normalizable. The inspector does not edit this field.
+    /// Local quaternion. Finite and normalizable. A joint clamps it before the write.
     pub fn set_entity_local_rotation(&mut self, id: EntityId, rotation: Quat) -> Result<AuthoringResult, AuthoringError> {
         let rotation = unit_quaternion(rotation)?;
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
         let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
-        if quaternion_matches(pose.rotation, rotation) {
+        self.write_clamped_pose(handle, frame, pose.translation, pose.rotation, pose.translation, rotation)
+    }
+
+    fn write_clamped_pose(
+        &mut self,
+        handle: EntityHandle,
+        frame: FrameId,
+        current_translation: Vec3,
+        current_rotation: Quat,
+        translation: Vec3,
+        rotation: Quat,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        let record = self.joints.iter().find(|joint| joint.handle == handle).map(|joint| joint.record);
+        let (translation, rotation) = if let Some(record) = record {
+            crate::joint::clamp_joint_pose(&record, translation, rotation)
+        } else {
+            (translation, rotation)
+        };
+        let translation_same = current_translation == translation;
+        let rotation_same = quaternion_matches(current_rotation, rotation);
+        if translation_same && rotation_same {
             return Ok(AuthoringResult::Unchanged);
         }
-        self.frames.set_local_rotation(frame, rotation).map_err(|_| AuthoringError::InvalidOperation)?;
+        if !translation_same {
+            self.frames.set_local_translation(frame, translation).map_err(|_| AuthoringError::InvalidOperation)?;
+        }
+        if !rotation_same {
+            self.frames.set_local_rotation(frame, rotation).map_err(|_| AuthoringError::InvalidOperation)?;
+        }
         self.revise();
         Ok(AuthoringResult::Applied)
     }
@@ -1127,6 +1331,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             EntityError::Missing | EntityError::Stale => AuthoringError::NotFound,
             EntityError::Duplicate => AuthoringError::InvalidOperation,
         })?;
+        self.align_joint_frame(handle)?;
         self.revise();
         Ok(())
     }
@@ -1149,6 +1354,13 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if self.is_world_settings(handle) {
             return Err(AuthoringError::ProtectedEntity);
         }
+        if self.derived_visuals.contains(&handle) {
+            return Err(AuthoringError::Unsupported);
+        }
+        if let Some(index) = self.terrains.iter().position(|terrain| terrain.handle == handle) {
+            self.retire_terrain_visuals(index);
+            self.terrains.remove(index);
+        }
         let children: Vec<EntityHandle> = self
             .entities
             .handles()
@@ -1161,6 +1373,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.lights.retain(|light| light.handle != handle);
         self.probes.retain(|probe| probe.handle != handle);
         self.game_cameras.retain(|camera| camera.handle != handle);
+        self.joints.retain(|joint| joint.handle != handle);
         self.anchors.retain(|(anchor, _)| *anchor != handle);
         let uuid = self.entities.retire(handle).map_err(|_| AuthoringError::NotFound)?;
         self.revise();
@@ -1182,6 +1395,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     fn duplicate_authored_handle(&mut self, handle: EntityHandle) -> Result<EntityId, AuthoringError> {
+        if self.derived_visuals.contains(&handle) || self.terrains.iter().any(|terrain| terrain.handle == handle) {
+            return Err(AuthoringError::Unsupported);
+        }
         let ownership = self.ownership_of_handle(handle);
         if ownership.capabilities.world_settings {
             return Err(AuthoringError::ProtectedEntity);
@@ -1221,6 +1437,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             (probe.frame, probe.radius_m, probe.priority, probe.intensity, probe.enabled)
         }));
         let game_camera = ownership.camera.and_then(|id| self.game_cameras.iter().find(|camera| camera.id == id).cloned());
+        let joint_record = self.joints.iter().find(|joint| joint.handle == handle).map(|joint| joint.record);
         let anchor = if ownership.capabilities.transform && ownership.capabilities.payload_count() == 0 {
             self.anchors.iter().find(|(anchor, _)| *anchor == handle).map(|(_, frame)| *frame)
         } else {
@@ -1284,6 +1501,10 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             self.copy_frame_record(frame, |world, copied| {
                 world.anchors.push((copy, copied));
             })?;
+        }
+        if let Some(record) = joint_record {
+            self.next_joint += 1;
+            self.joints.push(WorldJoint { id: JointId(self.next_joint), handle: copy, record });
         }
         self.revise();
         self.entities.uuid(copy).map_err(|_| AuthoringError::NotFound)
@@ -2059,10 +2280,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.lighting_revision = self.lighting_revision.saturating_add(1);
     }
 
-    /// Parent of the bootstrap cards. Lab objects hang here. Not the world root.
+    /// Scene frame under the billion-meter root. Empty worlds have no objects and still have this frame.
     pub fn scene_frame(&self) -> Result<FrameId, SpaceError> {
-        let object = self.objects.first().ok_or(SpaceError::MissingFrame)?;
-        self.frames.parent(object.frame)?.ok_or(SpaceError::MissingFrame)
+        Ok(self.scene)
     }
 
     /// Engine-owned validation object. New frame, new entity, shared mesh id supplied by the caller.
@@ -2123,6 +2343,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             lights: Vec::new(),
             probes: Vec::new(),
             game_cameras: Vec::new(),
+            joints: Vec::new(),
+            terrains: Vec::new(),
+            derived_visuals: HashSet::new(),
+            retired_meshes: Vec::new(),
+            terrain_dirty: Vec::new(),
             environment: EnvironmentLight::bootstrap(),
             environment_entity: EntityHandle::INVALID,
             front: camera(front),
@@ -2138,6 +2363,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             next_light: 0,
             next_probe: 0,
             next_camera: 0,
+            next_joint: 0,
         }
     }
 
@@ -2177,6 +2403,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
                     }
                 }
             }
+            self.alias_terrain_chunks(source, entity);
         }
         self.revision = source.revision;
         self.lighting_revision = source.lighting_revision;
@@ -2279,6 +2506,464 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             priority: camera.priority,
             viewport: camera.viewport,
         })
+    }
+
+    pub fn terrain_count(&self) -> usize {
+        self.terrains.len()
+    }
+
+    pub fn terrain_entity(&self) -> Option<EntityId> {
+        let terrain = self.terrains.first()?;
+        self.entities.uuid(terrain.handle).ok()
+    }
+
+    /// The terrain actor that owns `id`, including when `id` is a derived chunk.
+    pub fn terrain_owner(&self, id: EntityId) -> Option<EntityId> {
+        let handle = self.entities.find(id).ok()?;
+        if let Some(terrain) = self.terrains.iter().find(|terrain| terrain.handle == handle || terrain.chunks.iter().any(|chunk| chunk.handle == handle)) {
+            return self.entities.uuid(terrain.handle).ok();
+        }
+        None
+    }
+
+    pub fn terrain_chunk_objects(&self) -> Vec<ObjectId> {
+        self.terrains.iter().flat_map(|terrain| terrain.chunks.iter().map(|chunk| chunk.object)).collect()
+    }
+
+    pub fn take_retired_meshes(&mut self) -> Vec<MeshId> {
+        std::mem::take(&mut self.retired_meshes)
+    }
+
+    pub fn authored_terrain(&self, id: EntityId) -> Option<crate::TerrainRecord> {
+        let index = self.terrain_index(id).ok()?;
+        Some(self.terrains[index].record.clone())
+    }
+
+    pub fn set_authored_terrain(&mut self, id: EntityId, record: crate::TerrainRecord) -> Result<AuthoringResult, AuthoringError> {
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let index = self.terrain_index(id)?;
+        if self.terrains[index].record == record {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let geometry = {
+            let current = &self.terrains[index].record;
+            current.heights != record.heights
+                || current.width_m.to_bits() != record.width_m.to_bits()
+                || current.depth_m.to_bits() != record.depth_m.to_bits()
+                || current.spacing_m.to_bits() != record.spacing_m.to_bits()
+                || current.chunk_m.to_bits() != record.chunk_m.to_bits()
+        };
+        self.terrains[index].record = record;
+        if geometry {
+            self.rebuild_terrain_chunks(index)?;
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// One terrain actor in this foundation. The origin is scene-local meters, Y up.
+    pub fn create_terrain(&mut self, local: Vec3, record: crate::TerrainRecord) -> Result<EntityId, AuthoringError> {
+        if !self.terrains.is_empty() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let handle = self.entities.create();
+        self.entities.set_name(handle, "Terrain").map_err(|_| AuthoringError::InvalidOperation)?;
+        let frame = self.frames.add(Some(self.scene), HighPrecisionPose::at(local.x, local.y, local.z)).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.anchors.push((handle, frame));
+        self.grant(handle, crate::TYPE_SPATIAL_FRAME);
+        self.grant(handle, crate::TYPE_TERRAIN);
+        self.terrains.push(WorldTerrain { handle, frame, record, chunks: Vec::new() });
+        self.rebuild_terrain_chunks(self.terrains.len() - 1)?;
+        self.revise();
+        self.entities.uuid(handle).map_err(|_| AuthoringError::NotFound)
+    }
+
+    pub fn spawn_saved_terrain(
+        &mut self,
+        id: EntityId,
+        name: &str,
+        parent: Option<EntityId>,
+        local: HighPrecisionPose,
+        record: crate::TerrainRecord,
+    ) -> Result<(), AuthoringError> {
+        if !self.terrains.is_empty() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let parent_handle = self.parent_handle(parent)?;
+        let handle = self.entities.insert(id, parent_handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.entities.set_name(handle, name).map_err(|_| AuthoringError::InvalidOperation)?;
+        let frame = self.frames.add(Some(self.scene), local).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.anchors.push((handle, frame));
+        self.grant(handle, crate::TYPE_SPATIAL_FRAME);
+        self.grant(handle, crate::TYPE_TERRAIN);
+        self.terrains.push(WorldTerrain { handle, frame, record, chunks: Vec::new() });
+        self.rebuild_terrain_chunks(self.terrains.len() - 1)?;
+        self.revise();
+        Ok(())
+    }
+
+    pub fn stamp_terrain(
+        &mut self,
+        id: EntityId,
+        brush: crate::TerrainBrush,
+        local_x: f32,
+        local_z: f32,
+        radius_m: f32,
+        delta_m: f32,
+        layer: u8,
+        falloff: crate::TerrainFalloff,
+        flatten_to: Option<f32>,
+        rebuild_meshes: bool,
+    ) -> Result<crate::StampResult, AuthoringError> {
+        let index = self.terrain_index(id)?;
+        let result = self.terrains[index]
+            .record
+            .stamp(brush, local_x, local_z, radius_m, delta_m, layer, falloff, flatten_to)
+            .map_err(|_| AuthoringError::InvalidValue)?;
+        self.terrain_dirty = result.dirty.clone();
+        if result.height_changed {
+            if rebuild_meshes {
+                let dirty = result.dirty.clone();
+                for coord in dirty {
+                    self.sync_chunk(index, coord.x, coord.z)?;
+                }
+            }
+            self.revise();
+        }
+        Ok(result)
+    }
+
+    pub fn take_terrain_dirty(&mut self) -> Vec<crate::ChunkCoord> {
+        std::mem::take(&mut self.terrain_dirty)
+    }
+
+    pub fn terrain_chunk_mesh(&self, cx: u32, cz: u32) -> Option<MeshId> {
+        self.terrains.first()?.chunks.iter().find(|chunk| chunk.cx == cx && chunk.cz == cz).map(|chunk| chunk.mesh)
+    }
+
+    /// Replace derived chunk visuals. The heightfield is already authoritative. These meshes are not saved.
+    pub fn install_terrain_chunks(&mut self, id: EntityId, built: Vec<(u32, u32, Mesh)>) -> Result<(), AuthoringError> {
+        let index = self.terrain_index(id)?;
+        if built.is_empty() {
+            return Ok(());
+        }
+        for (cx, cz, mesh) in built {
+            let Some(existing) = self.terrains[index].chunks.iter().position(|chunk| chunk.cx == cx && chunk.cz == cz) else {
+                continue;
+            };
+            self.replace_chunk_mesh(index, existing, mesh);
+        }
+        self.revise();
+        Ok(())
+    }
+
+    pub fn terrain_overlay_lines(
+        &self,
+        mask: crate::TerrainOverlayMask,
+        minor_m: f32,
+        major_m: f32,
+        follow: bool,
+        focus_x: f32,
+        focus_z: f32,
+    ) -> Vec<crate::TerrainOverlayLine> {
+        let Some(terrain) = self.terrains.first() else { return Vec::new() };
+        crate::terrain_overlay_lines(&terrain.record, mask, minor_m, major_m, follow, focus_x, focus_z)
+    }
+
+    pub fn terrain_brush_ring(&self, local_x: f32, local_z: f32, radius_m: f32) -> Vec<[f32; 3]> {
+        let Some(terrain) = self.terrains.first() else { return Vec::new() };
+        crate::brush_ring(&terrain.record, local_x, local_z, radius_m, 48)
+    }
+
+    /// Chunk meshes the surface grid redraws. Not a second copy of the heightfield.
+    pub fn terrain_surface_meshes(&self) -> Vec<MeshId> {
+        self.terrains.iter().flat_map(|terrain| terrain.chunks.iter().map(|chunk| chunk.mesh)).collect()
+    }
+
+    /// Spacing and extents for the surface grid. Does not clone the samples.
+    pub fn terrain_surface_metrics(&self) -> Option<TerrainSurfaceMetrics> {
+        let record = &self.terrains.first()?.record;
+        Some(TerrainSurfaceMetrics {
+            half_x: record.width_m * 0.5,
+            half_z: record.depth_m * 0.5,
+            spacing_m: record.spacing_m,
+            chunk_m: record.chunk_m,
+            lod_enabled: record.lod_enabled,
+        })
+    }
+
+    /// Meshes the Land workspace can show or hide. Derived chunks are terrain. A joint mesh is a character.
+    pub fn land_draw_actors(&self) -> Vec<(EntityId, LandDrawClass)> {
+        let mut actors = Vec::new();
+        for object in &self.objects {
+            let Ok(id) = self.entities.uuid(object.handle) else { continue };
+            let class = if self.derived_visuals.contains(&object.handle) {
+                LandDrawClass::Terrain
+            } else if self.joints.iter().any(|joint| joint.handle == object.handle) {
+                LandDrawClass::Character
+            } else if self.membership_has(object.handle, crate::TYPE_PAWN) || self.membership_has(object.handle, crate::TYPE_FREE_FLY) {
+                LandDrawClass::Gameplay
+            } else {
+                LandDrawClass::Prop
+            };
+            actors.push((id, class));
+        }
+        actors
+    }
+
+    fn membership_has(&self, handle: EntityHandle, type_id: crate::TypeId) -> bool {
+        self.entities.membership(handle).ok().is_some_and(|entries| entries.iter().any(|entry| entry.type_id == type_id))
+    }
+
+    /// Collision height in terrain-local meters. `None` when base collision is off or the point is outside.
+    pub fn terrain_height_at(&self, local_x: f32, local_z: f32) -> Option<f32> {
+        self.terrains.first()?.record.height_at(local_x, local_z)
+    }
+
+    /// World ray minus the terrain pose in binary64, then narrowed. The absolute root is never stored in the heightfield.
+    pub fn terrain_ray_local(&self, id: EntityId, origin: Vec3, direction: Vec3) -> Option<crate::TerrainHit> {
+        let index = self.terrain_index(id).ok()?;
+        let pose = self.frames.resolve(self.terrains[index].frame).ok()?;
+        let delta = Vec3::new(origin.x - pose.translation.x, origin.y - pose.translation.y, origin.z - pose.translation.z);
+        let local = pose.rotation.conjugate().rotate(delta);
+        let dir = pose.rotation.conjugate().rotate(direction);
+        self.terrains[index].record.ray_heightfield([local.x as f32, local.y as f32, local.z as f32], [dir.x as f32, dir.y as f32, dir.z as f32])
+    }
+
+    fn terrain_index(&self, id: EntityId) -> Result<usize, AuthoringError> {
+        self.terrains.iter().position(|terrain| self.entities.uuid(terrain.handle).ok() == Some(id)).ok_or(AuthoringError::NotFound)
+    }
+
+    fn rebuild_terrain_chunks(&mut self, index: usize) -> Result<(), AuthoringError> {
+        let (chunks_x, chunks_z) = {
+            let record = &self.terrains[index].record;
+            (record.chunks_x(), record.chunks_z())
+        };
+        let existing = std::mem::take(&mut self.terrains[index].chunks);
+        let mut kept = Vec::new();
+        for chunk in existing {
+            if chunk.cx < chunks_x && chunk.cz < chunks_z {
+                kept.push(chunk);
+            } else {
+                self.drop_chunk_visual(chunk);
+            }
+        }
+        self.terrains[index].chunks = kept;
+        for cz in 0..chunks_z {
+            for cx in 0..chunks_x {
+                self.sync_chunk(index, cx, cz)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_chunk_mesh(&mut self, index: usize, existing: usize, mesh: Mesh) {
+        let old_mesh = self.terrains[index].chunks[existing].mesh;
+        let object = self.terrains[index].chunks[existing].object;
+        let id = self.meshes.insert(mesh);
+        self.retired_meshes.push(old_mesh);
+        self.meshes.remove(old_mesh);
+        if let Some(slot) = self.objects.iter_mut().find(|candidate| candidate.id == object) {
+            slot.mesh = id;
+            slot.cast_shadows = false;
+        }
+        self.terrains[index].chunks[existing].mesh = id;
+    }
+
+    fn sync_chunk(&mut self, index: usize, cx: u32, cz: u32) -> Result<(), AuthoringError> {
+        let mesh = self.terrains[index].record.chunk_mesh(cx, cz).map_err(|_| AuthoringError::InvalidValue)?;
+        let material_name = self.terrains[index].record.material_name.clone();
+        let base_color = self.terrains[index].record.base_color;
+        let metallic = self.terrains[index].record.metallic;
+        let roughness = self.terrains[index].record.roughness;
+        let chunk_m = self.terrains[index].record.chunk_m;
+        let owner = self.terrains[index].handle;
+        let frame = self.terrains[index].frame;
+        let material = MaterialAssetRef::builtin(material_name, base_color, metallic, roughness, [0.0, 0.0, 0.0, 1.0]);
+        let mesh_ref = MeshAssetRef::Floor { width_m: chunk_m as f64, depth_m: chunk_m as f64 };
+        if let Some(existing) = self.terrains[index].chunks.iter().position(|chunk| chunk.cx == cx && chunk.cz == cz) {
+            self.replace_chunk_mesh(index, existing, mesh);
+            let object = self.terrains[index].chunks[existing].object;
+            if let Some(slot) = self.objects.iter_mut().find(|candidate| candidate.id == object) {
+                slot.authored_mesh = Some(mesh_ref);
+                slot.authored_material = Some(material);
+            }
+        } else {
+            let id = self.meshes.insert(mesh);
+            let handle = self.entities.create();
+            self.entities.set_name(handle, &format!("Terrain {cx} {cz}")).map_err(|_| AuthoringError::InvalidOperation)?;
+            self.entities.set_parent(handle, Some(owner)).map_err(|_| AuthoringError::InvalidOperation)?;
+            let object = self.insert_object_with_handle(id, frame, Vec3::new(1.0, 1.0, 1.0), handle);
+            if let Some(slot) = self.objects.iter_mut().find(|candidate| candidate.id == object) {
+                slot.cast_shadows = false;
+                slot.authored_mesh = Some(mesh_ref);
+                slot.authored_material = Some(material);
+            }
+            self.derived_visuals.insert(handle);
+            self.terrains[index].chunks.push(TerrainChunk { cx, cz, handle, object, mesh: id });
+        }
+        Ok(())
+    }
+
+    fn drop_chunk_visual(&mut self, chunk: TerrainChunk) {
+        self.derived_visuals.remove(&chunk.handle);
+        self.objects.retain(|object| object.id != chunk.object);
+        self.meshes.remove(chunk.mesh);
+        self.retired_meshes.push(chunk.mesh);
+        let _ = self.entities.retire(chunk.handle);
+    }
+
+    fn retire_terrain_visuals(&mut self, index: usize) {
+        let chunks = std::mem::take(&mut self.terrains[index].chunks);
+        for chunk in chunks {
+            self.drop_chunk_visual(chunk);
+        }
+    }
+
+    fn alias_terrain_chunks(&mut self, source: &SceneWorld, entity: EntityId) {
+        let Some(source_index) = source.terrains.iter().position(|terrain| source.entities.uuid(terrain.handle).ok() == Some(entity)) else {
+            return;
+        };
+        let Some(index) = self.terrains.iter().position(|terrain| self.entities.uuid(terrain.handle).ok() == Some(entity)) else {
+            return;
+        };
+        let plan: Vec<(u32, u32, MeshId, RenderInstanceId, Mesh)> = source.terrains[source_index]
+            .chunks
+            .iter()
+            .filter_map(|chunk| {
+                let mesh = source.meshes.get(chunk.mesh)?.clone();
+                let render = source.objects.iter().find(|object| object.id == chunk.object)?.render_id;
+                Some((chunk.cx, chunk.cz, chunk.mesh, render, mesh))
+            })
+            .collect();
+        for (cx, cz, mesh_id, render_id, mesh) in plan {
+            let Some(chunk_index) = self.terrains[index].chunks.iter().position(|chunk| chunk.cx == cx && chunk.cz == cz) else {
+                continue;
+            };
+            let runtime_mesh = self.terrains[index].chunks[chunk_index].mesh;
+            let object = self.terrains[index].chunks[chunk_index].object;
+            if let Some(slot) = self.objects.iter_mut().find(|candidate| candidate.id == object) {
+                slot.mesh = mesh_id;
+                slot.render_id = render_id;
+            }
+            self.terrains[index].chunks[chunk_index].mesh = mesh_id;
+            self.meshes.insert_exact(mesh_id, mesh);
+            if runtime_mesh != mesh_id {
+                self.meshes.remove(runtime_mesh);
+                self.retired_meshes.push(runtime_mesh);
+            }
+        }
+    }
+
+    pub fn authored_joint(&self, id: EntityId) -> Option<crate::joint::JointRecord> {
+        let handle = self.entities.find(id).ok()?;
+        self.joints.iter().find(|joint| joint.handle == handle).map(|joint| joint.record)
+    }
+
+    pub fn set_authored_joint(&mut self, id: EntityId, record: crate::joint::JointRecord) -> Result<AuthoringResult, AuthoringError> {
+        let record = record.validate()?;
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let unchanged = {
+            let slot = self.joints.iter_mut().find(|joint| joint.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
+            if slot.record == record {
+                true
+            } else {
+                slot.record = record;
+                false
+            }
+        };
+        if unchanged {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
+        let (translation, rotation) = crate::joint::clamp_joint_pose(&record, pose.translation, pose.rotation);
+        self.frames.set_local_translation(frame, translation).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.frames.set_local_rotation(frame, rotation).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Parents a joint frame to the parent entity's frame and keeps the stored local pose.
+    pub fn attach_joint(&mut self, id: EntityId, record: crate::joint::JointRecord) -> Result<(), AuthoringError> {
+        let record = record.validate()?;
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        if self.joints.iter().any(|joint| joint.handle == handle) {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let _frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.next_joint += 1;
+        self.joints.push(WorldJoint { id: JointId(self.next_joint), handle, record });
+        self.grant(handle, crate::TYPE_JOINT);
+        self.align_joint_frame(handle)?;
+        self.revise();
+        Ok(())
+    }
+
+    /// A frame with no mesh. Used when a saved joint has no other payload.
+    pub fn spawn_saved_transform(&mut self, id: EntityId, name: &str, parent: Option<EntityId>, local: HighPrecisionPose) -> Result<(), AuthoringError> {
+        let parent_handle = self.parent_handle(parent)?;
+        let handle = self.entities.insert(id, parent_handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.entities.set_name(handle, name).map_err(|_| AuthoringError::InvalidOperation)?;
+        let frame = self.frames.add(Some(self.scene), local).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.anchors.push((handle, frame));
+        self.grant(handle, crate::TYPE_SPATIAL_FRAME);
+        self.revise();
+        Ok(())
+    }
+
+    /// World-space overlay segments. Limit marks are drawn for `selected` only.
+    pub fn joint_debug_segments(&self, selected: Option<EntityId>) -> Vec<JointDebugSegment> {
+        let mut segments = Vec::new();
+        for joint in &self.joints {
+            let Ok(frame) = self.frame_of(joint.handle) else { continue };
+            let Ok(pose) = self.frames.resolve(frame) else { continue };
+            let Ok(entity) = self.entities.uuid(joint.handle) else { continue };
+            let selected_this = selected.is_some_and(|id| self.entities.find(id).ok() == Some(joint.handle));
+            for line in crate::joint::joint_debug_lines(&joint.record, selected_this) {
+                segments.push(JointDebugSegment {
+                    entity,
+                    start: pose.translation + pose.rotation.rotate(line.from),
+                    end: pose.translation + pose.rotation.rotate(line.to),
+                    color: line.color,
+                    limits: line.limits,
+                });
+            }
+        }
+        segments
+    }
+
+    fn align_joint_frame(&mut self, handle: EntityHandle) -> Result<(), AuthoringError> {
+        if !self.joints.iter().any(|joint| joint.handle == handle) {
+            return Ok(());
+        }
+        let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        let parent_entity = self.entities.parent(handle).map_err(|_| AuthoringError::NotFound)?;
+        let parent_frame = match parent_entity {
+            Some(parent) => self.frame_of(parent).unwrap_or(self.scene),
+            None => self.scene,
+        };
+        if parent_frame == frame {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        self.frames.set_parent(frame, Some(parent_frame)).map_err(|_| AuthoringError::InvalidOperation)?;
+        Ok(())
+    }
+
+    /// Puts the frame back under the scene frame and keeps the world pose.
+    fn release_joint_to_scene(&mut self, handle: EntityHandle) -> Result<(), AuthoringError> {
+        let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        let world = self.frames.resolve(frame).map_err(|_| AuthoringError::InvalidOperation)?;
+        let scene = self.frames.resolve(self.scene).map_err(|_| AuthoringError::InvalidOperation)?;
+        let delta = Vec3::new(world.translation.x - scene.translation.x, world.translation.y - scene.translation.y, world.translation.z - scene.translation.z);
+        let local_translation = scene.rotation.conjugate().rotate(delta);
+        let local_rotation = unit_quaternion(scene.rotation.conjugate().mul(world.rotation))?;
+        self.frames.set_parent(frame, Some(self.scene)).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.frames.set_local_translation(frame, local_translation).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.frames.set_local_rotation(frame, local_rotation).map_err(|_| AuthoringError::InvalidOperation)?;
+        Ok(())
     }
 
     pub fn spawn_saved_camera(
@@ -2746,6 +3431,7 @@ fn mesh_choice_name(mesh: &crate::MeshAssetRef) -> String {
     match mesh {
         crate::MeshAssetRef::Cube { .. } => "Cube".into(),
         crate::MeshAssetRef::Sphere { .. } => "Sphere".into(),
+        crate::MeshAssetRef::Capsule { .. } => "Capsule".into(),
         crate::MeshAssetRef::Floor { .. } => "Plane".into(),
         crate::MeshAssetRef::NearTriangle | crate::MeshAssetRef::FarTriangle => "Triangle".into(),
         crate::MeshAssetRef::EmissivePanel { .. } => "Panel".into(),

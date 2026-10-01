@@ -19,6 +19,10 @@ pub const LEVEL_SCHEMA: &str = "jarvig.level";
 pub const LEVEL_FORMAT_VERSION: u32 = 1;
 /// Cameras are version 2. Version 1 files still load. A save writes 2 only when a camera is present.
 pub const LEVEL_CAMERA_VERSION: u32 = 2;
+/// Joints are version 3. Version 1 and 2 files still load. A save writes 3 only when a joint is present.
+pub const LEVEL_JOINT_VERSION: u32 = 3;
+/// Terrain is version 4. Versions 1–3 still load. A save writes 4 only when a terrain component is present.
+pub const LEVEL_TERRAIN_VERSION: u32 = 4;
 
 /// Fixed identity for the regression level. Not a runtime slot.
 pub const LIGHTING_LAB_LEVEL_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -61,6 +65,9 @@ pub enum ComponentRecord {
     SpotLight(LightRecord),
     ReflectionProbe(ProbeRecord),
     Camera(CameraRecord),
+    Joint(crate::joint::JointRecord),
+    /// Authoritative heightfield. Chunk meshes are rebuilt on load and are not stored.
+    Terrain(crate::TerrainRecord),
     WorldSettings,
 }
 
@@ -104,6 +111,8 @@ pub enum MeshAssetRef {
     Floor { width_m: f64, depth_m: f64 },
     Cube { size_m: f64 },
     Sphere { radius_m: f64, segments: u32, rings: u32, flat: bool },
+    /// Straight section along Y, plus a hemisphere of `radius_m` at each end.
+    Capsule { radius_m: f64, height_m: f64 },
     EmissivePanel { width_m: f64, height_m: f64 },
     /// A project mesh asset. The id is the reference. The name is a label.
     Asset { id: crate::AssetId, name: String },
@@ -156,7 +165,7 @@ impl fmt::Display for LevelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax(text) | Self::Corrupt(text) | Self::UnknownComponent(text) | Self::MissingAsset(text) => write!(formatter, "{text}"),
-            Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_CAMERA_VERSION}"),
+            Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_TERRAIN_VERSION}"),
             Self::DuplicateUuid(uuid) => write!(formatter, "duplicate entity uuid {uuid}"),
             Self::InvalidParent(uuid) => write!(formatter, "parent uuid {uuid} is not in the level"),
             Self::Cycle(uuid) => write!(formatter, "parent cycle includes {uuid}"),
@@ -176,7 +185,7 @@ impl LevelDocument {
         if self.format_version == 0 {
             return Err(LevelError::Corrupt("level format version is missing".into()));
         }
-        if self.format_version > LEVEL_CAMERA_VERSION {
+        if self.format_version > LEVEL_TERRAIN_VERSION {
             return Err(LevelError::UnsupportedVersion(self.format_version));
         }
         if self.name.is_empty() || !self.level_uuid.is_persistent() {
@@ -223,6 +232,8 @@ impl LevelDocument {
                         | ComponentRecord::SpotLight(_)
                         | ComponentRecord::ReflectionProbe(_)
                         | ComponentRecord::Camera(_)
+                        | ComponentRecord::Joint(_)
+                        | ComponentRecord::Terrain(_)
                 )
             });
             if needs_transform && !has_transform {
@@ -233,6 +244,18 @@ impl LevelDocument {
             }
             if let Some(ComponentRecord::Camera(camera)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::Camera(_))) {
                 camera.validate()?;
+            }
+            if let Some(ComponentRecord::Joint(joint)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::Joint(_))) {
+                if self.format_version < LEVEL_JOINT_VERSION {
+                    return Err(LevelError::Corrupt(format!("entity {text} has a joint, which needs level format {LEVEL_JOINT_VERSION}")));
+                }
+                joint.validate().map_err(|error| LevelError::Corrupt(error.to_string()))?;
+            }
+            if let Some(ComponentRecord::Terrain(terrain)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::Terrain(_))) {
+                if self.format_version < LEVEL_TERRAIN_VERSION {
+                    return Err(LevelError::Corrupt(format!("entity {text} has terrain, which needs level format {LEVEL_TERRAIN_VERSION}")));
+                }
+                terrain.validate().map_err(|error| LevelError::Corrupt(format!("terrain on {text} is not valid ({error:?})")))?;
             }
         }
         if settings != 1 {
@@ -356,13 +379,34 @@ impl LevelDocument {
                 let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
                 components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
                 components.push(ComponentRecord::Camera(camera));
+            } else if let Some(terrain) = world.authored_terrain(row.uuid) {
+                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                components.push(ComponentRecord::Terrain(terrain));
             } else if let Some((translation, rotation)) = world.authored_local_pose(row.uuid) {
                 components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+            }
+            if world.authored_world_settings(row.uuid).is_none() {
+                if let Some(joint) = world.authored_joint(row.uuid) {
+                    if !components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. })) {
+                        if let Some((translation, rotation)) = world.authored_local_pose(row.uuid) {
+                            components.insert(0, ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                        }
+                    }
+                    components.push(ComponentRecord::Joint(joint));
+                }
             }
             entities.push(EntityRecord { uuid: row.uuid, name: row.name, parent_uuid: parent, components });
         }
         let world_settings = settings.ok_or(LevelError::MissingWorldSettings)?;
-        let format_version = if entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_)))) {
+        let has_terrain = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Terrain(_))));
+        let has_joint = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Joint(_))));
+        let has_camera = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_))));
+        let format_version = if has_terrain {
+            LEVEL_TERRAIN_VERSION
+        } else if has_joint {
+            LEVEL_JOINT_VERSION
+        } else if has_camera {
             LEVEL_CAMERA_VERSION
         } else {
             LEVEL_FORMAT_VERSION
@@ -493,6 +537,7 @@ impl MeshAssetRef {
             Self::Cube { size_m } => cube_mesh(size_m as f32),
             Self::Sphere { radius_m, segments, rings, flat: false } => sphere_mesh(radius_m as f32, segments, rings),
             Self::Sphere { radius_m, segments, rings, flat: true } => flat_sphere_mesh(radius_m as f32, segments, rings),
+            Self::Capsule { radius_m, height_m } => crate::capsule_mesh(radius_m as f32, height_m as f32),
             Self::EmissivePanel { width_m, height_m } => emissive_panel_mesh(width_m as f32, height_m as f32),
             Self::Asset { .. } => unreachable!("asset meshes are resolved before instantiate"),
         }
@@ -527,6 +572,7 @@ impl MeshAssetRef {
                     ("rings", Json::int(rings as i64)),
                 ],
             ),
+            Self::Capsule { radius_m, height_m } => builtin_mesh("capsule", vec![("radius_m", Json::number(radius_m)), ("height_m", Json::number(height_m))]),
             Self::EmissivePanel { width_m, height_m } => {
                 builtin_mesh("emissive_panel", vec![("width_m", Json::number(width_m)), ("height_m", Json::number(height_m))])
             }
@@ -578,13 +624,15 @@ impl ComponentRecord {
             Self::SpotLight(_) => "SpotLight",
             Self::ReflectionProbe(_) => "ReflectionProbe",
             Self::Camera(_) => "Camera",
+            Self::Joint(_) => "Joint",
+            Self::Terrain(_) => "Terrain",
             Self::WorldSettings => "WorldSettings",
         }
     }
 }
 
 impl EntityRecord {
-    fn to_json(&self) -> Json {
+    pub(crate) fn to_json(&self) -> Json {
         let parent = match self.parent_uuid {
             Some(parent) => Json::string(parent.to_string()),
             None => Json::Null,
@@ -630,6 +678,8 @@ impl ComponentRecord {
                 ("resolution", Json::int(probe.resolution as i64)),
             ]),
             Self::Camera(camera) => camera.to_json(),
+            Self::Joint(joint) => joint_json(joint),
+            Self::Terrain(terrain) => terrain_json(terrain),
             Self::WorldSettings => Json::object(vec![("type", Json::string("WorldSettings")), ("version", Json::int(1))]),
         }
     }
@@ -666,7 +716,7 @@ pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
         return Err(LevelError::Corrupt(format!("schema {schema} is not {LEVEL_SCHEMA}")));
     }
     let format_version = required_u32(&json, "format_version")?;
-    if format_version > LEVEL_CAMERA_VERSION {
+    if format_version > LEVEL_TERRAIN_VERSION {
         return Err(LevelError::UnsupportedVersion(format_version));
     }
     let level_uuid = parse_uuid(required_str(&json, "level_uuid")?)?;
@@ -682,7 +732,7 @@ pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
     Ok(document)
 }
 
-fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settings: &WorldSettingsRecord) -> Result<(), LevelError> {
+pub(crate) fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settings: &WorldSettingsRecord) -> Result<(), LevelError> {
     let transform = entity.components.iter().find_map(|component| match component {
         ComponentRecord::Transform { translation, rotation, scale } => Some((*translation, *rotation, *scale)),
         _ => None,
@@ -724,6 +774,15 @@ fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settings: &WorldS
             ComponentRecord::Camera(camera) => {
                 world.spawn_saved_camera(entity.uuid, &entity.name, entity.parent_uuid, pose, camera.clone()).map_err(authoring)?;
             }
+            ComponentRecord::Joint(joint) => {
+                if world.entity_ownership(entity.uuid).is_err() {
+                    world.spawn_saved_transform(entity.uuid, &entity.name, entity.parent_uuid, pose).map_err(authoring)?;
+                }
+                world.attach_joint(entity.uuid, *joint).map_err(authoring)?;
+            }
+            ComponentRecord::Terrain(terrain) => {
+                world.spawn_saved_terrain(entity.uuid, &entity.name, entity.parent_uuid, pose, terrain.clone()).map_err(authoring)?;
+            }
         }
     }
     Ok(())
@@ -737,7 +796,7 @@ fn authoring(error: AuthoringError) -> LevelError {
     LevelError::Corrupt(error.to_string())
 }
 
-fn parse_entity(json: &Json) -> Result<EntityRecord, LevelError> {
+pub(crate) fn parse_entity(json: &Json) -> Result<EntityRecord, LevelError> {
     let uuid = parse_uuid(required_str(json, "uuid")?)?;
     let name = required_str(json, "name")?.to_string();
     let parent_uuid = match json.get("parent_uuid") {
@@ -751,6 +810,136 @@ fn parse_entity(json: &Json) -> Result<EntityRecord, LevelError> {
         components.push(parse_component(component)?);
     }
     Ok(EntityRecord { uuid, name, parent_uuid, components })
+}
+
+fn joint_json(joint: &crate::joint::JointRecord) -> Json {
+    let limits = joint.limits;
+    Json::object(vec![
+        ("type", Json::string("Joint")),
+        ("version", Json::int(1)),
+        ("kind", Json::string(joint.kind.label())),
+        ("rest_translation", vec3_json(joint.rest_translation)),
+        ("rest_rotation", quat_json(joint.rest_rotation)),
+        ("axis", vec3_json(limits.axis)),
+        ("secondary_axis", vec3_json(limits.secondary_axis)),
+        ("hinge_min_rad", Json::number(limits.hinge_min)),
+        ("hinge_max_rad", Json::number(limits.hinge_max)),
+        ("swing_rad", Json::number(limits.swing)),
+        ("twist_min_rad", Json::number(limits.twist_min)),
+        ("twist_max_rad", Json::number(limits.twist_max)),
+        ("primary_min_rad", Json::number(limits.primary_min)),
+        ("primary_max_rad", Json::number(limits.primary_max)),
+        ("secondary_min_rad", Json::number(limits.secondary_min)),
+        ("secondary_max_rad", Json::number(limits.secondary_max)),
+        ("linear_min_m", Json::number(limits.linear_min)),
+        ("linear_max_m", Json::number(limits.linear_max)),
+        ("stiffness", Json::number(joint.stiffness)),
+        ("damping", Json::number(joint.damping)),
+    ])
+}
+
+fn parse_joint(json: &Json) -> Result<crate::joint::JointRecord, LevelError> {
+    let kind = crate::joint::JointKind::parse(required_str(json, "kind")?).ok_or_else(|| LevelError::Corrupt("joint kind is unknown".into()))?;
+    let joint = crate::joint::JointRecord {
+        kind,
+        rest_translation: required_vec3(json, "rest_translation")?,
+        rest_rotation: required_quat(json, "rest_rotation")?,
+        limits: crate::joint::JointLimits {
+            axis: required_vec3(json, "axis")?,
+            secondary_axis: required_vec3(json, "secondary_axis")?,
+            hinge_min: required_f64(json, "hinge_min_rad")?,
+            hinge_max: required_f64(json, "hinge_max_rad")?,
+            swing: required_f64(json, "swing_rad")?,
+            twist_min: required_f64(json, "twist_min_rad")?,
+            twist_max: required_f64(json, "twist_max_rad")?,
+            primary_min: required_f64(json, "primary_min_rad")?,
+            primary_max: required_f64(json, "primary_max_rad")?,
+            secondary_min: required_f64(json, "secondary_min_rad")?,
+            secondary_max: required_f64(json, "secondary_max_rad")?,
+            linear_min: required_f64(json, "linear_min_m")?,
+            linear_max: required_f64(json, "linear_max_m")?,
+        },
+        stiffness: required_f64(json, "stiffness")?,
+        damping: required_f64(json, "damping")?,
+    };
+    joint.validate().map_err(|error| LevelError::Corrupt(error.to_string()))
+}
+
+fn terrain_json(record: &crate::TerrainRecord) -> Json {
+    let detail = &record.einstein;
+    Json::object(vec![
+        ("type", Json::string("Terrain")),
+        ("version", Json::int(1)),
+        ("width_m", Json::number(record.width_m as f64)),
+        ("depth_m", Json::number(record.depth_m as f64)),
+        ("spacing_m", Json::number(record.spacing_m as f64)),
+        ("chunk_m", Json::number(record.chunk_m as f64)),
+        ("height_min", Json::number(record.height_min as f64)),
+        ("height_max", Json::number(record.height_max as f64)),
+        ("collision", Json::bool(record.collision)),
+        ("lod", Json::bool(record.lod_enabled)),
+        ("debug", Json::bool(record.debug_visualization)),
+        ("material", Json::string(&record.material_name)),
+        ("base_color", float4_json(record.base_color)),
+        ("metallic", Json::number(record.metallic as f64)),
+        ("roughness", Json::number(record.roughness as f64)),
+        ("heights", Json::string(crate::encode_f32_base64(&record.heights))),
+        ("layers", Json::string(crate::encode_u8_base64(&record.layers))),
+        ("einstein", Json::bool(detail.enabled)),
+        ("einstein_seed", Json::int(detail.seed as i64)),
+        ("einstein_density", Json::number(detail.density as f64)),
+        ("einstein_displacement_m", Json::number(detail.max_displacement_m as f64)),
+        ("einstein_error_px", Json::number(detail.error_threshold_px as f64)),
+        ("einstein_distance_m", Json::number(detail.distance_m as f64)),
+        ("einstein_surface_class", Json::int(detail.surface_class as i64)),
+        ("cliff", Json::string(detail.cliff.label())),
+        ("einstein_debug_colors", Json::bool(detail.debug_colors)),
+        ("einstein_collision", Json::bool(false)),
+    ])
+}
+
+fn parse_terrain(json: &Json) -> Result<crate::TerrainRecord, LevelError> {
+    let seed = required_f64(json, "einstein_seed")?;
+    if seed.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&seed) {
+        return Err(LevelError::Corrupt("einstein_seed is not an integer".into()));
+    }
+    let class = required_f64(json, "einstein_surface_class")?;
+    if class.fract() != 0.0 || !(0.0..=255.0).contains(&class) {
+        return Err(LevelError::Corrupt("einstein_surface_class is not a byte".into()));
+    }
+    let heights = crate::decode_f32_base64(required_str(json, "heights")?).map_err(|_| LevelError::Corrupt("terrain heights are not base64 f32le".into()))?;
+    let layers = crate::decode_u8_base64(required_str(json, "layers")?).map_err(|_| LevelError::Corrupt("terrain layers are not base64".into()))?;
+    let record = crate::TerrainRecord {
+        width_m: required_f32(json, "width_m")?,
+        depth_m: required_f32(json, "depth_m")?,
+        spacing_m: required_f32(json, "spacing_m")?,
+        chunk_m: required_f32(json, "chunk_m")?,
+        height_min: required_f32(json, "height_min")?,
+        height_max: required_f32(json, "height_max")?,
+        collision: required_bool(json, "collision")?,
+        lod_enabled: required_bool(json, "lod")?,
+        debug_visualization: required_bool(json, "debug")?,
+        material_name: required_str(json, "material")?.to_string(),
+        base_color: required_float4(json, "base_color")?,
+        metallic: required_f32(json, "metallic")?,
+        roughness: required_f32(json, "roughness")?,
+        heights,
+        layers,
+        einstein: crate::EinsteinTerrainDetail {
+            enabled: required_bool(json, "einstein")?,
+            seed: seed as u32,
+            density: required_f32(json, "einstein_density")?,
+            max_displacement_m: required_f32(json, "einstein_displacement_m")?,
+            error_threshold_px: required_f32(json, "einstein_error_px")?,
+            distance_m: required_f32(json, "einstein_distance_m")?,
+            surface_class: class as u8,
+            cliff: crate::CliffProjection::parse(required_str(json, "cliff")?).ok_or_else(|| LevelError::Corrupt("cliff projection is unknown".into()))?,
+            debug_colors: required_bool(json, "einstein_debug_colors")?,
+            collision: required_bool(json, "einstein_collision")?,
+        },
+    };
+    record.validate().map_err(|error| LevelError::Corrupt(format!("terrain record is not valid ({error:?})")))?;
+    Ok(record)
 }
 
 fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
@@ -782,6 +971,8 @@ fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
             priority: required_i32(json, "priority")?,
             resolution: required_u32(json, "resolution")?,
         })),
+        "Joint" => Ok(ComponentRecord::Joint(parse_joint(json)?)),
+        "Terrain" => Ok(ComponentRecord::Terrain(parse_terrain(json)?)),
         "Camera" => Ok(ComponentRecord::Camera(CameraRecord {
             enabled: required_bool(json, "enabled")?,
             orthographic: match required_str(json, "projection")? {
@@ -873,6 +1064,7 @@ fn parse_mesh(json: &Json) -> Result<MeshAssetRef, LevelError> {
                 flat,
             })
         }
+        "capsule" => Ok(MeshAssetRef::Capsule { radius_m: required_f64(json, "radius_m")?, height_m: required_f64(json, "height_m")? }),
         "emissive_panel" => Ok(MeshAssetRef::EmissivePanel { width_m: required_f64(json, "width_m")?, height_m: required_f64(json, "height_m")? }),
         other => Err(LevelError::MissingAsset(format!("unknown builtin mesh {other}"))),
     }
@@ -1062,6 +1254,31 @@ fn mesh_entity(id: &str, name: &str, pose: ComponentRecord, mesh: MeshAssetRef, 
         name: name.into(),
         parent_uuid: None,
         components: vec![pose, ComponentRecord::MeshRenderer { visible: true, cast_shadows: true, receive_shadows: true, mesh, material }],
+    }
+}
+
+/// One World Settings entity and the bootstrap environment. No meshes, lights, probes, or cameras.
+pub fn empty_world_level() -> LevelDocument {
+    let settings = EntityId::new();
+    LevelDocument {
+        format_version: LEVEL_FORMAT_VERSION,
+        level_uuid: EntityId::new(),
+        name: "Empty World".into(),
+        world_settings: WorldSettingsRecord {
+            entity: settings,
+            enabled: true,
+            intensity: BOOTSTRAP_ENVIRONMENT_INTENSITY,
+            upper: BOOTSTRAP_UPPER_HEMISPHERE_LINEAR,
+            lower: BOOTSTRAP_LOWER_HEMISPHERE_LINEAR,
+            probe_update_policy: ProbeUpdatePolicy::Static,
+            startup_camera: None,
+        },
+        entities: vec![EntityRecord {
+            uuid: settings,
+            name: "World Settings".into(),
+            parent_uuid: None,
+            components: vec![ComponentRecord::WorldSettings],
+        }],
     }
 }
 
@@ -1261,8 +1478,8 @@ mod tests {
         document.entities[2].parent_uuid = Some(document.entities[1].uuid);
         assert!(matches!(document.validate(), Err(LevelError::Cycle(_))));
         document = lighting_lab_level();
-        document.format_version = 3;
-        assert!(matches!(document.validate(), Err(LevelError::UnsupportedVersion(3))));
+        document.format_version = 5;
+        assert!(matches!(document.validate(), Err(LevelError::UnsupportedVersion(5))));
         let mut text = lighting_lab_level().to_json();
         text.truncate(24);
         assert!(matches!(parse_level(&text), Err(LevelError::Syntax(_))));
@@ -1271,6 +1488,138 @@ mod tests {
         text = lighting_lab_level().to_json().replace("\"MeshRenderer\"", "\"Nanite\"");
         assert!(matches!(parse_level(&text), Err(LevelError::UnknownComponent(_))));
         text = lighting_lab_level().to_json().replace("\"jarvig.builtin\"", "\"jarvig.asset\"");
-        assert!(matches!(parse_level(&text), Err(LevelError::MissingAsset(_))));
+        // A builtin mesh rewritten to jarvig.asset has no asset id. That is a corrupt reference.
+        assert!(matches!(parse_level(&text), Err(LevelError::Corrupt(_))));
+    }
+
+    #[test]
+    fn empty_world_is_only_world_settings() {
+        let document = empty_world_level();
+        assert_eq!(document.format_version, LEVEL_FORMAT_VERSION);
+        assert_eq!(document.entities.len(), 1);
+        assert_eq!(document.entities[0].name, "World Settings");
+        assert!(document.entities[0].components.iter().all(|component| matches!(component, ComponentRecord::WorldSettings)));
+        let world = document.instantiate().unwrap();
+        assert_eq!(world.entity_count(), 1);
+        assert_eq!(world.object_count(), 0);
+        assert_eq!(world.light_count(), 0);
+        assert_eq!(world.entity_outline()[0].class, crate::AuthoringClass::WorldSettings);
+    }
+
+    #[test]
+    fn sculpted_terrain_heights_round_trip_bit_exact_and_chunks_do_not_cast_shadows() {
+        let mut document = empty_world_level();
+        let mut record = crate::TerrainRecord::flat(4.0, 4.0, 1.0, 2.0, 0.0).unwrap();
+        record.heights[3] = 1.25;
+        record.heights[7] = -0.5;
+        let flat: Vec<u32> = record.heights.iter().map(|height| height.to_bits()).collect();
+        let stamped = record.stamp(crate::TerrainBrush::Sculpt, 0.0, 0.0, 1.2, 0.4, 2, crate::TerrainFalloff::Smooth, None).unwrap();
+        assert!(stamped.height_changed);
+        let before: Vec<u32> = record.heights.iter().map(|height| height.to_bits()).collect();
+        assert_ne!(before, flat);
+        record.einstein.enabled = true;
+        assert!(record.detail_displacement(0.0, 0.0, 1).is_none());
+        assert_eq!(record.heights.iter().map(|height| height.to_bits()).collect::<Vec<_>>(), before);
+        record.einstein.collision = true;
+        assert!(record.validate().is_err());
+        record.einstein.collision = false;
+        document.format_version = LEVEL_TERRAIN_VERSION;
+        document.entities.push(EntityRecord {
+            uuid: EntityId::new(),
+            name: "Terrain".into(),
+            parent_uuid: None,
+            components: vec![
+                ComponentRecord::Transform { translation: Vec3::new(1.0, 0.0, 2.0), rotation: Quat::IDENTITY, scale: Vec3::new(1.0, 1.0, 1.0) },
+                ComponentRecord::Terrain(record),
+            ],
+        });
+        let text = document.to_json();
+        assert!(text.contains("\"heights\""));
+        let parsed = parse_level(&text).unwrap();
+        assert_eq!(parsed.format_version, LEVEL_TERRAIN_VERSION);
+        let loaded = parsed.entities.iter().find_map(|entity| {
+            entity.components.iter().find_map(|component| match component {
+                ComponentRecord::Terrain(terrain) => Some(terrain),
+                _ => None,
+            })
+        }).unwrap();
+        assert_eq!(loaded.heights.iter().map(|height| height.to_bits()).collect::<Vec<_>>(), before);
+        assert!(loaded.einstein.enabled);
+        let mut world = parsed.instantiate().unwrap();
+        assert_eq!(world.entity_outline().len(), 2);
+        assert_eq!(world.terrain_count(), 1);
+        assert_eq!(world.object_count(), 4);
+        let snapshot = world.extract(crate::RenderFrameId(1)).unwrap();
+        assert!(snapshot.instances().iter().all(|instance| !instance.cast_shadows));
+        assert!(snapshot.instances().iter().all(|instance| world.meshes().get(instance.mesh).unwrap().index_count() / 3 == 8));
+        let captured = LevelDocument::capture(&world, parsed.level_uuid, parsed.name.clone()).unwrap();
+        let again = parse_level(&captured.to_json()).unwrap();
+        let round = again.entities.iter().find_map(|entity| {
+            entity.components.iter().find_map(|component| match component {
+                ComponentRecord::Terrain(terrain) => Some(terrain.heights.iter().map(|height| height.to_bits()).collect::<Vec<_>>()),
+                _ => None,
+            })
+        }).unwrap();
+        assert_eq!(round, before);
+        assert!(world.create_terrain(Vec3::ZERO, crate::TerrainRecord::flat(4.0, 4.0, 1.0, 2.0, 0.0).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_deferred_brush_rebuilds_only_the_dirty_chunk() {
+        let mut world = empty_world_level().instantiate().unwrap();
+        let id = world.create_terrain(Vec3::ZERO, crate::TerrainRecord::flat(8.0, 8.0, 1.0, 4.0, 0.0).unwrap()).unwrap();
+        let mut before = Vec::new();
+        for z in 0..2 {
+            for x in 0..2 {
+                before.push((x, z, world.terrain_chunk_mesh(x, z).unwrap()));
+            }
+        }
+        let stamped = world
+            .stamp_terrain(id, crate::TerrainBrush::Sculpt, -3.0, -3.0, 1.2, 0.4, 0, crate::TerrainFalloff::Smooth, None, false)
+            .unwrap();
+        assert!(stamped.height_changed);
+        assert!(stamped.dirty.iter().all(|coord| coord.x == 0 && coord.z == 0));
+        for (x, z, mesh) in &before {
+            assert_eq!(world.terrain_chunk_mesh(*x, *z), Some(*mesh));
+        }
+        let record = world.authored_terrain(id).unwrap();
+        let built = crate::build_dirty_chunks(&record, &stamped.dirty).unwrap();
+        assert_eq!(built.len(), 1);
+        world.install_terrain_chunks(id, built.into_iter().map(|chunk| (chunk.coord.x, chunk.coord.z, chunk.mesh)).collect()).unwrap();
+        assert_ne!(world.terrain_chunk_mesh(0, 0), before.iter().find(|item| item.0 == 0 && item.1 == 0).map(|item| item.2));
+        for (x, z, mesh) in before {
+            if x == 0 && z == 0 {
+                continue;
+            }
+            assert_eq!(world.terrain_chunk_mesh(x, z), Some(mesh));
+        }
+        assert!(world.authored_terrain(id).unwrap().sample_height(-3.0, -3.0).unwrap() > 0.0);
+        let again = world.extract(crate::RenderFrameId(2)).unwrap();
+        assert!(again.instances().iter().all(|instance| !instance.cast_shadows));
+    }
+
+    #[test]
+    fn land_draw_classes_keep_chunks_terrain_and_a_jointed_mesh_a_character() {
+        let mut world = empty_world_level().instantiate().unwrap();
+        let id = world.create_terrain(Vec3::ZERO, crate::TerrainRecord::flat(8.0, 8.0, 1.0, 4.0, 0.0).unwrap()).unwrap();
+        let height_bits: Vec<u32> = world.authored_terrain(id).unwrap().heights.iter().map(|height| height.to_bits()).collect();
+        let scene = world.scene_frame().unwrap();
+        let mesh = world.add_mesh(cube_mesh(1.0));
+        world.spawn_named_object("Crate", mesh, scene, Vec3::new(2.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0)).unwrap();
+        let pawn_mesh = world.add_mesh(cube_mesh(0.5));
+        world.spawn_named_object("Pawn", pawn_mesh, scene, Vec3::new(-2.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0)).unwrap();
+        let crate_id = world.entity_outline().iter().find(|row| row.name == "Crate").unwrap().uuid;
+        let pawn_id = world.entity_outline().iter().find(|row| row.name == "Pawn").unwrap().uuid;
+        let actors = world.land_draw_actors();
+        assert_eq!(actors.iter().filter(|(_, class)| *class == crate::LandDrawClass::Terrain).count(), 4);
+        assert_eq!(actors.iter().find(|(actor, _)| *actor == crate_id).unwrap().1, crate::LandDrawClass::Prop);
+        assert_eq!(world.terrain_surface_meshes().len(), 4);
+        world.add_component(pawn_id, crate::TYPE_PAWN).unwrap();
+        assert_eq!(world.land_draw_actors().iter().find(|(actor, _)| *actor == pawn_id).unwrap().1, crate::LandDrawClass::Gameplay);
+        world.add_component(crate_id, crate::TYPE_JOINT).unwrap();
+        assert_eq!(world.land_draw_actors().iter().find(|(actor, _)| *actor == crate_id).unwrap().1, crate::LandDrawClass::Character);
+        assert_eq!(world.authored_terrain(id).unwrap().heights.iter().map(|height| height.to_bits()).collect::<Vec<_>>(), height_bits);
+        let drawn = world.extract(crate::RenderFrameId(3)).unwrap();
+        assert!(drawn.instances().iter().all(|instance| instance.visible));
     }
 }

@@ -1,0 +1,8 @@
+{
+  "schema": "jarvig.settings",
+  "format_version": 1,
+  "default_player_controller": "JARVIG.PlayerController",
+  "default_pawn": "JARVIG.DefaultFreeFlyPawn",
+  "default_mapping_context": "JARVIG.Default",
+  "startup_camera": "pawn"
+}

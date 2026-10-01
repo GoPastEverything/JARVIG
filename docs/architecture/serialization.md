@@ -28,7 +28,7 @@ Package: `@jarvig/project-schema`. Id: `jarvig.project/v1`.
 
 Id: `jarvig.scene/v1`. See [ecs.md](ecs.md). Entities carry `id`, `parentId`, and an ordered component array of `{ name, version, data }`. Data values are finite numbers, strings, or booleans.
 
-The native editor writes a different, explicit pair of documents. ADR-0045. A `*.jarvigproject` file is schema `jarvig.project` format version 1. A `*.jarviglevel` file is schema `jarvig.level` format version 1. The level stores `EntityUuid`, name, parent uuid, and component payloads. It does not store `EntityHandle`, `ObjectId`, subsystem ids, or GPU resources. Builtin mesh and material names are temporary references until AssetIds exist. The TypeScript packages above remain the prototype schema. They are not the bytes `JARVIGEditor` saves. See [entity-identity.md](entity-identity.md).
+The native editor writes a different, explicit pair of documents. ADR-0045. A `*.jarvigproject` file is schema `jarvig.project` format version 1. A `*.jarviglevel` file is schema `jarvig.level` format version 1. Format version 4 is written only when a terrain component is present. Versions 1, 2, and 3 still load. The level stores `EntityUuid`, name, parent uuid, and component payloads. It does not store `EntityHandle`, `ObjectId`, subsystem ids, or GPU resources. Builtin mesh and material names are temporary references until AssetIds exist. The TypeScript packages above remain the prototype schema. They are not the bytes `JARVIGEditor` saves. See [entity-identity.md](entity-identity.md).
 
 ## Migration
 

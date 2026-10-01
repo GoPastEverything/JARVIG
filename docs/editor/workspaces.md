@@ -27,6 +27,20 @@ Layout converts DIPs to physical pixels with the window DPI (`dip * dpi / 96`). 
 
 The menu bar, toolbar, and status bar are application chrome. They are not dock nodes. The dock host fills the client area between the toolbar and the status bar.
 
+## Editor modes
+
+Level, Land, and Character are workspaces over the same project data. The toolbar shows those three words. View > Land Mode and View > Character Editor select the same modes. The level is not copied.
+
+Level is the authored world. Characters, props, lights, and terrain stay visible. The terrain editing grid is off. Joint helpers are off.
+
+Land is the terrain workspace. The terrain is the editable object. Characters, props, and gameplay actors are hidden until Show Full Level. The conforming grid is on by default, depth-tested, and follows the surface. Minor and major spacing stay independent. Sculpt, smooth, flatten, and paint run only here.
+
+Character is the rig workspace. Terrain and props are hidden. Joints, limits, and pose tools draw here. A character asset opens here. A level with no rig stays in the current mode.
+
+The last mode and its visualization settings are `Saved/Editor/workspace.json`, schema `jarvig.editor-workspace` version 1. That file is editor state, beside `viewport.json`. It is not in the level. A Terrain World template opens in Land only when that file is absent. Land overlays and joint helpers are applied in their own mode. Level does not draw them.
+
+This is not the dock layout. Named layout presets and a saved dock tree are still JRV-0069. Reset Layout does not change the mode.
+
 ## Tabs and splits
 
 A stack has one active tab. Inactive panels are hidden, not destroyed. Clicking a tab activates it. Dragging a tab and dropping on another stack docks that panel: the edges mean left, right, top, or bottom, and the tab strip means a new tab. A splitter drag writes a new ratio.
