@@ -51,9 +51,24 @@ The private/local work has also been exercised on Intel UHD-class integrated gra
 
 The mathematical `einstein` concept and the 2023 hat monotile are prior mathematical work associated with David Smith, Joseph Samuel Myers, Craig S. Kaplan, and Chaim Goodman-Strauss. JARVIG does not claim invention of that mathematical result.
 
-JARVIG's research contribution under this RFC is the game-engine application and integration work: using deterministic aperiodic surface information as an optional source of local detail, coupling it to screen-space relevance, generating bounded renderable geometry, caching/reusing completed results, and composing that detail with the accepted base geometry/material pipeline.
+For this RFC, **JARVIG Einstein Surface** names the JARVIG engine integration being evaluated, not the mathematical discovery itself.
 
-Public wording must distinguish those two things. A specific provider may be described as Einstein-hat-derived or Einstein-hat-inspired only when that is accurate for the provider revision being discussed.
+The JARVIG-specific contribution under evaluation is the real-time engine architecture that combines Einstein-hat-derived aperiodic surface information with:
+
+- projected screen-space relevance;
+- bounded connected generated microgeometry;
+- the accepted RFC-0001 hierarchy and ordinary material fallback;
+- asynchronous generation and chunked upload work;
+- stale-build rejection;
+- complete-result/frame-boundary publication;
+- deterministic reuse and return behavior;
+- independent base-geometry and generated-detail accounting.
+
+The intent is generated geometry that participates in the renderer as local surface detail while leaving the authored/base representation valid independently. It is not merely a non-repeating texture pattern and it is not a claim to have invented the Einstein hat.
+
+The public RFC intentionally stops at this architectural boundary. The active private/local provider's exact aperiodic construction, subdivision/refinement method, topology rules, cache/addressing implementation, and placement heuristics remain unpublished.
+
+Public wording must distinguish the mathematical prior work from JARVIG's engine integration. A specific provider may be described as Einstein-hat-derived or Einstein-hat-inspired only when that is accurate for the provider revision being discussed.
 
 ## Benchmark and disclosure policy
 
