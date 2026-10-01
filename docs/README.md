@@ -34,7 +34,7 @@ A public document can describe private/local research without making that implem
 | Hosts | [hub/overview.md](hub/overview.md), [editor/overview.md](editor/overview.md), [cli/overview.md](cli/overview.md) |
 | Legal | [legal/THIRD_PARTY.md](legal/THIRD_PARTY.md), [legal/RESEARCH_DISCLOSURE_BOUNDARY.md](legal/RESEARCH_DISCLOSURE_BOUNDARY.md) |
 | Decisions | [adr/README.md](adr/README.md) |
-| Research proposals | [rfc/README.md](rfc/README.md), [research/README.md](research/README.md) |
+| Research proposals | [rfc/README.md](rfc/README.md), [research/README.md](research/README.md), [Einstein Surface research](research/aperiodic-detail.md) |
 | Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
 
 ## Founding sections
