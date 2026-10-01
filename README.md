@@ -16,6 +16,8 @@ The public tree contains the engine contracts and the implementations intentiona
 
 In particular, RFC-0002 procedural microgeometry remains **Proposed** in this public tree. Its public provider is deliberately limited and defaults off. Private/local RFC-0002 experiments and acceptance-candidate runs are tracked separately; their implementation details are not granted for reuse by this repository.
 
+The private/local research provider is referred to in the documentation as **JARVIG Einstein Surface** when discussing the engine integration. The mathematical Einstein/hat monotile is prior work; JARVIG does **not** claim to have discovered that mathematical result. The JARVIG-specific work under evaluation is the real-time engine architecture around it: deterministic aperiodic surface detail used as screen-space-adaptive procedural microgeometry, integrated with the accepted hierarchy and ordinary material path, generated asynchronously, rejected when stale, reused deterministically, and published only as a complete renderable result.
+
 A public clone should be judged only by behavior reproducible from the public source and public benchmark artifacts. See [RFC-0002](docs/rfc/RFC-0002-procedural-microgeometry.md) and [the surface-detail research note](docs/research/aperiodic-detail.md) for the current boundary.
 
 ## Run the editor
