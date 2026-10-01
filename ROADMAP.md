@@ -43,4 +43,10 @@ No marketplace. No finished cinematic suite. No full server mesh. No attempt to 
 
 ## Where the repository is
 
-P0 is in progress. The local toolchain, documentation, engine lifecycle, and minimal hosts exist. See [`docs/status/CURRENT.md`](docs/status/CURRENT.md) for what has actually been verified. P0's exit still wants a continuous integration run on a real push; the workflow file is `.github/workflows/ci.yml` and has not been executed by a forge yet.
+This roadmap is **not** a linear progress meter. The repository now contains accepted work across foundation, editor, materials/lighting, renderer, meshlets, and virtual-geometry research while other tickets in those same milestone groups remain open.
+
+RFC-0001, the virtual-geometry baseline, is Accepted. Its measured performance follow-ups remain open.
+
+RFC-0002, procedural microgeometry, is still Proposed. The public tree contains only the public reference provider. Private/local acceptance-candidate research exists beyond that public provider, but it is intentionally not represented as public-source completion.
+
+Use [`docs/status/CURRENT.md`](docs/status/CURRENT.md) for the public/private state boundary and [`docs/BACKLOG.md`](docs/BACKLOG.md) for ticket-level status. Do not infer current project status from the old P0-only repository snapshot.
