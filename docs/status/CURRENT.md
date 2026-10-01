@@ -32,6 +32,8 @@ The active private/local development tree has progressed beyond the public RFC-0
 
 Those runs exercise an acceptance-candidate procedural-detail path, including deterministic return behavior, screen-space transition behavior, and asynchronous generation/publication. They are **not** a public-source acceptance result and do not make RFC-0002 Accepted.
 
-The exact provider algorithm, distribution rule, topology construction, and other unpublished implementation details are outside this public repository. Public documentation should describe the boundary and measured behavior without pretending those private details are present in `master`.
+The private/local candidate is documented as **JARVIG Einstein Surface** when referring to the engine integration: Einstein-hat-derived aperiodic structure used as deterministic, screen-space-adaptive procedural microgeometry with asynchronous generation/publication and preservation of the accepted base geometry path. The underlying Einstein/hat mathematics is prior work and is not claimed as a JARVIG discovery.
+
+The exact provider algorithm, distribution rule, topology construction, subdivision/refinement strategy, cache/addressing implementation, placement heuristics, and other unpublished implementation details are outside this public repository. Public documentation should describe the boundary and measured behavior without pretending those private details are present in `master`.
 
 See [RFC-0002](../rfc/RFC-0002-procedural-microgeometry.md) and [Surface detail research](../research/aperiodic-detail.md).
