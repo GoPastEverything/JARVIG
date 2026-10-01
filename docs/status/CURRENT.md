@@ -4,10 +4,12 @@ JARVIG is a native multi-platform engine. This repository is the public source. 
 
 Procedural detail defaults off. The included provider draws nothing, or one flat reference triangle with no displacement.
 
+Users start at [getting-started.md](../getting-started.md): a new project, glTF or GLB import, save, and play.
+
 The editor cold start is:
 
 ```text
-cargo run --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor
+cargo run --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor
 ```
 
 Page streaming is not part of this tree.

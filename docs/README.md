@@ -16,6 +16,7 @@
 
 | Area | Start here |
 | --- | --- |
+| Make a game | [getting-started.md](getting-started.md) |
 | Current state | [status/CURRENT.md](status/CURRENT.md) |
 | Tickets | [BACKLOG.md](BACKLOG.md) |
 | Milestones | [../ROADMAP.md](../ROADMAP.md) |
