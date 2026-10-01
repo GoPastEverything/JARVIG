@@ -56,6 +56,10 @@ JARVIG documentation must distinguish prior mathematics, algorithms, papers, API
 
 For RFC-0002, the mathematical `einstein` concept and the 2023 hat monotile are prior mathematical work associated with David Smith, Joseph Samuel Myers, Craig S. Kaplan, and Chaim Goodman-Strauss. JARVIG does not claim invention of that mathematical result.
 
+The JARVIG-specific work being documented and evaluated is the engine integration around that prior mathematics: using Einstein-hat-derived aperiodic structure as deterministic input to screen-space-adaptive generated microgeometry, preserving the accepted base hierarchy/material path, performing generation and upload asynchronously, rejecting stale work, publishing complete results at a frame boundary, and reusing deterministic results. The project documentation refers to that engine-side integration as **JARVIG Einstein Surface**.
+
+This description is intentionally architectural. It does not publish the active private/local provider's exact construction, topology/subdivision rules, cache/addressing implementation, placement heuristics, or other unpublished implementation details.
+
 JARVIG may describe and protect its own engine-specific integration, implementation, tooling, heuristics, data structures, pipelines, or other original work, but public wording must not erase the underlying attribution.
 
 ## Before publishing sensitive research
