@@ -34,9 +34,27 @@ The public repository intentionally omits the active provider's exact distributi
 
 The mathematical term *einstein* and the 2023 hat monotile are prior mathematical work, not a JARVIG invention. The discovery is associated with David Smith, Joseph Samuel Myers, Craig S. Kaplan, and Chaim Goodman-Strauss.
 
-JARVIG's work is the engine-side research and implementation built around aperiodic procedural detail: deciding when detail is perceptually relevant, generating bounded geometry, composing it with the existing surface, reusing deterministic results, and publishing completed work without destabilizing the base mesh.
+### JARVIG Einstein Surface
 
-Public descriptions should use language such as **"Einstein-hat-derived/inspired aperiodic procedural microgeometry"** only when that wording matches the actual provider being discussed. They should not say that JARVIG invented the Einstein hat or the mathematical einstein concept.
+**JARVIG Einstein Surface** is the project name for JARVIG's engine-side application of Einstein-hat-derived aperiodic structure to procedural microgeometry. The name refers to the engine integration, not to ownership of the underlying mathematical tile.
+
+The JARVIG-specific contribution under evaluation is the combination of:
+
+- deterministic aperiodic surface information used as an input to generated local geometry;
+- screen-space error deciding when that detail should exist;
+- bounded connected microgeometry composed with, rather than substituted for, the accepted base surface;
+- independent preservation of the RFC-0001 hierarchy and ordinary material fallback;
+- asynchronous generation and upload through the engine's background-work path;
+- stale-result rejection when the requested patch set changes before publication;
+- atomic/frame-boundary publication of a complete replacement detail set;
+- deterministic reuse and return behavior for previously requested detail;
+- independent counters and validation for base triangles versus generated microtriangles.
+
+That combination is the research subject. It should not be reduced in documentation to "a non-repeating texture" or "an Einstein-hat shader": RFC-0002 is evaluating generated geometry integrated into JARVIG's LOD/render pipeline.
+
+The exact provider construction remains private/local. This document intentionally does not disclose the unpublished aperiodic construction rule, topology builder, subdivision/refinement strategy, cache/addressing implementation, or placement heuristics.
+
+Public descriptions should use language such as **"Einstein-hat-derived aperiodic procedural microgeometry integrated with JARVIG's screen-space LOD pipeline"** when that wording matches the provider being discussed. They should not say that JARVIG invented the Einstein hat or the mathematical einstein concept.
 
 ## Disclosure rule
 
