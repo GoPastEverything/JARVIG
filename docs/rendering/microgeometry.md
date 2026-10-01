@@ -25,10 +25,24 @@ No private distribution rule, topology construction rule, subdivision strategy, 
 
 See [RFC-0002](../rfc/RFC-0002-procedural-microgeometry.md) and [Surface detail research](../research/aperiodic-detail.md).
 
-## Terminology and attribution
+## Attribution and JARVIG-specific contribution
 
 JARVIG does not claim invention of the mathematical `einstein` concept or the 2023 hat monotile. Those are prior mathematical work associated with David Smith, Joseph Samuel Myers, Craig S. Kaplan, and Chaim Goodman-Strauss.
 
-JARVIG's research claim is narrower: investigating how aperiodic, deterministic surface information can be integrated into a game-engine microgeometry pipeline, gated by screen-space relevance and composed with the engine's existing geometry and material systems.
+The JARVIG-specific work under RFC-0002 is the **engine architecture that applies Einstein-hat-derived aperiodic structure to real-time procedural microgeometry**. At the architecture level, the private/local candidate evaluates all of the following as one system:
+
+- deterministic surface-detail addressing from stable surface information and a seed;
+- projected screen-space error as the gate that decides whether generated detail is warranted;
+- bounded connected local microgeometry layered onto the accepted base surface rather than replacing that base representation;
+- preservation of the RFC-0001 hierarchy and ordinary material path as an independent fallback;
+- background generation and upload work that does not own the editor frame loop;
+- stale-work rejection when a newer camera/detail request supersedes an in-flight build;
+- complete-result publication at a frame boundary rather than exposing partially generated geometry;
+- deterministic reuse and return behavior so revisiting the same surface state can recover the same detail result;
+- separate accounting for base geometry and generated microgeometry.
+
+This engine integration is distinct from the underlying mathematical discovery. The documentation may call the private/local integration **JARVIG Einstein Surface** for clarity, but that name does not assert ownership of the Einstein/hat mathematics.
+
+The public repository intentionally does not publish the active provider's exact aperiodic construction, topology/subdivision rules, cache/addressing scheme, placement heuristics, or equivalent unpublished implementation details.
 
 Any public claim about a specific private provider must distinguish the underlying mathematical work from JARVIG's engine integration and must be backed by a reproducible artifact before it is presented as a public-source result.
