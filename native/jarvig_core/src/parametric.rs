@@ -73,6 +73,16 @@ pub enum BlockOp {
     InsetFace { face: u8, distance_m: f64 },
     Bevel { distance_m: f64 },
     Mirror { axis: u8 },
+    /// Both ends of one edge moved by the same vector. The log is not replayed.
+    MoveEdge { edge: u32, delta_m: [f64; 3] },
+    /// A new edge and the wall that joins it to the old one.
+    ExtrudeEdge { edge: u32, delta_m: [f64; 3] },
+    /// Midpoint of one edge. The old id stays on the first half.
+    SplitEdge { edge: u32 },
+    /// One quad replaced by a grid of quads.
+    SubdivideFace { face: u32, u: u32, v: u32 },
+    /// One vertex moved. Loops that already contain it stay connected.
+    MoveVertex { vertex: u32, delta_m: [f64; 3] },
 }
 
 impl BlockOp {
@@ -83,15 +93,31 @@ impl BlockOp {
             Self::InsetFace { face, distance_m } => format!("Inset {} {}", face_name(*face), meters(*distance_m)),
             Self::Bevel { distance_m } => format!("Bevel {}", meters(*distance_m)),
             Self::Mirror { axis } => format!("Mirror {}", axis_name(*axis)),
+            Self::MoveEdge { edge, delta_m } => format!("Move edge E:{edge} {}", meters(delta_span(*delta_m))),
+            Self::ExtrudeEdge { edge, delta_m } => format!("Extrude edge E:{edge} {}", meters(delta_span(*delta_m))),
+            Self::SplitEdge { edge } => format!("Split edge E:{edge}"),
+            Self::SubdivideFace { face, u, v } => format!("Subdivide face F:{face} {u}×{v}"),
+            Self::MoveVertex { vertex, delta_m } => format!("Move vertex V:{vertex} {}", meters(delta_span(*delta_m))),
         }
     }
 
-    fn finite(&self) -> bool {
+    pub(crate) fn is_topology(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveEdge { .. } | Self::ExtrudeEdge { .. } | Self::SplitEdge { .. } | Self::SubdivideFace { .. } | Self::MoveVertex { .. }
+        )
+    }
+
+    pub(crate) fn finite(&self) -> bool {
         match self {
             Self::Size { size_m } => size_m.iter().all(|axis| axis.is_finite()),
             Self::ExtrudeFace { face, distance_m } | Self::InsetFace { face, distance_m } => *face < 6 && distance_m.is_finite(),
             Self::Bevel { distance_m } => distance_m.is_finite(),
             Self::Mirror { axis } => *axis < 3,
+            Self::MoveEdge { edge, delta_m } | Self::ExtrudeEdge { edge, delta_m } => *edge != 0 && delta_m.iter().all(|axis| axis.is_finite()),
+            Self::SplitEdge { edge } => *edge != 0,
+            Self::SubdivideFace { face, u, v } => *face != 0 && (1..=crate::topology::SUBDIVIDE_MAX).contains(u) && (1..=crate::topology::SUBDIVIDE_MAX).contains(v),
+            Self::MoveVertex { vertex, delta_m } => *vertex != 0 && delta_m.iter().all(|axis| axis.is_finite()),
         }
     }
 }
@@ -107,6 +133,8 @@ pub struct BlockRecord {
     pub bevel_m: f64,
     pub material: MaterialAssetRef,
     pub history: Vec<BlockOp>,
+    /// Present after an edge, vertex, or subdivision edit. Absent on an analytic box.
+    pub body: Option<crate::topology::SolidBody>,
 }
 
 impl BlockRecord {
@@ -117,12 +145,29 @@ impl BlockRecord {
             bevel_m: 0.0,
             material: default_block_material(),
             history: Vec::new(),
+            body: None,
         })
     }
 
     /// A plain block writes the same JSON as before this slice: size and material only.
     pub fn is_plain(&self) -> bool {
-        self.bevel_m.abs() < 1.0e-12 && self.inset_m.iter().all(|value| value.abs() < 1.0e-12) && self.history.is_empty()
+        self.body.is_none() && self.bevel_m.abs() < 1.0e-12 && self.inset_m.iter().all(|value| value.abs() < 1.0e-12) && self.history.is_empty()
+    }
+
+    /// Bevel or inset is still an analytic parameter. Edge edits wait until those are cleared.
+    pub fn analytic_features(&self) -> bool {
+        self.bevel_m.abs() > 1.0e-9 || self.inset_m.iter().any(|value| value.abs() > 1.0e-9)
+    }
+
+    /// Body used for picking and the overlay. A canonical box is computed and not written back.
+    pub fn display_body(&self) -> Option<crate::topology::SolidBody> {
+        if let Some(body) = &self.body {
+            return Some(body.clone());
+        }
+        if self.analytic_features() {
+            return None;
+        }
+        crate::topology::SolidBody::from_box(self.size_m).ok()
     }
 
     pub fn history_text(&self) -> String {
@@ -154,6 +199,13 @@ impl BlockRecord {
         }
         if self.history.iter().any(|op| !op.finite()) {
             return Err(crate::LevelError::Corrupt("block history is not finite".into()));
+        }
+        if let Some(body) = &self.body {
+            body.validate().map_err(|_| crate::LevelError::Corrupt("block body is not a closed solid".into()))?;
+            let size = body.aabb_size();
+            if (0..3).any(|axis| (size[axis] - self.size_m[axis]).abs() > 1.0e-3) {
+                return Err(crate::LevelError::Corrupt("block size does not match its body".into()));
+            }
         }
         self.material.validate()
     }
@@ -330,6 +382,10 @@ pub struct FacePush {
 
 fn meters(value: f64) -> String {
     format!("{value:.2}")
+}
+
+fn delta_span(delta: [f64; 3]) -> f64 {
+    (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
 }
 
 fn axis_name(axis: u8) -> &'static str {
@@ -571,7 +627,7 @@ mod tests {
         let json = captured.to_json();
         assert!(json.contains("ParametricBlock"));
         assert!(json.contains("2") && json.contains("3") && json.contains("4"));
-        assert!(!json.contains("bevel_m") && !json.contains("inset_m") && !json.contains("history"), "a plain block keeps the size-only record");
+        assert!(!json.contains("bevel_m") && !json.contains("inset_m") && !json.contains("history") && !json.contains("\"body\""), "a plain block keeps the size-only record");
         for forbidden in ["meshlet", "einstein", "Einstein", "indices", "triangle"] {
             assert!(!json.contains(forbidden), "{forbidden} leaked into the block level");
         }
@@ -1060,5 +1116,62 @@ mod tests {
         let ejected = runtime.authored_local_pose(pawn).unwrap().0;
         assert!((ejected.x - 1.3).abs() < 1.0e-6, "{ejected:?}");
         assert!((ejected.y - 1.0).abs() < 1.0e-6 && ejected.z.abs() < 1.0e-6, "{ejected:?}");
+    }
+
+    #[test]
+    fn a_split_edge_round_trips_and_a_body_is_not_a_plain_box() {
+        let document = empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let plain = LevelDocument::capture(&world, document.level_uuid, "Split").unwrap().to_json();
+        assert!(!plain.contains("\"body\""));
+        assert!(world.authored_block(id).unwrap().is_plain());
+        assert_eq!(world.split_block_edge(id, 12).unwrap(), crate::AuthoringResult::Applied);
+        let record = world.authored_block(id).unwrap();
+        assert!(!record.is_plain());
+        assert_eq!(record.body.as_ref().unwrap().vertices.len(), 9);
+        assert!(matches!(record.history.last(), Some(BlockOp::SplitEdge { edge: 12 })));
+        let mesh = world.object_mesh(id).unwrap();
+        assert_eq!(world.meshes().get(mesh).unwrap().triangle_indices().len(), 14);
+        let json = LevelDocument::capture(&world, document.level_uuid, "Split").unwrap().to_json();
+        assert!(json.contains("\"body\"") && json.contains("split-edge"));
+        let loaded = parse_level(&json).unwrap().instantiate().unwrap();
+        let again = loaded.authored_block(id).unwrap();
+        assert_eq!(again.body.as_ref().unwrap().vertices.len(), 9);
+        assert!(again.body.as_ref().unwrap().edges.iter().any(|edge| edge.id == 12));
+        assert!(world.push_block_face(id, 0, [2.0, 2.0, 2.0], Vec3::new(0.0, 1.0, -4.0), 0.25).is_err());
+        assert!(world.set_block_bevel(id, 0.1).is_err());
+    }
+
+    #[test]
+    fn sizing_a_body_scales_about_the_center_and_keeps_ids() {
+        let document = empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::ZERO, BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.split_block_edge(id, 12).unwrap();
+        assert_eq!(world.set_block_extent(id, 0, 4.0).unwrap(), crate::AuthoringResult::Applied);
+        let record = world.authored_block(id).unwrap();
+        assert!((record.size_m[0] - 4.0).abs() < 1.0e-6, "{:?}", record.size_m);
+        let body = record.body.unwrap();
+        assert!(body.edges.iter().any(|edge| edge.id == 12));
+        assert!((body.vertex_position(2).unwrap()[0] - 2.0).abs() < 1.0e-6);
+        let pose = world.authored_local_pose(id).unwrap().0;
+        assert!(pose.x.abs() < 1.0e-6 && pose.y.abs() < 1.0e-6, "{pose:?}");
+    }
+
+    #[test]
+    fn an_invalid_body_preview_leaves_the_record_alone() {
+        let document = empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, 0.0), BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let mut bad = crate::SolidBody::from_box([2.0, 2.0, 2.0]).unwrap();
+        bad.vertices.clear();
+        assert!(world.preview_block_body(id, bad, Vec3::new(0.0, 1.0, 0.0)).is_err());
+        assert!(world.authored_block(id).unwrap().body.is_none());
+        assert_eq!(world.authored_block(id).unwrap().size_m, [2.0, 2.0, 2.0]);
+        let baked = crate::SolidBody::from_box([2.0, 2.0, 2.0]).unwrap();
+        world.preview_block_body(id, baked, Vec3::new(0.0, 1.0, 0.0)).unwrap();
+        let mesh = world.object_mesh(id).unwrap();
+        assert_eq!(world.meshes().get(mesh).unwrap().triangle_indices().len(), 12);
     }
 }

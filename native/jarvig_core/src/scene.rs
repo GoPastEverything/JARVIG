@@ -184,6 +184,26 @@ fn translation_matches(left: Vec3, right: Vec3) -> bool {
     (left.x - right.x).abs() < 1.0e-9 && (left.y - right.y).abs() < 1.0e-9 && (left.z - right.z).abs() < 1.0e-9
 }
 
+fn translation_plus_shift(pose: HighPrecisionPose, shift: [f64; 3]) -> Vec3 {
+    let delta = pose.rotation.rotate(Vec3::new(shift[0], shift[1], shift[2]));
+    Vec3::new(pose.translation.x + delta.x, pose.translation.y + delta.y, pose.translation.z + delta.z)
+}
+
+fn finite_body_size(body: &crate::topology::SolidBody) -> Result<[f64; 3], AuthoringError> {
+    let size = body.aabb_size();
+    if size.iter().any(|axis| !axis.is_finite() || *axis < crate::BLOCK_MIN_EXTENT_M - 1.0e-9 || *axis > crate::BLOCK_MAX_EXTENT_M + 1.0e-9) {
+        return Err(AuthoringError::InvalidValue);
+    }
+    Ok(size)
+}
+
+fn topology_error(error: crate::topology::TopologyError) -> AuthoringError {
+    match error {
+        crate::topology::TopologyError::Missing | crate::topology::TopologyError::Degenerate => AuthoringError::InvalidValue,
+        crate::topology::TopologyError::NotQuad | crate::topology::TopologyError::Torn => AuthoringError::InvalidOperation,
+    }
+}
+
 fn block_size_axis(field: crate::FieldId) -> Option<usize> {
     if field == crate::FIELD_BLOCK_SIZE_X {
         Some(0)
@@ -215,6 +235,9 @@ fn block_inset_face(field: crate::FieldId) -> Option<u8> {
 }
 
 fn block_mesh(record: &crate::BlockRecord) -> crate::Mesh {
+    if let Some(body) = &record.body {
+        return crate::mesh_from_body(body);
+    }
     let size = [record.size_m[0] as f32, record.size_m[1] as f32, record.size_m[2] as f32];
     let inset = [
         record.inset_m[0] as f32,
@@ -3095,7 +3118,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if current == &record {
             return Ok(AuthoringResult::Unchanged);
         }
-        let mesh_changed = current.size_m != record.size_m || current.inset_m != record.inset_m || current.bevel_m != record.bevel_m;
+        let mesh_changed = current.size_m != record.size_m || current.inset_m != record.inset_m || current.bevel_m != record.bevel_m || current.body != record.body;
         self.blocks[index].record = record;
         if mesh_changed {
             self.rebuild_block_mesh(index)?;
@@ -3187,6 +3210,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if (self.blocks[index].record.size_m[axis] - meters).abs() < 1.0e-9 {
             return Ok(AuthoringResult::Unchanged);
         }
+        if self.blocks[index].record.body.is_some() {
+            return self.scale_block_body(id, axis, meters);
+        }
         self.blocks[index].record.size_m[axis] = meters;
         self.blocks[index].record.clamp_features();
         let size = self.blocks[index].record.size_m;
@@ -3206,6 +3232,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         outward_m: f64,
     ) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let local = self.entity_local_pose(id)?;
         let pushed = crate::push_face(baseline_size, baseline_local, local.rotation, face, outward_m).ok_or(AuthoringError::InvalidValue)?;
         let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - pushed.size_m[axis]).abs() < 1.0e-9);
@@ -3224,6 +3251,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     /// Records one face push after the drag releases. The mesh is already at the new size.
     pub fn commit_block_face(&mut self, id: EntityId, face: u8, baseline_size: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let axis = (face / 2) as usize;
         if face > 5 || axis > 2 {
             return Err(AuthoringError::InvalidValue);
@@ -3242,6 +3270,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
@@ -3259,6 +3288,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
@@ -3277,6 +3307,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
@@ -3294,6 +3325,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
@@ -3308,6 +3340,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     /// One bevel entry when the preview differs from the value the session started with.
     pub fn commit_block_bevel(&mut self, id: EntityId, baseline_m: f64) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let current = self.blocks[index].record.bevel_m;
         if (current - baseline_m).abs() < 1.0e-9 {
             return Ok(AuthoringResult::Unchanged);
@@ -3323,6 +3356,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let current = self.blocks[index].record.inset_m[face as usize];
         if (current - baseline_m).abs() < 1.0e-9 {
             return Ok(AuthoringResult::Unchanged);
@@ -3359,8 +3393,14 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         let index = self.block_index(created)?;
         let insets = crate::swap_insets(source.inset_m, axis).ok_or(AuthoringError::InvalidValue)?;
         self.blocks[index].record.inset_m = insets;
+        let mut translation = crate::mirrored_translation(local.translation, local.rotation, source.size_m, axis).ok_or(AuthoringError::InvalidValue)?;
+        if let Some(body) = source.body.clone() {
+            let edit = body.mirrored(axis).map_err(topology_error)?;
+            self.blocks[index].record.body = Some(edit.body);
+            self.blocks[index].record.size_m = edit.size_m;
+            translation = translation_plus_shift(HighPrecisionPose { translation, rotation: local.rotation }, edit.shift);
+        }
         self.blocks[index].record.push_op(crate::BlockOp::Mirror { axis: axis as u8 });
-        let translation = crate::mirrored_translation(local.translation, local.rotation, source.size_m, axis).ok_or(AuthoringError::InvalidValue)?;
         self.rebuild_block_mesh(index)?;
         self.write_block_translation(created, translation)?;
         self.revise();
@@ -3393,6 +3433,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_body(index)?;
         let local = self.entity_local_pose(id)?;
         let record = &self.blocks[index].record;
         let same_size = (0..3).all(|axis| (record.size_m[axis] - size_m[axis]).abs() < 1.0e-9);
@@ -3425,6 +3466,144 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Ok(AuthoringResult::Unchanged);
         }
         self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Shows a candidate body. Does not append history. `translation` is absolute.
+    pub fn preview_block_body(&mut self, id: EntityId, body: crate::topology::SolidBody, translation: Vec3) -> Result<AuthoringResult, AuthoringError> {
+        body.validate().map_err(topology_error)?;
+        let size = finite_body_size(&body)?;
+        let index = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let same_body = self.blocks[index].record.body.as_ref() == Some(&body);
+        let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - size[axis]).abs() < 1.0e-9);
+        if same_body && same_size && translation_matches(local.translation, translation) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.body = Some(body);
+        self.blocks[index].record.size_m = size;
+        self.blocks[index].record.clamp_features();
+        self.rebuild_block_mesh(index)?;
+        self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// One log line after the body is already stored. The log is not replayed.
+    pub fn commit_block_topology(&mut self, id: EntityId, op: crate::BlockOp) -> Result<AuthoringResult, AuthoringError> {
+        if !op.is_topology() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        if !op.finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        if self.blocks[index].record.body.is_none() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        self.blocks[index].record.push_op(op);
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Puts a topology drag back to the body it started from. Does not append history.
+    pub fn restore_block_body(
+        &mut self,
+        id: EntityId,
+        body: Option<crate::topology::SolidBody>,
+        size_m: [f64; 3],
+        translation: Vec3,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        if size_m.iter().any(|axis| !axis.is_finite()) {
+            return Err(AuthoringError::InvalidValue);
+        }
+        if let Some(body) = &body {
+            body.validate().map_err(topology_error)?;
+            let extent = body.aabb_size();
+            if (0..3).any(|axis| (extent[axis] - size_m[axis]).abs() > 1.0e-3) {
+                return Err(AuthoringError::InvalidValue);
+            }
+        }
+        if size_m.iter().any(|axis| *axis < crate::BLOCK_MIN_EXTENT_M - 1.0e-9 || *axis > crate::BLOCK_MAX_EXTENT_M + 1.0e-9) {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let same_body = self.blocks[index].record.body == body;
+        let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - size_m[axis]).abs() < 1.0e-9);
+        if same_body && same_size && translation_matches(local.translation, translation) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.body = body;
+        self.blocks[index].record.size_m = size_m;
+        self.blocks[index].record.clamp_features();
+        self.rebuild_block_mesh(index)?;
+        self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Inserts the midpoint of one edge and records it.
+    pub fn split_block_edge(&mut self, id: EntityId, edge: u32) -> Result<AuthoringResult, AuthoringError> {
+        self.store_topology_edit(id, |body| body.split_edge(edge), crate::BlockOp::SplitEdge { edge })
+    }
+
+    /// Replaces one quad with a grid and records it.
+    pub fn subdivide_block_face(&mut self, id: EntityId, face: u32, u: u32, v: u32) -> Result<AuthoringResult, AuthoringError> {
+        self.store_topology_edit(id, |body| body.subdivide_face(face, u, v), crate::BlockOp::SubdivideFace { face, u, v })
+    }
+
+    fn refuse_body(&self, index: usize) -> Result<(), AuthoringError> {
+        if self.blocks[index].record.body.is_some() {
+            Err(AuthoringError::InvalidOperation)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn scale_block_body(&mut self, id: EntityId, axis: usize, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let mut size = self.blocks[index].record.size_m;
+        size[axis] = meters;
+        let body = self.blocks[index].record.body.clone().ok_or(AuthoringError::InvalidOperation)?;
+        let edit = body.scale_to(size).map_err(|_| AuthoringError::InvalidValue)?;
+        finite_body_size(&edit.body)?;
+        self.blocks[index].record.body = Some(edit.body);
+        self.blocks[index].record.size_m = edit.size_m;
+        self.blocks[index].record.clamp_features();
+        let stored = self.blocks[index].record.size_m;
+        self.blocks[index].record.push_op(crate::BlockOp::Size { size_m: stored });
+        self.rebuild_block_mesh(index)?;
+        let local = self.entity_local_pose(id)?;
+        self.write_block_translation(id, translation_plus_shift(local, edit.shift))?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    fn store_topology_edit(
+        &mut self,
+        id: EntityId,
+        edit_of: impl FnOnce(&crate::topology::SolidBody) -> Result<crate::topology::TopologyEdit, crate::topology::TopologyError>,
+        op: crate::BlockOp,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        if self.blocks[index].record.analytic_features() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let source = match &self.blocks[index].record.body {
+            Some(body) => body.clone(),
+            None => crate::topology::SolidBody::from_box(self.blocks[index].record.size_m).map_err(topology_error)?,
+        };
+        let edit = edit_of(&source).map_err(topology_error)?;
+        finite_body_size(&edit.body)?;
+        self.blocks[index].record.body = Some(edit.body);
+        self.blocks[index].record.size_m = edit.size_m;
+        self.blocks[index].record.clamp_features();
+        self.blocks[index].record.push_op(op);
+        self.rebuild_block_mesh(index)?;
+        let local = self.entity_local_pose(id)?;
+        self.write_block_translation(id, translation_plus_shift(local, edit.shift))?;
         self.revise();
         Ok(AuthoringResult::Applied)
     }

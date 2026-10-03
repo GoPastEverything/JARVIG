@@ -704,6 +704,9 @@ impl ComponentRecord {
                     fields.push(("bevel_m", Json::number(block.bevel_m)));
                     fields.push(("history", block_history_json(&block.history)));
                 }
+                if let Some(body) = &block.body {
+                    fields.push(("body", solid_body_json(body)));
+                }
                 Json::object(fields)
             }
             Self::WorldSettings => Json::object(vec![("type", Json::string("WorldSettings")), ("version", Json::int(1))]),
@@ -1092,12 +1095,17 @@ fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
             };
             let bevel_m = optional_f64(json, "bevel_m", 0.0)?;
             let history = parse_block_history(json)?;
+            let body = match json.get("body") {
+                None => None,
+                Some(value) => Some(parse_solid_body(value)?),
+            };
             let block = crate::BlockRecord {
                 size_m: [size[0], size[1], size[2]],
                 inset_m: inset,
                 bevel_m,
                 material,
                 history,
+                body,
             };
             block.validate()?;
             Ok(ComponentRecord::ParametricBlock(block))
@@ -1299,6 +1307,19 @@ fn block_history_json(history: &[crate::BlockOp]) -> Json {
                     ("op", Json::string("mirror")),
                     ("axis", Json::int(*axis as i64)),
                 ]),
+                crate::BlockOp::MoveEdge { edge, delta_m } => topology_delta_json("move-edge", "edge", *edge, *delta_m),
+                crate::BlockOp::ExtrudeEdge { edge, delta_m } => topology_delta_json("extrude-edge", "edge", *edge, *delta_m),
+                crate::BlockOp::SplitEdge { edge } => Json::object(vec![
+                    ("op", Json::string("split-edge")),
+                    ("edge", Json::int(*edge as i64)),
+                ]),
+                crate::BlockOp::SubdivideFace { face, u, v } => Json::object(vec![
+                    ("op", Json::string("subdivide-face")),
+                    ("face", Json::int(*face as i64)),
+                    ("u", Json::int(*u as i64)),
+                    ("v", Json::int(*v as i64)),
+                ]),
+                crate::BlockOp::MoveVertex { vertex, delta_m } => topology_delta_json("move-vertex", "vertex", *vertex, *delta_m),
             })
             .collect(),
     )
@@ -1321,6 +1342,15 @@ fn parse_block_history(json: &Json) -> Result<Vec<crate::BlockOp>, LevelError> {
             "inset" => crate::BlockOp::InsetFace { face: block_face_index(entry)?, distance_m: required_f64(entry, "distance_m")? },
             "bevel" => crate::BlockOp::Bevel { distance_m: required_f64(entry, "distance_m")? },
             "mirror" => crate::BlockOp::Mirror { axis: block_axis_index(entry)? },
+            "move-edge" => crate::BlockOp::MoveEdge { edge: nonzero_u32(entry, "edge")?, delta_m: required_delta(entry)? },
+            "extrude-edge" => crate::BlockOp::ExtrudeEdge { edge: nonzero_u32(entry, "edge")?, delta_m: required_delta(entry)? },
+            "split-edge" => crate::BlockOp::SplitEdge { edge: nonzero_u32(entry, "edge")? },
+            "subdivide-face" => crate::BlockOp::SubdivideFace {
+                face: nonzero_u32(entry, "face")?,
+                u: required_u32(entry, "u")?,
+                v: required_u32(entry, "v")?,
+            },
+            "move-vertex" => crate::BlockOp::MoveVertex { vertex: nonzero_u32(entry, "vertex")?, delta_m: required_delta(entry)? },
             other => return Err(LevelError::Corrupt(format!("unknown block edit {other}"))),
         };
         history.push(op);
@@ -1330,6 +1360,119 @@ fn parse_block_history(json: &Json) -> Result<Vec<crate::BlockOp>, LevelError> {
         history.drain(0..extra);
     }
     Ok(history)
+}
+
+fn topology_delta_json(op: &str, key: &str, id: u32, delta_m: [f64; 3]) -> Json {
+    Json::object(vec![
+        ("op", Json::string(op)),
+        (key, Json::int(id as i64)),
+        ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+    ])
+}
+
+fn solid_body_json(body: &crate::topology::SolidBody) -> Json {
+    Json::object(vec![
+        ("next_id", Json::int(body.next_id as i64)),
+        (
+            "vertices",
+            Json::array(
+                body.vertices
+                    .iter()
+                    .map(|vertex| {
+                        Json::array(vec![
+                            Json::int(vertex.id as i64),
+                            Json::number(vertex.position[0]),
+                            Json::number(vertex.position[1]),
+                            Json::number(vertex.position[2]),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "edges",
+            Json::array(
+                body.edges
+                    .iter()
+                    .map(|edge| Json::array(vec![Json::int(edge.id as i64), Json::int(edge.a as i64), Json::int(edge.b as i64)]))
+                    .collect(),
+            ),
+        ),
+        (
+            "faces",
+            Json::array(
+                body.faces
+                    .iter()
+                    .map(|face| {
+                        let mut values = vec![Json::int(face.id as i64)];
+                        values.extend(face.vertices.iter().copied().map(|id| Json::int(id as i64)));
+                        Json::array(values)
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn parse_solid_body(json: &Json) -> Result<crate::topology::SolidBody, LevelError> {
+    let next_id = required_u32(json, "next_id")?;
+    let mut vertices = Vec::new();
+    for entry in json.get("vertices").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block body vertices are missing".into()))? {
+        let values = entry.as_array().ok_or_else(|| LevelError::Corrupt("block body vertex is not a list".into()))?;
+        if values.len() != 4 {
+            return Err(LevelError::Corrupt("block body vertex has the wrong width".into()));
+        }
+        vertices.push(crate::topology::SolidVertex {
+            id: json_u32(&values[0], "vertex")?,
+            position: [json_f64(&values[1], "vertex")?, json_f64(&values[2], "vertex")?, json_f64(&values[3], "vertex")?],
+        });
+    }
+    let mut edges = Vec::new();
+    for entry in json.get("edges").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block body edges are missing".into()))? {
+        let values = entry.as_array().ok_or_else(|| LevelError::Corrupt("block body edge is not a list".into()))?;
+        if values.len() != 3 {
+            return Err(LevelError::Corrupt("block body edge has the wrong width".into()));
+        }
+        edges.push(crate::topology::SolidEdge { id: json_u32(&values[0], "edge")?, a: json_u32(&values[1], "edge")?, b: json_u32(&values[2], "edge")? });
+    }
+    let mut faces = Vec::new();
+    for entry in json.get("faces").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block body faces are missing".into()))? {
+        let values = entry.as_array().ok_or_else(|| LevelError::Corrupt("block body face is not a list".into()))?;
+        if values.len() < 4 {
+            return Err(LevelError::Corrupt("block body face has the wrong width".into()));
+        }
+        let mut loop_ = Vec::new();
+        for value in values.iter().skip(1) {
+            loop_.push(json_u32(value, "face")?);
+        }
+        faces.push(crate::topology::SolidFace { id: json_u32(&values[0], "face")?, vertices: loop_ });
+    }
+    Ok(crate::topology::SolidBody { next_id, vertices, edges, faces })
+}
+
+fn json_f64(json: &Json, label: &str) -> Result<f64, LevelError> {
+    json.as_f64().ok_or_else(|| LevelError::Corrupt(format!("{label} is not a number")))
+}
+
+fn json_u32(json: &Json, label: &str) -> Result<u32, LevelError> {
+    let value = json_f64(json, label)?;
+    if value.fract() != 0.0 || !(0.0..u32::MAX as f64).contains(&value) {
+        return Err(LevelError::Corrupt(format!("{label} is not an integer")));
+    }
+    Ok(value as u32)
+}
+
+fn nonzero_u32(json: &Json, key: &str) -> Result<u32, LevelError> {
+    let value = required_u32(json, key)?;
+    if value == 0 {
+        return Err(LevelError::Corrupt("block element id is zero".into()));
+    }
+    Ok(value)
+}
+
+fn required_delta(json: &Json) -> Result<[f64; 3], LevelError> {
+    let values = required_floats(json, "delta_m", 3)?;
+    Ok([values[0], values[1], values[2]])
 }
 
 fn block_face_index(json: &Json) -> Result<u8, LevelError> {

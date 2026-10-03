@@ -22,7 +22,7 @@ Icons are the PNGs in `assets/editor/ui/navigation/`. Windows Imaging decodes th
 
 Select, Move, Rotate, and Scale are the mesh tools. Move is the caption for Translate. The active tool is a darker tile, a blue bottom edge, and an accent-tinted icon. Inactive tools in that group are gray on charcoal. Hover lightens the tile. Scale is dimmed and cannot become active: the frame has no scale. Select picks. Move and Rotate drag a gizmo. See [gizmos.md](gizmos.md).
 
-Block sits in that group and is not a tool mode. It runs the same Create Block command as the menu and places one parametric solid. It does not stay selected. Extrude, Inset, and Bevel appear after Block, with a gap before Extrude, only while a parametric solid is selected outside Play, Land, and Character. They start one modeling session. ADR-0067.
+Block sits in that group and is not a tool mode. It runs the same Create Block command as the menu and places one parametric solid. It does not stay selected. Extrude, Inset, Bevel, Subdiv, Edge, Extend, Split, and Vertex appear after Block, with a gap before Extrude, only while a parametric solid is selected outside Play, Land, and Character. Extrude, Inset, Bevel, Edge, Extend, and Vertex start one modeling session. Subdiv and Split run on the click. ADR-0067. ADR-0069.
 
 Level, Land, and Character sit after that group and before Play. Each has an icon and its name. One is active. They choose an editor view of the open level. They do not load a second world. See [workspaces.md](workspaces.md).
 

@@ -42,8 +42,18 @@ pub enum AuthoringCommand {
         baseline_local: jarvig_core::Vec3,
         outward_m: f64,
     },
-    /// One history entry when an extrude session is applied. A drag release does not call this.
+    /// One history entry when an extrude session is applied. A viewport drag commits this on mouse-up.
     CommitBlockFace { target: EntityId, face: u8, baseline_size: [f64; 3] },
+    /// Live topological body. History is [`Self::CommitBlockTopology`]. `translation` is absolute.
+    PreviewBlockBody { target: EntityId, body: jarvig_core::SolidBody, translation: jarvig_core::Vec3 },
+    /// One log line after the body is already stored. Only a topology edit is accepted.
+    CommitBlockTopology { target: EntityId, op: jarvig_core::BlockOp },
+    /// Puts a topology drag back. Does not append history.
+    RestoreBlockBody { target: EntityId, body: Option<jarvig_core::SolidBody>, size_m: [f64; 3], translation: jarvig_core::Vec3 },
+    /// Midpoint of one edge. One undo entry.
+    SplitBlockEdge { target: EntityId, edge: u32 },
+    /// One quad becomes a grid of quads. One undo entry.
+    SubdivideBlockFace { target: EntityId, face: u32, u: u32, v: u32 },
     /// Live bevel. History is [`Self::CommitBlockBevel`].
     PreviewBlockBevel { target: EntityId, meters: f64 },
     /// Live inset on one face. History is [`Self::CommitBlockInset`].
@@ -151,6 +161,11 @@ impl EngineSession {
             AuthoringCommand::RestoreBlockDrag { target, size_m, inset_m, bevel_m, translation } => {
                 self.world.restore_block_drag(target, size_m, inset_m, bevel_m, translation)
             }
+            AuthoringCommand::PreviewBlockBody { target, body, translation } => self.world.preview_block_body(target, body, translation),
+            AuthoringCommand::CommitBlockTopology { target, op } => self.world.commit_block_topology(target, op),
+            AuthoringCommand::RestoreBlockBody { target, body, size_m, translation } => self.world.restore_block_body(target, body, size_m, translation),
+            AuthoringCommand::SplitBlockEdge { target, edge } => self.world.split_block_edge(target, edge),
+            AuthoringCommand::SubdivideBlockFace { target, face, u, v } => self.world.subdivide_block_face(target, face, u, v),
             AuthoringCommand::CreateBlock { local } => {
                 let master = if self.runtime.profile().renders() {
                     Some(self.current_material_master().map_err(|_| AuthoringError::InvalidOperation)?)

@@ -205,6 +205,11 @@ pub enum ToolbarCommand {
     Extrude,
     Inset,
     Bevel,
+    Subdivide,
+    MoveEdge,
+    ExtrudeEdge,
+    SplitEdge,
+    MoveVertex,
     Level,
     Land,
     Character,
@@ -240,7 +245,10 @@ impl ToolbarCommand {
 
     /// Shown only while a parametric solid is selected.
     pub fn is_modeling(self) -> bool {
-        matches!(self, Self::Extrude | Self::Inset | Self::Bevel)
+        matches!(
+            self,
+            Self::Extrude | Self::Inset | Self::Bevel | Self::Subdivide | Self::MoveEdge | Self::ExtrudeEdge | Self::SplitEdge | Self::MoveVertex
+        )
     }
 
     /// Log and menu name. Longer than the toolbar caption.
@@ -254,6 +262,11 @@ impl ToolbarCommand {
             Self::Extrude => "Extrude",
             Self::Inset => "Inset",
             Self::Bevel => "Bevel",
+            Self::Subdivide => "Subdivide",
+            Self::MoveEdge => "Move Edge",
+            Self::ExtrudeEdge => "Extrude Edge",
+            Self::SplitEdge => "Split Edge",
+            Self::MoveVertex => "Move Vertex",
             Self::Level => "Level",
             Self::Land => "Land",
             Self::Character => "Character",
@@ -282,6 +295,11 @@ impl ToolbarCommand {
             Self::Extrude => "Extrude",
             Self::Inset => "Inset",
             Self::Bevel => "Bevel",
+            Self::Subdivide => "Subdiv",
+            Self::MoveEdge => "Edge",
+            Self::ExtrudeEdge => "Extend",
+            Self::SplitEdge => "Split",
+            Self::MoveVertex => "Vertex",
             Self::Level => "Level",
             Self::Land => "Land",
             Self::Character => "Character",
@@ -550,6 +568,11 @@ const BUTTONS: &[(ToolbarCommand, &str, bool)] = &[
     (ToolbarCommand::Extrude, "extrude.png", true),
     (ToolbarCommand::Inset, "inset.png", false),
     (ToolbarCommand::Bevel, "bevel.png", false),
+    (ToolbarCommand::Subdivide, "subdivide.png", false),
+    (ToolbarCommand::MoveEdge, "move_edge.png", false),
+    (ToolbarCommand::ExtrudeEdge, "extrude_edge.png", false),
+    (ToolbarCommand::SplitEdge, "split_edge.png", false),
+    (ToolbarCommand::MoveVertex, "move_vertex.png", false),
     (ToolbarCommand::Level, "level.png", true),
     (ToolbarCommand::Land, "land.png", false),
     (ToolbarCommand::Character, "character.png", false),
@@ -922,6 +945,11 @@ mod tests {
         assert!(toolbar.load_note.is_empty(), "{}", toolbar.load_note);
         assert_eq!(toolbar.buttons.len(), BUTTONS.len());
         assert!(ToolbarCommand::Extrude.is_modeling());
+        assert!(ToolbarCommand::Subdivide.is_modeling());
+        assert!(ToolbarCommand::MoveEdge.is_modeling());
+        assert!(ToolbarCommand::ExtrudeEdge.is_modeling());
+        assert!(ToolbarCommand::SplitEdge.is_modeling());
+        assert!(ToolbarCommand::MoveVertex.is_modeling());
         assert!(!ToolbarCommand::Block.is_modeling());
         assert!(!ToolbarCommand::Block.is_object_tool());
         assert!(ToolbarCommand::Translate.is_object_tool());
@@ -939,7 +967,7 @@ mod tests {
         }
         let slots = toolbar.slots(96, true);
         assert_eq!(slots.len(), BUTTONS.len());
-        assert_eq!(toolbar.slots(96, false).len(), BUTTONS.len() - 3);
+        assert_eq!(toolbar.slots(96, false).len(), BUTTONS.len() - 8);
         for slot in &slots {
             assert!(slot.height > slot.icon, "caption band");
             assert!(slot.width >= slot.icon);

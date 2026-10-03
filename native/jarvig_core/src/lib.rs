@@ -14,6 +14,7 @@ mod gpu_scene;
 mod clock;
 mod input;
 mod parametric;
+mod topology;
 mod play;
 mod settings;
 mod entity;
@@ -117,7 +118,7 @@ pub use material_set::{
     select_normal, MaterialMapRole, NormalConvention,
 };
 pub use mesh::{
-    block_surface_mesh, box_mesh, capsule_mesh, create_mesh, cube_mesh, emissive_panel_mesh, far_triangle_mesh, flat_sphere_mesh, floor_mesh, near_triangle_mesh, sphere_mesh,
+    block_surface_mesh, box_mesh, capsule_mesh, create_mesh, cube_mesh, emissive_panel_mesh, far_triangle_mesh, flat_sphere_mesh, floor_mesh, mesh_from_body, near_triangle_mesh, sphere_mesh,
     Aabb,
     BoundingSphere, LocalBounds, Mesh, MeshDesc,
     MeshError, MeshId, MeshIndexFormat, MeshLibrary, MeshTopology, MeshVertexAttribute, MeshVertexFormat, Submesh,
@@ -175,6 +176,7 @@ pub use parametric::{
     snap_translation, swap_insets, BlockOp, BlockRecord, BlockSolid, FacePush, ReferenceSegment, BLOCK_DIMENSION_SNAP_M, BLOCK_EXTRUDE_STEP_M, BLOCK_HISTORY_LIMIT,
     BLOCK_INSET_STEP_M, BLOCK_MAX_EXTENT_M, BLOCK_MIN_EXTENT_M, BLOCK_POSITION_SNAP_M, FLY_COLLISION_RADIUS_M, REFERENCE_GRID_Y_M,
 };
+pub use topology::{SolidBody, SolidEdge, SolidFace, SolidVertex, TopologyEdit, TopologyError, TopologyPick, SUBDIVIDE_MAX};
 pub use player::{
     apply_player_start_property, compose_spawn_rotation, parse_player, parse_player_start_fields, player_start_lines, validate_relative_asset, PlayerDocument, PlayerStartRecord,
     PLAYER_FORMAT_VERSION, PLAYER_SCHEMA,

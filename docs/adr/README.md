@@ -74,7 +74,8 @@ Do not edit an Accepted ADR in place to change the decision. Write a new ADR and
 | [0064](ADR-0064-a-parametric-solid-builds-its-clusters.md) | A parametric solid builds its clusters from the derived surface | Accepted. The close-view patch sentence for an exact solid is superseded by 0065. The size-only save sentence is superseded by 0066 |
 | [0065](ADR-0065-an-exact-parametric-solid-draws-no-relief.md) | An exact parametric solid is classified and draws no relief | Accepted. The size-only save sentence is superseded by 0066 |
 | [0066](ADR-0066-a-solid-keeps-its-parameters.md) | A solid keeps its parameters, and the inspector shows what it can do | Accepted. The permanent Modeling form and the mouse-up face commit are superseded by 0067 |
-| [0067](ADR-0067-a-modeling-operation-is-one-session.md) | A modeling operation is one session across the toolbar, the panel, and the viewport | Accepted. Mixing commands into Features is superseded by 0068 |
-| [0068](ADR-0068-selection-promotes-and-an-edit-is-one-transaction.md) | Selection promotes, and an edit is one transaction | Accepted |
+| [0067](ADR-0067-a-modeling-operation-is-one-session.md) | A modeling operation is one session across the toolbar, the panel, and the viewport | Accepted. Mixing commands into Features is superseded by 0068. The mouse-up sentence is superseded by 0069 |
+| [0068](ADR-0068-selection-promotes-and-an-edit-is-one-transaction.md) | Selection promotes, and an edit is one transaction | Accepted. The sentence that Edge and Vertex are not shown is superseded by 0069 |
+| [0069](ADR-0069-direct-manipulation-commits-and-topology-is-the-solid.md) | Direct manipulation commits, and topology is the solid | Accepted |
 
 RFCs are not in this list. See [../rfc/README.md](../rfc/README.md).

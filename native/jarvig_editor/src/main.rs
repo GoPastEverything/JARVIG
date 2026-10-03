@@ -30,7 +30,7 @@ use dock::{
 use jarvig_core::{
     camera_relative_f32, environment_diffuse_for, environment_specular_for, face_from_local_point, face_name, perspective_ray,
     pick_snapshot_skipping, plus_z_normal, reflection_probe_influence, reflection_probe_lod, render_light_record, snap_dimension, visible_side_normal,
-    AuthoringCapabilities, EntityHandle, EntityUuid, FocusError, LightKind, PropertyValue, Quat, RenderFrameId, ResolvedPose, ValueKind, Vec3,
+    AuthoringCapabilities, BlockOp, EntityHandle, EntityUuid, FocusError, LightKind, PropertyValue, Quat, RenderFrameId, ResolvedPose, SolidBody, ValueKind, Vec3,
     BLOCK_POSITION_SNAP_M, FIELD_LOCAL_ROTATION, REFLECTION_PROBE_MIP_COUNT, TYPE_CAMERA, TYPE_PARAMETRIC_BLOCK,
     TYPE_SPATIAL_FRAME,
 };
@@ -335,27 +335,58 @@ enum ModelingTool {
     Extrude,
     Inset,
     Bevel,
+    MoveEdge,
+    ExtrudeEdge,
+    MoveVertex,
 }
 
-/// Viewport pick resolution. Edge and vertex wait until a solid has those elements.
+fn topology_tool(tool: ModelingTool) -> bool {
+    matches!(tool, ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex)
+}
+
+/// Viewport pick resolution. Auto still selects a face.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionMode {
     Auto,
     Object,
     Face,
+    Edge,
+    Vertex,
 }
 
 /// One open modeling operation. The viewport handle and the amount field share this state.
+///
+/// The body is not stored here. This value is copied, and a topological body is not.
 #[derive(Clone, Copy)]
 struct ModelingSession {
     tool: ModelingTool,
     entity: EntityUuid,
     face: u8,
+    /// Edge or vertex id. Zero for an analytic face operation.
+    element: u32,
     baseline_size: [f64; 3],
     baseline_inset: [f64; 6],
     baseline_bevel: f64,
     baseline_local: Vec3,
     amount: f64,
+}
+
+/// One topology drag. The candidate is always the baseline body plus the full snapped delta.
+#[derive(Clone)]
+struct TopologyDrag {
+    entity: EntityUuid,
+    element: u32,
+    /// Body at mouse-down. A plain box is the canonical bake and is not written until commit.
+    geometry: SolidBody,
+    /// What the record held at mouse-down. `None` is a plain analytic box.
+    stored: Option<SolidBody>,
+    baseline_size: [f64; 3],
+    baseline_local: Vec3,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    start_hit: Vec3,
+    /// World axis when the drag started on the translate gizmo. Empty is a view-plane drag.
+    axis: Option<Vec3>,
 }
 
 #[derive(Clone, Copy)]
@@ -834,6 +865,16 @@ struct Editor {
     face_hover: Option<u8>,
     modeling_session: Option<ModelingSession>,
     selected_face: Option<(EntityUuid, u8)>,
+    selected_body_face: Option<(EntityUuid, u32)>,
+    selected_edge: Option<(EntityUuid, u32)>,
+    selected_vertex: Option<(EntityUuid, u32)>,
+    edge_hover: Option<u32>,
+    vertex_hover: Option<u32>,
+    body_face_hover: Option<u32>,
+    topology_drag: Option<TopologyDrag>,
+    topology_delta: [f64; 3],
+    /// `None` means no topology session. `Some(None)` means the session started from a plain box.
+    topology_session_body: Option<Option<SolidBody>>,
     selection_mode: SelectionMode,
     marquee: Option<marquee::MarqueeDrag>,
     pick_requests: u64,
@@ -1409,6 +1450,15 @@ impl Editor {
             face_hover: None,
             modeling_session: None,
             selected_face: None,
+            selected_body_face: None,
+            selected_edge: None,
+            selected_vertex: None,
+            edge_hover: None,
+            vertex_hover: None,
+            body_face_hover: None,
+            topology_drag: None,
+            topology_delta: [0.0; 3],
+            topology_session_body: None,
             selection_mode: SelectionMode::Auto,
             marquee: None,
             pick_requests: 0,
@@ -1922,8 +1972,18 @@ impl Editor {
         }
         if selection_changed {
             let primary = self.selection.primary_entity();
-            if self.selected_face.is_some_and(|(id, _)| Some(id) != primary) {
+            let owns = |id: EntityUuid| Some(id) == primary;
+            if self.selected_face.is_some_and(|(id, _)| !owns(id)) {
                 self.selected_face = None;
+            }
+            if self.selected_body_face.is_some_and(|(id, _)| !owns(id)) {
+                self.selected_body_face = None;
+            }
+            if self.selected_edge.is_some_and(|(id, _)| !owns(id)) {
+                self.selected_edge = None;
+            }
+            if self.selected_vertex.is_some_and(|(id, _)| !owns(id)) {
+                self.selected_vertex = None;
             }
         }
         self.selection_seen = self.selection.revision();
@@ -1967,14 +2027,15 @@ impl Editor {
                 )
             }
         } else {
-            let element = match self.selected_face {
-                Some((id, face)) if self.selection.primary_entity() == Some(id) => inspector::SolidElement::Face(face),
-                _ => inspector::SolidElement::Object,
-            };
+            let primary = self.selection.primary_entity();
+            let record = primary.and_then(|id| self.engine.world().authored_block(id));
+            let element = self.inspector_element(primary, record.as_ref());
             let mode_name = match self.selection_mode {
                 SelectionMode::Auto => "Auto",
                 SelectionMode::Object => "Object",
                 SelectionMode::Face => "Face",
+                SelectionMode::Edge => "Edge",
+                SelectionMode::Vertex => "Vertex",
             };
             let mut model = inspector::build_solid(&self.selection, self.viewed_world(), &staged, &meshes, element, mode_name);
             if let Some(session) = self.modeling_session {
@@ -2541,6 +2602,14 @@ impl Editor {
                 self.set_selection_mode(SelectionMode::Face);
                 return;
             }
+            inspector::InspectorCommand::SelectionEdge => {
+                self.set_selection_mode(SelectionMode::Edge);
+                return;
+            }
+            inspector::InspectorCommand::SelectionVertex => {
+                self.set_selection_mode(SelectionMode::Vertex);
+                return;
+            }
             _ => {}
         }
         let Some(entity) = self.inspector_target() else { return };
@@ -2583,6 +2652,11 @@ impl Editor {
             inspector::InspectorCommand::ExtrudeFace => self.begin_modeling(ModelingTool::Extrude),
             inspector::InspectorCommand::InsetFace => self.begin_modeling(ModelingTool::Inset),
             inspector::InspectorCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
+            inspector::InspectorCommand::MoveEdge => self.begin_modeling(ModelingTool::MoveEdge),
+            inspector::InspectorCommand::ExtrudeEdge => self.begin_modeling(ModelingTool::ExtrudeEdge),
+            inspector::InspectorCommand::MoveVertex => self.begin_modeling(ModelingTool::MoveVertex),
+            inspector::InspectorCommand::SplitEdge => self.split_selected_edge(entity),
+            inspector::InspectorCommand::SubdivideFace => self.subdivide_selected_face(entity),
             inspector::InspectorCommand::CancelModeling => self.cancel_modeling(true),
             inspector::InspectorCommand::ApplyModeling => self.apply_modeling(),
             inspector::InspectorCommand::MirrorX => self.mirror_selected_block(entity, 0),
@@ -2598,26 +2672,98 @@ impl Editor {
             }
             inspector::InspectorCommand::SelectionAuto
             | inspector::InspectorCommand::SelectionObject
-            | inspector::InspectorCommand::SelectionFace => {}
+            | inspector::InspectorCommand::SelectionFace
+            | inspector::InspectorCommand::SelectionEdge
+            | inspector::InspectorCommand::SelectionVertex => {}
         }
     }
 
     fn set_selection_mode(&mut self, mode: SelectionMode) {
         self.selection_mode = mode;
-        if mode == SelectionMode::Object {
-            self.selected_face = None;
+        match mode {
+            SelectionMode::Object => self.clear_element_selection(),
+            SelectionMode::Edge => {
+                self.selected_face = None;
+                self.selected_body_face = None;
+                self.selected_vertex = None;
+            }
+            SelectionMode::Vertex => {
+                self.selected_face = None;
+                self.selected_body_face = None;
+                self.selected_edge = None;
+            }
+            SelectionMode::Auto | SelectionMode::Face => {
+                self.selected_edge = None;
+                self.selected_vertex = None;
+            }
         }
         self.inspector_force_realize = true;
         self.rebuild_inspector();
         self.refresh_status();
     }
 
+    fn clear_element_selection(&mut self) {
+        let had = self.selected_face.take().is_some()
+            || self.selected_body_face.take().is_some()
+            || self.selected_edge.take().is_some()
+            || self.selected_vertex.take().is_some();
+        if had {
+            self.inspector_force_realize = true;
+        }
+    }
+
+    fn inspector_element(&self, primary: Option<EntityUuid>, record: Option<&jarvig_core::BlockRecord>) -> inspector::SolidElement {
+        let owns = |id: EntityUuid| primary == Some(id);
+        let stored = record.is_some_and(|record| record.body.is_some());
+        match self.selection_mode {
+            SelectionMode::Object => inspector::SolidElement::Object,
+            SelectionMode::Edge => inspector::SolidElement::Edge(self.selected_edge.filter(|(id, _)| owns(*id)).map(|(_, edge)| edge).unwrap_or(0)),
+            SelectionMode::Vertex => {
+                inspector::SolidElement::Vertex(self.selected_vertex.filter(|(id, _)| owns(*id)).map(|(_, vertex)| vertex).unwrap_or(0))
+            }
+            SelectionMode::Auto | SelectionMode::Face => {
+                if stored {
+                    if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| owns(*id)) {
+                        inspector::SolidElement::BodyFace(face)
+                    } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| owns(*id)) {
+                        inspector::SolidElement::BodyFace(u32::from(face) + 1)
+                    } else {
+                        inspector::SolidElement::Object
+                    }
+                } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| owns(*id)) {
+                    inspector::SolidElement::Face(face)
+                } else {
+                    inspector::SolidElement::Object
+                }
+            }
+        }
+    }
+
     fn selection_element_suffix(&self) -> String {
         if self.selection.is_empty() {
             return String::new();
         }
+        let primary = self.selection.primary_entity();
+        if let Some((id, edge)) = self.selected_edge {
+            if Some(id) == primary {
+                return format!(" · Edge E:{edge}");
+            }
+        }
+        if let Some((id, vertex)) = self.selected_vertex {
+            if Some(id) == primary {
+                return format!(" · Vertex V:{vertex}");
+            }
+        }
+        if let Some((id, face)) = self.selected_body_face {
+            if Some(id) == primary {
+                return format!(" · Face F:{face}");
+            }
+        }
         if let Some((id, face)) = self.selected_face {
-            if self.selection.primary_entity() == Some(id) {
+            if Some(id) == primary {
+                if self.engine.world().authored_block(id).is_some_and(|record| record.body.is_some()) {
+                    return format!(" · Face F:{}", u32::from(face) + 1);
+                }
                 return format!(" · Face {}", face_name(face));
             }
         }
@@ -2680,6 +2826,14 @@ impl Editor {
             return;
         };
         let Ok(local) = self.engine.world().entity_local_pose(entity) else { return };
+        if topology_tool(tool) {
+            self.open_topology_session(tool, entity, &record, local.translation);
+            return;
+        }
+        if record.body.is_some() {
+            self.append("This solid is a topological body. Extrude a face by moving its edges, or Reset Shape to return to the box.");
+            return;
+        }
         let face = if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
             face
         } else {
@@ -2693,12 +2847,14 @@ impl Editor {
             ModelingTool::Extrude => 0.0,
             ModelingTool::Inset => record.inset_m[face as usize],
             ModelingTool::Bevel => record.bevel_m,
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => 0.0,
         };
         self.history_begin(modeling_tool_name(tool), &[entity]);
         self.modeling_session = Some(ModelingSession {
             tool,
             entity,
             face,
+            element: 0,
             baseline_size: record.size_m,
             baseline_inset: record.inset_m,
             baseline_bevel: record.bevel_m,
@@ -2742,6 +2898,7 @@ impl Editor {
                 meters: applied,
             }),
             ModelingTool::Bevel => self.engine.execute_authoring(AuthoringCommand::PreviewBlockBevel { target: session.entity, meters: applied }),
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => return,
         };
         if result.is_err() {
             self.realize_inspector_controls();
@@ -2756,6 +2913,10 @@ impl Editor {
     fn apply_modeling(&mut self) {
         let Some(session) = self.modeling_session.take() else { return };
         self.face_drag.take();
+        self.topology_drag.take();
+        let stored_body = self.topology_session_body.take();
+        let delta = self.topology_delta;
+        self.topology_delta = [0.0; 3];
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
         }
@@ -2775,6 +2936,19 @@ impl Editor {
                 target: session.entity,
                 baseline_m: session.baseline_bevel,
             }),
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => {
+                if delta.iter().all(|axis| axis.abs() < 1.0e-12) {
+                    Ok(jarvig_core::AuthoringResult::Unchanged)
+                } else {
+                    let op = match session.tool {
+                        ModelingTool::MoveEdge => BlockOp::MoveEdge { edge: session.element, delta_m: delta },
+                        ModelingTool::ExtrudeEdge => BlockOp::ExtrudeEdge { edge: session.element, delta_m: delta },
+                        ModelingTool::MoveVertex => BlockOp::MoveVertex { vertex: session.element, delta_m: delta },
+                        _ => BlockOp::MoveEdge { edge: session.element, delta_m: delta },
+                    };
+                    self.engine.execute_authoring(AuthoringCommand::CommitBlockTopology { target: session.entity, op })
+                }
+            }
         };
         match result {
             Ok(jarvig_core::AuthoringResult::Unchanged) => {
@@ -2786,7 +2960,16 @@ impl Editor {
                 self.append(&format!("Applied {name}."));
             }
             Err(error) => {
-                let _ = self.history_cancel();
+                if !self.history_cancel() && topology_tool(session.tool) {
+                    if let Some(body) = stored_body {
+                        let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                            target: session.entity,
+                            body,
+                            size_m: session.baseline_size,
+                            translation: session.baseline_local,
+                        });
+                    }
+                }
                 self.append(&format!("{name} was not applied: {error}."));
             }
         }
@@ -2799,15 +2982,29 @@ impl Editor {
     fn cancel_modeling(&mut self, announce: bool) {
         let Some(session) = self.modeling_session.take() else { return };
         self.face_drag = None;
+        self.topology_drag = None;
         self.gizmo_drag = None;
+        let stored_body = self.topology_session_body.take();
+        self.topology_delta = [0.0; 3];
         if !self.history_cancel() {
-            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
-                target: session.entity,
-                size_m: session.baseline_size,
-                inset_m: session.baseline_inset,
-                bevel_m: session.baseline_bevel,
-                translation: session.baseline_local,
-            });
+            if topology_tool(session.tool) {
+                if let Some(body) = stored_body {
+                    let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                        target: session.entity,
+                        body,
+                        size_m: session.baseline_size,
+                        translation: session.baseline_local,
+                    });
+                }
+            } else {
+                let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
+                    target: session.entity,
+                    size_m: session.baseline_size,
+                    inset_m: session.baseline_inset,
+                    bevel_m: session.baseline_bevel,
+                    translation: session.baseline_local,
+                });
+            }
         }
         if matches!(self.capture, Some(CaptureKind::Face | CaptureKind::Gizmo)) {
             self.end_capture(true, false);
@@ -2820,6 +3017,173 @@ impl Editor {
         unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
     }
 
+    fn open_topology_session(&mut self, tool: ModelingTool, entity: EntityUuid, record: &jarvig_core::BlockRecord, translation: Vec3) {
+        if record.analytic_features() {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        }
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        };
+        let element = match tool {
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge => match self.selected_edge.filter(|(id, _)| *id == entity) {
+                Some((_, edge)) => edge,
+                None => {
+                    self.append("Select an edge first.");
+                    return;
+                }
+            },
+            ModelingTool::MoveVertex => match self.selected_vertex.filter(|(id, _)| *id == entity) {
+                Some((_, vertex)) => vertex,
+                None => {
+                    self.append("Select a vertex first.");
+                    return;
+                }
+            },
+            _ => return,
+        };
+        let present = match tool {
+            ModelingTool::MoveVertex => body.vertex_position(element).is_some(),
+            _ => body.edge_endpoints(element).is_some(),
+        };
+        if !present {
+            self.append("That element is not on the solid.");
+            return;
+        }
+        self.history_begin(modeling_tool_name(tool), &[entity]);
+        self.topology_session_body = Some(record.body.clone());
+        self.topology_delta = [0.0; 3];
+        self.modeling_session = Some(ModelingSession {
+            tool,
+            entity,
+            face: 0,
+            element,
+            baseline_size: record.size_m,
+            baseline_inset: record.inset_m,
+            baseline_bevel: record.bevel_m,
+            baseline_local: translation,
+            amount: 0.0,
+        });
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    fn split_selected_edge(&mut self, entity: EntityUuid) {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            self.append("Return to the level before modeling a solid.");
+            return;
+        }
+        if self.modeling_session.is_some() {
+            self.cancel_modeling(false);
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else { return };
+        if record.analytic_features() {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        }
+        let Some((_, edge)) = self.selected_edge.filter(|(id, _)| *id == entity) else {
+            self.append("Select an edge first.");
+            return;
+        };
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        };
+        if body.edge_endpoints(edge).is_none() {
+            self.append("That element is not on the solid.");
+            return;
+        }
+        let opened = self.history_begin("Split Edge", &[entity]);
+        match self.engine.execute_authoring(AuthoringCommand::SplitBlockEdge { target: entity, edge }) {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("Split Edge left the solid unchanged.");
+            }
+            Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append(&format!("Split edge E:{edge}."));
+                self.sync_outliner();
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Split Edge was not applied: {error}."));
+            }
+        }
+    }
+
+    fn subdivide_selected_face(&mut self, entity: EntityUuid) {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            self.append("Return to the level before modeling a solid.");
+            return;
+        }
+        if self.modeling_session.is_some() {
+            self.cancel_modeling(false);
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else { return };
+        if record.analytic_features() {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        }
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        };
+        let face = if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+            face
+        } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
+            u32::from(face) + 1
+        } else {
+            self.append("Subdivide used +X. Select a face to choose another.");
+            1
+        };
+        match body.face_len(face) {
+            Some(4) => {}
+            Some(_) => {
+                self.append("Subdivide Face needs a quad.");
+                return;
+            }
+            None => {
+                self.append("That element is not on the solid.");
+                return;
+            }
+        }
+        let opened = self.history_begin("Subdivide Face", &[entity]);
+        match self.engine.execute_authoring(AuthoringCommand::SubdivideBlockFace { target: entity, face, u: 2, v: 2 }) {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("Subdivide left the solid unchanged.");
+            }
+            Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.selected_face = None;
+                self.selected_body_face = Some((entity, face));
+                self.selected_edge = None;
+                self.selected_vertex = None;
+                self.append(&format!("Subdivided face F:{face} 2×2."));
+                self.inspector_force_realize = true;
+                self.sync_outliner();
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Subdivide was not applied: {error}."));
+            }
+        }
+    }
+
     fn mirror_selected_block(&mut self, entity: EntityUuid, axis: u8) {
         self.cancel_modeling(false);
         let opened = self.history_begin("Mirror", &[]);
@@ -2830,7 +3194,7 @@ impl Editor {
                     self.history_commit();
                 }
                 self.append(&format!("Mirrored {entity} as {created}. The copy is independent."));
-                self.selected_face = None;
+                self.clear_element_selection();
                 let _ = self.selection.replace_from(selection::SelectionItem::Entity(created), selection::SelectionSource::Inspector);
                 self.sync_outliner();
             }
@@ -4035,7 +4399,7 @@ impl Editor {
         if self.gizmo_drag.is_some() {
             self.cancel_gizmo();
         }
-        if self.face_drag.is_some() {
+        if self.face_drag.is_some() || self.topology_drag.is_some() {
             self.cancel_face();
         }
         self.viewport_resize_requests = self.viewport_resize_requests.saturating_add(1);
@@ -6652,15 +7016,68 @@ impl Editor {
         perspective_ray(camera.pose(), camera.vertical_fov_radians, width, height, x, y)
     }
 
+    fn gizmo_shows_rotation(&self) -> bool {
+        self.modeling_session.is_none() && self.object_tool == chrome::ToolbarCommand::Rotate
+    }
+
+    /// World point of the edge or vertex the translate gizmo should ride on.
+    fn element_gizmo_point(&self) -> Option<Vec3> {
+        let entity = self.selection.primary_entity()?;
+        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        let record = self.engine.world().authored_block(entity)?;
+        let body = record.display_body()?;
+        let local = if let Some(session) = self.modeling_session.filter(|session| topology_tool(session.tool) && session.entity == entity) {
+            self.topology_local_point(&body, session.tool, session.element)?
+        } else if self.object_tool != chrome::ToolbarCommand::Translate || self.modeling_session.is_some() {
+            return None;
+        } else if self.selection_mode == SelectionMode::Edge {
+            let (_, edge) = self.selected_edge.filter(|(id, _)| *id == entity)?;
+            self.edge_midpoint(&body, edge)?
+        } else if self.selection_mode == SelectionMode::Vertex {
+            let (_, vertex) = self.selected_vertex.filter(|(id, _)| *id == entity)?;
+            body.vertex_position(vertex)?
+        } else {
+            return None;
+        };
+        Some(pose.translation + pose.rotation.rotate(Vec3::new(local[0], local[1], local[2])))
+    }
+
+    fn edge_midpoint(&self, body: &SolidBody, edge: u32) -> Option<[f64; 3]> {
+        let (start, end) = body.edge_endpoints(edge)?;
+        Some([(start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5, (start[2] + end[2]) * 0.5])
+    }
+
+    fn topology_local_point(&self, body: &SolidBody, tool: ModelingTool, element: u32) -> Option<[f64; 3]> {
+        if tool == ModelingTool::MoveVertex {
+            body.vertex_position(element)
+        } else {
+            self.edge_midpoint(body, element)
+        }
+    }
+
     fn gizmo_target(&self) -> Option<(EntityUuid, ResolvedPose)> {
-        if self.session_active() || self.modeling_session.is_some() {
+        if self.session_active() {
             return None;
         }
-        if !matches!(self.object_tool, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) {
+        let topology = self.modeling_session.is_some_and(|session| topology_tool(session.tool));
+        if self.modeling_session.is_some() && !topology {
+            return None;
+        }
+        if !topology && !matches!(self.object_tool, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) {
             return None;
         }
         let entity = self.selection.primary_entity()?;
-        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        if self.modeling_session.is_some_and(|session| session.entity != entity) {
+            return None;
+        }
+        let mut pose = self.engine.world().entity_world_pose(entity).ok()?;
+        if !self.gizmo_shows_rotation() {
+            if let Some(point) = self.element_gizmo_point() {
+                pose.translation = point;
+            } else if topology {
+                return None;
+            }
+        }
         Some((entity, pose))
     }
 
@@ -6683,7 +7100,7 @@ impl Editor {
             length,
             self.transform_space,
             pose.rotation,
-            self.object_tool == chrome::ToolbarCommand::Rotate,
+            self.gizmo_shows_rotation(),
         )
     }
 
@@ -6695,8 +7112,19 @@ impl Editor {
     }
 
     fn viewport_press(&mut self, hwnd: HWND, x: f64, y: f64, ctrl: bool, shift: bool) {
+        // An axis on the element gizmo edits that edge or vertex. A miss falls through to a view-plane drag.
+        if !ctrl && !shift && self.element_gizmo_point().is_some() && self.begin_topology_axis_drag(hwnd, x, y) {
+            return;
+        }
+        // A topology session drags from anywhere in the view. The edge itself is a thin target.
+        if !ctrl && !shift && self.modeling_session.is_some_and(|session| topology_tool(session.tool) && self.selection.primary_entity() == Some(session.entity))
+        {
+            if self.begin_topology_drag(hwnd, x, y) {
+                return;
+            }
+        }
         // The open modeling arrow and its face come before the transform gizmo.
-        if !ctrl && !shift {
+        if !ctrl && !shift && !self.modeling_session.is_some_and(|session| topology_tool(session.tool)) {
             if let Some(face) = self.operation_handle_at(x, y) {
                 if self.begin_face_drag(hwnd, face, x, y) {
                     return;
@@ -6716,6 +7144,9 @@ impl Editor {
         }
         // An axis or ring under the cursor starts a drag before a marker or a mesh can change the selection.
         if let Some(handle) = self.gizmo_handle_at(x, y) {
+            if !handle.is_rotation() && self.element_gizmo_point().is_some() {
+                return;
+            }
             self.begin_gizmo_drag(hwnd, handle, x, y);
             return;
         }
@@ -6758,7 +7189,7 @@ impl Editor {
                     .unwrap_or(hit.entity);
                 let item = selection::SelectionItem::Entity(entity);
                 self.apply_click_selection(item, ctrl, shift);
-                self.assign_picked_element(entity, hit.position);
+                self.assign_picked_element(entity, hit.position, x, y);
                 self.selection_change_us = started.elapsed().as_micros();
                 self.sync_selection_view();
             }
@@ -6766,7 +7197,7 @@ impl Editor {
                 self.pick_misses = self.pick_misses.saturating_add(1);
                 if !ctrl && !shift {
                     self.selection.clear_from(selection::SelectionSource::Viewport);
-                    self.selected_face = None;
+                    self.clear_element_selection();
                     self.selection_change_us = started.elapsed().as_micros();
                     self.sync_selection_view();
                 }
@@ -6784,17 +7215,78 @@ impl Editor {
         }
     }
 
-    fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3) {
-        if self.selection_mode == SelectionMode::Object {
-            if self.selected_face.take().is_some() {
-                self.inspector_force_realize = true;
+    fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64) {
+        match self.selection_mode {
+            SelectionMode::Object => self.clear_element_selection(),
+            SelectionMode::Edge => self.assign_edge(entity, x, y),
+            SelectionMode::Vertex => self.assign_vertex(entity, x, y),
+            SelectionMode::Auto | SelectionMode::Face => self.assign_face(entity, point, x, y),
+        }
+    }
+
+    fn assign_edge(&mut self, entity: EntityUuid, x: f64, y: f64) {
+        let Some((pose, record)) = self.block_display(entity) else {
+            self.clear_element_selection();
+            return;
+        };
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            self.clear_element_selection();
+            return;
+        };
+        let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
+        if let Some(pick) = body.pick_edge(origin, direction, slack) {
+            self.note_edge(entity, pick.id);
+        } else {
+            self.selected_edge = None;
+            self.selected_face = None;
+            self.selected_body_face = None;
+            self.selected_vertex = None;
+            self.inspector_force_realize = true;
+        }
+    }
+
+    fn assign_vertex(&mut self, entity: EntityUuid, x: f64, y: f64) {
+        let Some((pose, record)) = self.block_display(entity) else {
+            self.clear_element_selection();
+            return;
+        };
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            self.clear_element_selection();
+            return;
+        };
+        let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
+        if let Some(pick) = body.pick_vertex(origin, direction, slack) {
+            self.note_vertex(entity, pick.id);
+        } else {
+            self.selected_vertex = None;
+            self.selected_face = None;
+            self.selected_body_face = None;
+            self.selected_edge = None;
+            self.inspector_force_realize = true;
+        }
+    }
+
+    fn assign_face(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64) {
+        let Some((pose, record)) = self.block_display(entity) else {
+            self.clear_element_selection();
+            return;
+        };
+        if record.body.is_some() {
+            let Some(body) = record.body.as_ref() else { return };
+            let Some((origin, direction, _)) = self.topology_ray(&pose, x, y) else { return };
+            if let Some(pick) = body.pick_face(origin, direction) {
+                self.note_body_face(entity, pick.id);
+            } else {
+                self.clear_element_selection();
             }
             return;
         }
         if let Some(face) = self.face_on_block(entity, point) {
             self.note_selected_face(entity, face);
-        } else if self.selected_face.take().is_some() {
-            self.inspector_force_realize = true;
+        } else {
+            self.clear_element_selection();
         }
     }
 
@@ -6846,10 +7338,13 @@ impl Editor {
     }
 
     fn modeling_toolbar_command(&self) -> Option<chrome::ToolbarCommand> {
-        self.modeling_session.map(|session| match session.tool {
-            ModelingTool::Extrude => chrome::ToolbarCommand::Extrude,
-            ModelingTool::Inset => chrome::ToolbarCommand::Inset,
-            ModelingTool::Bevel => chrome::ToolbarCommand::Bevel,
+        self.modeling_session.and_then(|session| match session.tool {
+            ModelingTool::Extrude => Some(chrome::ToolbarCommand::Extrude),
+            ModelingTool::Inset => Some(chrome::ToolbarCommand::Inset),
+            ModelingTool::Bevel => Some(chrome::ToolbarCommand::Bevel),
+            ModelingTool::MoveEdge => Some(chrome::ToolbarCommand::MoveEdge),
+            ModelingTool::ExtrudeEdge => Some(chrome::ToolbarCommand::ExtrudeEdge),
+            ModelingTool::MoveVertex => Some(chrome::ToolbarCommand::MoveVertex),
         })
     }
 
@@ -6908,10 +7403,52 @@ impl Editor {
 
     fn note_selected_face(&mut self, entity: EntityUuid, face: u8) {
         let next = Some((entity, face));
+        self.selected_body_face = None;
+        self.selected_edge = None;
+        self.selected_vertex = None;
         if self.selected_face == next {
             return;
         }
         self.selected_face = next;
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+    }
+
+    fn note_body_face(&mut self, entity: EntityUuid, face: u32) {
+        let next = Some((entity, face));
+        self.selected_face = None;
+        self.selected_edge = None;
+        self.selected_vertex = None;
+        if self.selected_body_face == next {
+            return;
+        }
+        self.selected_body_face = next;
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+    }
+
+    fn note_edge(&mut self, entity: EntityUuid, edge: u32) {
+        let next = Some((entity, edge));
+        self.selected_face = None;
+        self.selected_body_face = None;
+        self.selected_vertex = None;
+        if self.selected_edge == next {
+            return;
+        }
+        self.selected_edge = next;
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+    }
+
+    fn note_vertex(&mut self, entity: EntityUuid, vertex: u32) {
+        let next = Some((entity, vertex));
+        self.selected_face = None;
+        self.selected_body_face = None;
+        self.selected_edge = None;
+        if self.selected_vertex == next {
+            return;
+        }
+        self.selected_vertex = next;
         self.inspector_force_realize = true;
         self.rebuild_inspector();
     }
@@ -6965,21 +7502,28 @@ impl Editor {
         let raw = match session.tool {
             ModelingTool::Extrude => drag.amount_origin + along,
             ModelingTool::Bevel | ModelingTool::Inset => (drag.amount_origin + along).max(0.0),
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => return,
         };
         self.preview_modeling_amount(raw);
     }
 
-    /// Mouse-up keeps the preview. Apply writes history. Cancel restores it.
+    /// Mouse-up commits a drag and closes that operation. A typed amount still uses Apply.
     fn commit_face(&mut self) {
-        self.face_drag.take();
+        let dragged = self.face_drag.take().is_some() || self.topology_drag.take().is_some();
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
+        }
+        if dragged {
+            self.apply_modeling();
         }
     }
 
     fn cancel_face(&mut self) {
         if self.face_drag.is_some() {
             self.restore_face_drag();
+        }
+        if self.topology_drag.is_some() {
+            self.restore_topology_preview();
         }
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
@@ -7004,12 +7548,219 @@ impl Editor {
         self.sync_outliner();
     }
 
+    fn begin_topology_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if !topology_tool(session.tool) || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let Some(geometry) = self.session_geometry(&session) else { return false };
+        let Some(local) = self.topology_local_point(&geometry, session.tool, session.element) else { return false };
+        let Ok(world_pose) = self.engine.world().entity_world_pose(session.entity) else { return false };
+        let plane_point = world_pose.translation + world_pose.rotation.rotate(Vec3::new(local[0], local[1], local[2]));
+        let Some(ray) = self.viewport_ray(x, y) else { return false };
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, plane_point, ray.direction) else { return false };
+        self.start_topology_drag(hwnd, plane_point, ray.direction, hit, None)
+    }
+
+    /// Translate-gizmo axis on the selected edge or vertex. Opens Move Edge or Move Vertex when no session is open.
+    fn begin_topology_axis_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
+        let Some(anchor) = self.element_gizmo_point() else { return false };
+        let Some(entity) = self.selection.primary_entity() else { return false };
+        let Ok(world_pose) = self.engine.world().entity_world_pose(entity) else { return false };
+        let Some(ray) = self.viewport_ray(x, y) else { return false };
+        let Some(length) = self.gizmo_length(anchor) else { return false };
+        let Some(handle) = gizmo::hit_gizmo(anchor, ray.origin, ray.direction, length, self.transform_space, world_pose.rotation, false) else {
+            return false;
+        };
+        if handle.is_rotation() {
+            return false;
+        }
+        if !self.modeling_session.is_some_and(|session| topology_tool(session.tool) && session.entity == entity) {
+            let tool = if self.selection_mode == SelectionMode::Vertex { ModelingTool::MoveVertex } else { ModelingTool::MoveEdge };
+            self.begin_modeling(tool);
+        }
+        if !self.modeling_session.is_some_and(|session| topology_tool(session.tool) && session.entity == entity) {
+            return false;
+        }
+        let axis = gizmo::axis_in_space(handle, self.transform_space, world_pose.rotation);
+        let normal = gizmo::axis_drag_plane(axis, ray.direction);
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, anchor, normal) else { return false };
+        self.gizmo_hover = Some(handle);
+        self.start_topology_drag(hwnd, anchor, normal, hit, Some(axis))
+    }
+
+    fn start_topology_drag(&mut self, hwnd: HWND, plane_point: Vec3, plane_normal: Vec3, hit: Vec3, axis: Option<Vec3>) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if !topology_tool(session.tool) || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let Some(geometry) = self.session_geometry(&session) else { return false };
+        let stored = match &self.topology_session_body {
+            Some(body) => body.clone(),
+            None => self.engine.world().authored_block(session.entity).and_then(|record| record.body),
+        };
+        self.topology_drag = Some(TopologyDrag {
+            entity: session.entity,
+            element: session.element,
+            geometry,
+            stored,
+            baseline_size: session.baseline_size,
+            baseline_local: session.baseline_local,
+            plane_point,
+            plane_normal,
+            start_hit: hit,
+            axis,
+        });
+        self.begin_capture(hwnd, CaptureKind::Face);
+        true
+    }
+
+    fn session_geometry(&self, session: &ModelingSession) -> Option<SolidBody> {
+        match &self.topology_session_body {
+            Some(Some(body)) => Some(body.clone()),
+            Some(None) => SolidBody::from_box(session.baseline_size).ok(),
+            None => self.engine.world().authored_block(session.entity).and_then(|record| record.display_body()),
+        }
+    }
+
+    fn update_topology_drag(&mut self, x: f64, y: f64) {
+        let Some(drag) = self.topology_drag.clone() else { return };
+        let Some(session) = self.modeling_session else { return };
+        if session.entity != drag.entity || !topology_tool(session.tool) {
+            return;
+        }
+        let Some(ray) = self.viewport_ray(x, y) else { return };
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, drag.plane_point, drag.plane_normal) else { return };
+        let Ok(world_pose) = self.engine.world().entity_world_pose(drag.entity) else { return };
+        let world_delta = vec_sub(hit, drag.start_hit);
+        let world_delta = if let Some(axis) = drag.axis {
+            axis.scale(snap_dimension(gizmo::scalar_along(world_delta, axis)))
+        } else {
+            world_delta
+        };
+        let local = world_pose.rotation.conjugate().rotate(world_delta);
+        let snapped = if drag.axis.is_some() {
+            [local.x, local.y, local.z]
+        } else {
+            [snap_dimension(local.x), snap_dimension(local.y), snap_dimension(local.z)]
+        };
+        if snapped == self.topology_delta {
+            return;
+        }
+        if snapped.iter().all(|axis| axis.abs() < 1.0e-12) {
+            self.restore_topology_baseline(&drag);
+            return;
+        }
+        let edited = match session.tool {
+            ModelingTool::MoveEdge => drag.geometry.move_edge(drag.element, snapped),
+            ModelingTool::ExtrudeEdge => drag.geometry.extrude_edge(drag.element, snapped),
+            ModelingTool::MoveVertex => drag.geometry.move_vertex(drag.element, snapped),
+            _ => return,
+        };
+        let Ok(edit) = edited else { return };
+        let Ok(local_pose) = self.engine.world().entity_local_pose(drag.entity) else { return };
+        let shift = local_pose.rotation.rotate(Vec3::new(edit.shift[0], edit.shift[1], edit.shift[2]));
+        let translation = Vec3::new(
+            drag.baseline_local.x + shift.x,
+            drag.baseline_local.y + shift.y,
+            drag.baseline_local.z + shift.z,
+        );
+        if self
+            .engine
+            .execute_authoring(AuthoringCommand::PreviewBlockBody { target: drag.entity, body: edit.body, translation })
+            .is_err()
+        {
+            return;
+        }
+        self.topology_delta = snapped;
+        self.rebuild_inspector();
+    }
+
+    fn restore_topology_baseline(&mut self, drag: &TopologyDrag) {
+        let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+            target: drag.entity,
+            body: drag.stored.clone(),
+            size_m: drag.baseline_size,
+            translation: drag.baseline_local,
+        });
+        self.topology_delta = [0.0; 3];
+        self.rebuild_inspector();
+    }
+
+    /// Resize and focus loss put the preview back and leave the session open.
+    fn restore_topology_preview(&mut self) {
+        let Some(drag) = self.topology_drag.take() else { return };
+        self.restore_topology_baseline(&drag);
+        self.sync_outliner();
+    }
+
+    fn block_display(&self, entity: EntityUuid) -> Option<(ResolvedPose, jarvig_core::BlockRecord)> {
+        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        let record = self.engine.world().authored_block(entity)?;
+        Some((pose, record))
+    }
+
+    fn topology_ray(&self, pose: &ResolvedPose, x: f64, y: f64) -> Option<([f64; 3], [f64; 3], f64)> {
+        let ray = self.viewport_ray(x, y)?;
+        let camera = self.editor_camera.as_ref()?;
+        let depth = vec_len(vec_sub(pose.translation, camera.position));
+        let origin = pose.rotation.conjugate().rotate(vec_sub(ray.origin, pose.translation));
+        let direction = pose.rotation.conjugate().rotate(ray.direction);
+        Some(([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z], self.pick_slack_m(depth)))
+    }
+
+    fn pick_slack_m(&self, depth: f64) -> f64 {
+        let Some(camera) = self.editor_camera.as_ref() else { return 0.05 };
+        let Some(renderer) = self.renderer.as_ref() else { return 0.05 };
+        let height = renderer.configured_size().1 as f64;
+        if height < 1.0 {
+            return 0.05;
+        }
+        (8.0 * 2.0 * depth.max(0.05) * (camera.vertical_fov_radians * 0.5).tan() / height).max(0.01)
+    }
+
+    fn update_topology_hover(&mut self, x: f64, y: f64) {
+        if self.topology_drag.is_some() || self.face_drag.is_some() || self.modeling_session.is_some() {
+            return;
+        }
+        let mut edge = None;
+        let mut vertex = None;
+        let mut face = None;
+        if let Some(entity) = self.selection.primary_entity() {
+            if let Some((pose, record)) = self.block_display(entity) {
+                if let Some(body) = record.display_body() {
+                    if let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) {
+                        match self.selection_mode {
+                            SelectionMode::Edge => edge = body.pick_edge(origin, direction, slack).map(|pick| pick.id),
+                            SelectionMode::Vertex => vertex = body.pick_vertex(origin, direction, slack).map(|pick| pick.id),
+                            SelectionMode::Auto | SelectionMode::Face if record.body.is_some() => {
+                                face = body.pick_face(origin, direction).map(|pick| pick.id);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if edge != self.edge_hover {
+            self.edge_hover = edge;
+        }
+        if vertex != self.vertex_hover {
+            self.vertex_hover = vertex;
+        }
+        if face != self.body_face_hover {
+            self.body_face_hover = face;
+        }
+    }
+
     fn update_face_hover(&mut self, x: f64, y: f64) {
         let hover = if self.face_drag.is_some() {
             self.face_drag.as_ref().map(|drag| drag.face)
-        } else if self.modeling_session.is_some() {
+        } else if self.modeling_session.is_some_and(|session| !topology_tool(session.tool)) {
             self.operation_handle_at(x, y)
-        } else if self.selection_mode == SelectionMode::Object {
+        } else if matches!(self.selection_mode, SelectionMode::Object | SelectionMode::Edge | SelectionMode::Vertex) {
+            None
+        } else if self.selection.primary_entity().is_some_and(|id| self.engine.world().authored_block(id).is_some_and(|record| record.body.is_some())) {
             None
         } else {
             self.face_under_cursor(x, y)
@@ -11961,7 +12712,7 @@ impl Editor {
             return;
         }
         let ids = self.marquee_hits(&drag);
-        self.selected_face = None;
+        self.clear_element_selection();
         if drag.ctrl {
             for id in ids {
                 if let Ok(item) = selection::SelectionItem::entity(id) {
@@ -12107,70 +12858,19 @@ impl Editor {
             let height = renderer.configured_size().1;
             let distance = vec_len(vec_sub(pose.translation, camera.position));
             let length = gizmo::visual_length(distance, camera.vertical_fov_radians, height);
+            let rotate = self.gizmo_shows_rotation();
             vertices.extend(gizmo::build_gizmo(
                 pose.translation,
                 camera.position,
                 length,
                 self.transform_space,
                 pose.rotation,
-                self.object_tool == chrome::ToolbarCommand::Rotate,
-                self.gizmo_hover.filter(|handle| handle.is_rotation() == (self.object_tool == chrome::ToolbarCommand::Rotate)),
+                rotate,
+                self.gizmo_hover.filter(|handle| handle.is_rotation() == rotate),
                 self.gizmo_drag.as_ref().map(|drag| drag.handle),
             ));
         }
-        if let Some((entity, pose, size)) = self.face_target() {
-            if let Some(length) = self.gizmo_length(pose.translation) {
-                if let Some(session) = self.modeling_session.filter(|session| session.entity == entity) {
-                    let hot = self.face_hover.filter(|face| *face == session.face);
-                    vertices.extend(gizmo::face_outline_vertices(
-                        pose.translation,
-                        pose.rotation,
-                        size,
-                        camera.position,
-                        length,
-                        &[session.face],
-                        hot,
-                    ));
-                    vertices.extend(gizmo::operation_handle_vertices(
-                        pose.translation,
-                        pose.rotation,
-                        size,
-                        camera.position,
-                        length,
-                        session.face,
-                        session.tool == ModelingTool::Inset,
-                        self.face_drag.is_some(),
-                    ));
-                } else {
-                    let face_selected = self.selected_face.is_some_and(|(id, _)| id == entity);
-                    if !face_selected {
-                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera.position, length));
-                    }
-                    let mut faces = Vec::new();
-                    if self.selection_mode != SelectionMode::Object {
-                        if let Some(face) = self.face_hover {
-                            faces.push(face);
-                        }
-                    }
-                    if let Some((id, face)) = self.selected_face {
-                        if id == entity && !faces.contains(&face) {
-                            faces.push(face);
-                        }
-                    }
-                    if !faces.is_empty() {
-                        vertices.extend(gizmo::face_outline_vertices(
-                            pose.translation,
-                            pose.rotation,
-                            size,
-                            camera.position,
-                            length,
-                            &faces,
-                            self.face_hover,
-                        ));
-                    }
-                }
-            }
-        }
+        self.push_solid_overlay(&mut vertices, camera.position);
         let segments = self.visible_joint_segments();
         if !segments.is_empty() {
             vertices.extend(gizmo::joint_debug_vertices(&segments, camera.position));
@@ -12185,6 +12885,213 @@ impl Editor {
             vertices.extend(self.marquee_segments(drag));
         }
         if vertices.is_empty() { None } else { Some(vertices) }
+    }
+
+    fn push_solid_overlay(&self, vertices: &mut Vec<jarvig_renderer::OverlayVertex>, camera: Vec3) {
+        let Some((entity, pose, size)) = self.face_target() else { return };
+        let Some(length) = self.gizmo_length(pose.translation) else { return };
+        let record = self.engine.world().authored_block(entity);
+        let body = record.as_ref().and_then(|record| record.display_body());
+        if let Some(session) = self.modeling_session.filter(|session| session.entity == entity) {
+            if topology_tool(session.tool) {
+                let geometry = self.session_geometry(&session).or(body);
+                if let Some(geometry) = geometry {
+                    let edge = matches!(session.tool, ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge).then_some(session.element);
+                    self.draw_body_edges(vertices, camera, &pose, length, &geometry, edge, None, false);
+                    if session.tool == ModelingTool::MoveVertex {
+                        if let Some(position) = geometry.vertex_position(session.element) {
+                            self.draw_vertex_marker(vertices, camera, &pose, position, length * 0.02, [0.95, 0.45, 0.38, 1.0]);
+                        }
+                    }
+                }
+                return;
+            }
+            let hot = self.face_hover.filter(|face| *face == session.face);
+            vertices.extend(gizmo::face_outline_vertices(pose.translation, pose.rotation, size, camera, length, &[session.face], hot));
+            vertices.extend(gizmo::operation_handle_vertices(
+                pose.translation,
+                pose.rotation,
+                size,
+                camera,
+                length,
+                session.face,
+                session.tool == ModelingTool::Inset,
+                self.face_drag.is_some(),
+            ));
+            return;
+        }
+        match self.selection_mode {
+            SelectionMode::Object => {
+                vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+            }
+            SelectionMode::Edge => {
+                if let Some(body) = body.as_ref() {
+                    let selected = self.selected_edge.filter(|(id, _)| *id == entity).map(|(_, edge)| edge);
+                    self.draw_body_edges(vertices, camera, &pose, length, body, selected, self.edge_hover, false);
+                } else {
+                    vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                }
+            }
+            SelectionMode::Vertex => {
+                if let Some(body) = body.as_ref() {
+                    self.draw_body_edges(vertices, camera, &pose, length, body, None, None, true);
+                    let selected = self.selected_vertex.filter(|(id, _)| *id == entity).map(|(_, vertex)| vertex);
+                    self.draw_body_vertices(vertices, camera, &pose, length, body, selected, self.vertex_hover);
+                } else {
+                    vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                }
+            }
+            SelectionMode::Auto | SelectionMode::Face => {
+                let stored = record.as_ref().is_some_and(|record| record.body.is_some());
+                if stored {
+                    if let Some(body) = body.as_ref() {
+                        let mut faces = Vec::new();
+                        if let Some(face) = self.body_face_hover {
+                            faces.push(face);
+                        }
+                        if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+                            if !faces.contains(&face) {
+                                faces.push(face);
+                            }
+                        } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
+                            let face = u32::from(face) + 1;
+                            if !faces.contains(&face) {
+                                faces.push(face);
+                            }
+                        }
+                        if faces.is_empty() {
+                            vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                        } else {
+                            for face in faces {
+                                let hot = self.body_face_hover == Some(face);
+                                self.draw_face_loop(vertices, camera, &pose, length, body, face, hot);
+                            }
+                        }
+                    }
+                } else {
+                    let face_selected = self.selected_face.is_some_and(|(id, _)| id == entity);
+                    if !face_selected && self.selection_mode != SelectionMode::Face {
+                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                    }
+                    if self.selection_mode == SelectionMode::Face && !face_selected {
+                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                    }
+                    let mut faces = Vec::new();
+                    if let Some(face) = self.face_hover {
+                        faces.push(face);
+                    }
+                    if let Some((id, face)) = self.selected_face {
+                        if id == entity && !faces.contains(&face) {
+                            faces.push(face);
+                        }
+                    }
+                    if !faces.is_empty() {
+                        vertices.extend(gizmo::face_outline_vertices(pose.translation, pose.rotation, size, camera, length, &faces, self.face_hover));
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_body_edges(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        body: &SolidBody,
+        selected: Option<u32>,
+        hover: Option<u32>,
+        faint: bool,
+    ) {
+        let mut drawn = 0u32;
+        for (id, start, end) in body.edge_segments() {
+            let hot = selected == Some(id);
+            let hovered = hover == Some(id);
+            if drawn >= 256 && !hot && !hovered {
+                continue;
+            }
+            drawn += 1;
+            let (radius, color) = if hot {
+                (length * 0.022, [0.95, 0.45, 0.38, 1.0])
+            } else if hovered {
+                (length * 0.016, [1.0, 0.82, 0.45, 1.0])
+            } else if faint {
+                (length * 0.005, [0.40, 0.48, 0.58, 1.0])
+            } else {
+                (length * 0.008, [0.45, 0.62, 0.85, 1.0])
+            };
+            gizmo::push_segment(vertices, camera, self.world_of(pose, start), self.world_of(pose, end), radius, color);
+        }
+    }
+
+    fn draw_body_vertices(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        body: &SolidBody,
+        selected: Option<u32>,
+        hover: Option<u32>,
+    ) {
+        let mut drawn = 0u32;
+        for vertex in &body.vertices {
+            let hot = selected == Some(vertex.id);
+            let hovered = hover == Some(vertex.id);
+            if drawn >= 256 && !hot && !hovered {
+                continue;
+            }
+            drawn += 1;
+            let (radius, color) = if hot {
+                (length * 0.018, [0.95, 0.45, 0.38, 1.0])
+            } else if hovered {
+                (length * 0.014, [1.0, 0.82, 0.45, 1.0])
+            } else {
+                (length * 0.008, [0.55, 0.70, 0.85, 1.0])
+            };
+            self.draw_vertex_marker(vertices, camera, pose, vertex.position, radius, color);
+        }
+    }
+
+    fn draw_vertex_marker(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        position: [f64; 3],
+        radius: f64,
+        color: [f32; 4],
+    ) {
+        let center = self.world_of(pose, position);
+        let arm = radius * 2.5;
+        for axis in [Vec3::new(arm, 0.0, 0.0), Vec3::new(0.0, arm, 0.0), Vec3::new(0.0, 0.0, arm)] {
+            gizmo::push_segment(vertices, camera, vec_sub(center, axis), center + axis, radius * 0.35, color);
+        }
+    }
+
+    fn draw_face_loop(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        body: &SolidBody,
+        face: u32,
+        hot: bool,
+    ) {
+        let Some(positions) = body.face_positions(face) else { return };
+        let color = if hot { [0.75, 0.88, 1.0, 1.0] } else { [0.95, 0.55, 0.62, 1.0] };
+        let radius = if hot { length * 0.012 } else { length * 0.016 };
+        for index in 0..positions.len() {
+            let start = self.world_of(pose, positions[index]);
+            let end = self.world_of(pose, positions[(index + 1) % positions.len()]);
+            gizmo::push_segment(vertices, camera, start, end, radius, color);
+        }
+    }
+
+    fn world_of(&self, pose: &ResolvedPose, local: [f64; 3]) -> Vec3 {
+        pose.translation + pose.rotation.rotate(Vec3::new(local[0], local[1], local[2]))
     }
 
     fn begin_capture(&mut self, hwnd: HWND, kind: CaptureKind) {
@@ -12225,6 +13132,9 @@ impl Editor {
         }
         if self.face_drag.is_some() {
             self.restore_face_drag();
+        }
+        if self.topology_drag.is_some() {
+            self.restore_topology_preview();
         }
         if self.capture == Some(CaptureKind::Terrain) {
             if self.history.open_label() == Some("Sculpt") {
@@ -12529,9 +13439,7 @@ impl Editor {
         if self.modeling_session.is_some_and(|session| session.entity != entity) {
             return;
         }
-        if self.selected_face.take().is_some() {
-            self.inspector_force_realize = true;
-        }
+        self.clear_element_selection();
         if self.selection.primary_entity() != Some(entity) {
             if let Ok(item) = selection::SelectionItem::entity(entity) {
                 let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
@@ -12546,7 +13454,7 @@ impl Editor {
             return;
         }
         let items = self.selectable_entities();
-        self.selected_face = None;
+        self.clear_element_selection();
         let _ = self.selection.replace_many_from(&items, selection::SelectionSource::Command);
         self.sync_selection_view();
     }
@@ -12555,7 +13463,7 @@ impl Editor {
         if self.session_active() {
             return;
         }
-        self.selected_face = None;
+        self.clear_element_selection();
         self.selection.clear_from(selection::SelectionSource::Command);
         self.sync_selection_view();
     }
@@ -12573,7 +13481,7 @@ impl Editor {
             .filter_map(|row| selection::SelectionItem::entity(row.uuid).ok())
             .filter(|item| !self.selection.contains(*item))
             .collect();
-        self.selected_face = None;
+        self.clear_element_selection();
         let _ = self.selection.replace_many_from(&items, selection::SelectionSource::Command);
         self.sync_selection_view();
     }
@@ -12771,7 +13679,7 @@ impl Editor {
             }
             if !self.session_active() && !self.selection.is_empty() {
                 self.selection.clear_from(selection::SelectionSource::Viewport);
-                self.selected_face = None;
+                self.clear_element_selection();
                 self.sync_selection_view();
             }
             return true;
@@ -12877,7 +13785,11 @@ impl Editor {
         }
         match message {
             WM_RBUTTONDOWN => {
-                if self.gizmo_drag.is_some() || self.face_drag.is_some() {
+                if self.gizmo_drag.is_some() {
+                    return true;
+                }
+                if self.face_drag.is_some() || self.topology_drag.is_some() {
+                    self.cancel_modeling(true);
                     return true;
                 }
                 if self.marquee.is_some() {
@@ -12894,7 +13806,7 @@ impl Editor {
                 true
             }
             WM_MBUTTONDOWN => {
-                if self.gizmo_drag.is_some() || self.face_drag.is_some() {
+                if self.gizmo_drag.is_some() || self.face_drag.is_some() || self.topology_drag.is_some() {
                     return true;
                 }
                 if self.marquee.is_some() {
@@ -12914,7 +13826,7 @@ impl Editor {
                 self.note_child_focus(PERSPECTIVE.raw());
                 let alt = (unsafe { GetKeyState(VK_MENU as i32) } as u16) & 0x8000 != 0;
                 if alt {
-                    if self.gizmo_drag.is_none() && self.face_drag.is_none() {
+                    if self.gizmo_drag.is_none() && self.face_drag.is_none() && self.topology_drag.is_none() {
                         self.begin_capture(hwnd, CaptureKind::Orbit);
                     }
                     return true;
@@ -12973,13 +13885,18 @@ impl Editor {
                 if self.capture == Some(CaptureKind::Gizmo) {
                     self.update_gizmo_drag(x, y);
                 } else if self.capture == Some(CaptureKind::Face) {
-                    self.update_face_drag(x, y);
+                    if self.topology_drag.is_some() {
+                        self.update_topology_drag(x, y);
+                    } else {
+                        self.update_face_drag(x, y);
+                    }
                 } else if self.capture == Some(CaptureKind::Terrain) {
                     self.stamp_land(x, y, false);
                 } else {
                     self.sample_captured_mouse();
                     self.update_gizmo_hover(x, y);
                     self.update_face_hover(x, y);
+                    self.update_topology_hover(x, y);
                     self.track_land_hover(x, y);
                 }
                 true
@@ -13953,6 +14870,36 @@ impl Editor {
             chrome::ToolbarCommand::Extrude => self.begin_modeling(ModelingTool::Extrude),
             chrome::ToolbarCommand::Inset => self.begin_modeling(ModelingTool::Inset),
             chrome::ToolbarCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
+            chrome::ToolbarCommand::Subdivide => {
+                if let Some(entity) = self.selection.primary_entity() {
+                    self.subdivide_selected_face(entity);
+                } else {
+                    self.append("Select a parametric solid first.");
+                }
+            }
+            chrome::ToolbarCommand::MoveEdge => {
+                self.object_tool = chrome::ToolbarCommand::Translate;
+                self.set_selection_mode(SelectionMode::Edge);
+                self.begin_modeling(ModelingTool::MoveEdge);
+            }
+            chrome::ToolbarCommand::ExtrudeEdge => {
+                self.object_tool = chrome::ToolbarCommand::Translate;
+                self.set_selection_mode(SelectionMode::Edge);
+                self.begin_modeling(ModelingTool::ExtrudeEdge);
+            }
+            chrome::ToolbarCommand::SplitEdge => {
+                self.set_selection_mode(SelectionMode::Edge);
+                if let Some(entity) = self.selection.primary_entity() {
+                    self.split_selected_edge(entity);
+                } else {
+                    self.append("Select a parametric solid first.");
+                }
+            }
+            chrome::ToolbarCommand::MoveVertex => {
+                self.object_tool = chrome::ToolbarCommand::Translate;
+                self.set_selection_mode(SelectionMode::Vertex);
+                self.begin_modeling(ModelingTool::MoveVertex);
+            }
             chrome::ToolbarCommand::Level => self.enter_mode(chrome::WorkspaceMode::Level, true),
             chrome::ToolbarCommand::Land => self.enter_mode(chrome::WorkspaceMode::Land, true),
             chrome::ToolbarCommand::Character => self.enter_mode(chrome::WorkspaceMode::Character, true),
@@ -14015,6 +14962,9 @@ fn modeling_tool_name(tool: ModelingTool) -> &'static str {
         ModelingTool::Extrude => "Extrude",
         ModelingTool::Inset => "Inset",
         ModelingTool::Bevel => "Bevel",
+        ModelingTool::MoveEdge => "Move Edge",
+        ModelingTool::ExtrudeEdge => "Extrude Edge",
+        ModelingTool::MoveVertex => "Move Vertex",
     }
 }
 
@@ -14023,6 +14973,7 @@ fn modeling_start_amount(session: &ModelingSession) -> f64 {
         ModelingTool::Extrude => 0.0,
         ModelingTool::Inset => session.baseline_inset[session.face as usize],
         ModelingTool::Bevel => session.baseline_bevel,
+        ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => 0.0,
     }
 }
 
@@ -14038,6 +14989,7 @@ fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
             grown - session.baseline_size[axis]
         }
         ModelingTool::Inset | ModelingTool::Bevel => amount.clamp(0.0, jarvig_core::feature_limit(session.baseline_size)),
+        ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => session.amount,
     }
 }
 
@@ -14046,27 +14998,63 @@ fn modeling_view(session: ModelingSession) -> inspector::ModelingView {
     match session.tool {
         ModelingTool::Extrude => inspector::ModelingView {
             title: "Extrude",
-            face: face_name(session.face),
+            face: face_name(session.face).to_string(),
             amount_label: "Amount",
             amount: session.amount,
             minimum: -1000.0,
             maximum: 1000.0,
+            show_amount: true,
+            element_label: "Face",
         },
         ModelingTool::Inset => inspector::ModelingView {
             title: "Inset",
-            face: face_name(session.face),
+            face: face_name(session.face).to_string(),
             amount_label: "Amount",
             amount: session.amount,
             minimum: 0.0,
             maximum: limit,
+            show_amount: true,
+            element_label: "Face",
         },
         ModelingTool::Bevel => inspector::ModelingView {
             title: "Bevel",
-            face: "All edges",
+            face: "All edges".to_string(),
             amount_label: "Amount",
             amount: session.amount,
             minimum: 0.0,
             maximum: limit,
+            show_amount: true,
+            element_label: "Face",
+        },
+        ModelingTool::MoveEdge => inspector::ModelingView {
+            title: "Move Edge",
+            face: format!("E:{}", session.element),
+            amount_label: "Amount",
+            amount: 0.0,
+            minimum: 0.0,
+            maximum: 0.0,
+            show_amount: false,
+            element_label: "Edge",
+        },
+        ModelingTool::ExtrudeEdge => inspector::ModelingView {
+            title: "Extrude Edge",
+            face: format!("E:{}", session.element),
+            amount_label: "Amount",
+            amount: 0.0,
+            minimum: 0.0,
+            maximum: 0.0,
+            show_amount: false,
+            element_label: "Edge",
+        },
+        ModelingTool::MoveVertex => inspector::ModelingView {
+            title: "Move Vertex",
+            face: format!("V:{}", session.element),
+            amount_label: "Amount",
+            amount: 0.0,
+            minimum: 0.0,
+            maximum: 0.0,
+            show_amount: false,
+            element_label: "Vertex",
         },
     }
 }

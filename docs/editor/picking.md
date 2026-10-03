@@ -54,7 +54,7 @@ One owner at a time.
 
 | Gesture | Result |
 | --- | --- |
-| LMB on a visible entity | Replace. On a parametric solid, Auto and Face select the hit face. Object selects the entity. |
+| LMB on a visible entity | Replace. On a parametric solid, Auto and Face select the hit face. Object selects the entity. Edge selects the edge. Vertex selects the vertex. |
 | Double-click | Promote to the owning entity. The mode stays. |
 | Shift+LMB | Add. |
 | Ctrl+LMB | Toggle. Ctrl wins over Shift. |
@@ -63,7 +63,7 @@ One owner at a time.
 | Select-mode drag on empty view | Marquee. Left to right selects objects fully enclosed. Right to left selects objects the rectangle touches. Shift adds. Ctrl toggles. The result is whole objects. |
 | RMB look, MMB pan, Alt+LMB orbit | No selection change. Escape does one action and still consumes the key. |
 
-Auto, Object, and Face are a Selection section on a parametric solid. They are not toolbar buttons. Edge and Vertex are not shown. A movement of four pixels or less is still the click in the first rows. The marquee does not hide or recenter the cursor. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. The hit is the projected box of the object. ADR-0068.
+Auto, Object, Face, Edge, and Vertex are a Selection section on a parametric solid. They are not toolbar buttons. Edge selects one edge. Vertex selects one vertex. ADR-0069. A movement of four pixels or less is still the click in the first rows. The marquee does not hide or recenter the cursor. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. The hit is the projected box of the object. ADR-0068.
 
 While a transform handle is under the cursor, the gizmo takes the press and the scene behind it is not picked. An active camera capture does not pick. A plain click does not bump the world revision. It bumps the selection revision only when the ordered selection changes.
 
