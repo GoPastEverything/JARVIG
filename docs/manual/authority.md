@@ -46,7 +46,7 @@ It leaves these out on purpose:
 
 Those files remain in the repository. A link in the site that would have opened one of them is marked as repository-only. RFC-0002 stays proposed until a person accepts the look. Do not treat a manual page as that acceptance.
 
-The local site can still contain an accepted ADR whose text names the surface rule, because that ADR is architecture. That is why `docs/site/` is gitignored and must be excluded from any copy onto the public tree. The manual chapters do not teach the rule.
+The rendered site in this repository is those pages. It does not include the session logs, the ticket board, the benchmark dumps, or the withheld procedural-detail notes. The manual chapters do not teach the private surface rule.
 
 ## What a documentation change includes
 

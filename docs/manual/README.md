@@ -18,7 +18,7 @@ Build the site from the repository root:
 pwsh -File scripts\build-docs.ps1
 ```
 
-Open `docs/site/index.html`. That folder is generated, gitignored, and local. Do not copy it into the public tree. Session logs stay in `docs/status/` on disk and are not part of the site. The private surface rule for procedural detail is not taught here.
+Open `docs/site/index.html`. That folder is the rendered copy of these pages. Rebuild it with the command above. Session logs stay in `docs/status/` and are not part of the site. The private surface rule for procedural detail is not taught here.
 
 ## Start here
 

@@ -2,7 +2,7 @@
 
 `designdoc.html` at the repository root is the founding specification. These pages are the maintainable form of that document. They do not replace it.
 
-The creator manual is [manual/README.md](manual/README.md). Generate the local site with `pwsh -File scripts\build-docs.ps1` and open `docs/site/index.html`. That site is a reader. It is gitignored. It is not a second authority, and it is not copied into a public tree.
+The creator manual is [manual/README.md](manual/README.md). The rendered site is [site/index.html](site/index.html). Rebuild it with `pwsh -File scripts\build-docs.ps1`. That site is a reader. It is not a second authority.
 
 ## Authority
 
