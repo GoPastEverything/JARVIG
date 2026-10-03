@@ -26,7 +26,9 @@ A drag does not write a GPU matrix. It sends an absolute authoring command. The 
 | Select | Picking only. No gizmo. |
 | Translate | Red X, green Y, blue Z axes. |
 | Rotate | Rings on those axes. The value is a quaternion. |
-| Scale | Visible and disabled. A spatial frame stores translation and a quaternion, not scale. |
+| Scale | Visible, labeled, and disabled. A spatial frame stores translation and a quaternion, not scale. |
+
+The toolbar caption under Translate is Move. Scale stays on that toolbar and stays dim.
 
 Scale does not invent an editor-only scale. The button stays dim. Choosing it logs that scale is unavailable. Bootstrap object scale is not an entity property.
 
@@ -46,7 +48,17 @@ Axis colors are the usual ones: X red, Y green, Z blue. Hover brightens a handle
 
 ## Hit order
 
-When Translate or Rotate is active, the ray tests gizmo handles before scene triangles. A press on a handle starts a manipulation. A miss falls through to picking. Select mode does not hit-test the gizmo.
+When Translate or Rotate is active, the ray tests gizmo handles before scene triangles. A press on a handle starts a manipulation. A miss falls through to picking. Select mode does not hit-test the gizmo. During an Extrude, Inset, or Bevel session the operation arrow is tested after the gizmo and before scene triangles.
+
+## Face outline
+
+A parametric block outlines the face under the cursor, and the face already selected, while that entity is selected and the editor is not playing. Land mode and the character workspace do not draw it. Axis colors match the gizmo: X red, Y green, Z blue. Hover blends toward white. The vertices are camera-relative lines in the same overlay that draws the gizmo. They are not scene entities, they are not saved, and they carry no dimension text. The live number is the inspector Amount field.
+
+A click on the mesh selects the face and does not start a drag. A double-click selects the whole block. Opening Extrude, Inset, or Bevel draws one arrow on the session face. Inset's arrow points inward. Dragging that arrow, or pressing the session face and dragging, snaps the delta to 0.05 m and previews from the session baseline. The drag plane faces the camera and contains the arrow, so pulling along the arrow changes the amount. A typed amount is not snapped. Mouse-up leaves the preview open. The Move and Rotate gizmo stays hidden while the session is open. Choosing Move or Rotate on the toolbar closes the preview, and that gizmo is the drag handle again. Apply writes one feature-log line and one editor transaction. Cancel, and Escape during the session, restore the session baseline and push no undo entry. A selection change away from the solid, and entering Play, do the same. A resize or a focus loss during the drag restores that baseline and leaves the session open. Keys 1 through 4 stay Select, Translate, Rotate, and scale-unavailable. WASD and Q E are not taken. ADR-0067.
+
+When the primary selection is a parametric block and no face of that block is selected, the overlay draws the analytic box in `[0.75, 0.88, 1.0]`. A modeling session suppresses that box and keeps the session face and one arrow. Imported meshes and other actors have no silhouette in this pass.
+
+Select mode arms a marquee on a press that misses the gizmo, the operation handle, a character joint pivot, and the scene. The drag does not hide or recenter the cursor. Four pixels or less is still a click. Left to right requires every projected corner in front of the camera and inside the rectangle. Right to left selects when the on-screen corner box touches the rectangle. Shift adds. Ctrl toggles. The marquee selects whole objects. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. ADR-0068.
 
 ## Translate
 
@@ -66,14 +78,14 @@ An edge-on ring is hit as a tube, and its drag plane faces the camera when the r
 
 ## Edit session
 
-The editor owns the session. It is not an undo stack.
+The editor owns the drag. That drag is one transaction on the editor undo stack. A Move or Rotate begun during an open modeling preview stays inside that preview. ADR-0068.
 
 | Step | Behavior |
 | --- | --- |
-| Begin | Store the original local translation and quaternion. Capture the mouse. The cursor stays visible and is not recentered. |
-| Update | `SetProperty` of the absolute desired value. The same value does not bump the world. A real change does. |
-| Commit | Mouse release. Keep the last value. Clear the session. |
-| Cancel | Escape, focus loss, deactivate, viewport hide, shutdown, or a resize during the drag. Write the originals back. |
+| Begin | Store the original local translation and quaternion. Open one Move or Rotate transaction when no other gesture is open. Capture the mouse. The cursor stays visible and is not recentered. |
+| Update | `SetProperty` of the absolute desired value. The same value does not bump the world. A real change does. Intermediate values are not undo entries. |
+| Commit | Mouse release. Keep the last value. Commit the open Move or Rotate. Clear the session. |
+| Cancel | Escape, focus loss, deactivate, viewport hide, shutdown, or a resize during the drag. Restore the before-stamp and push nothing. |
 
 Resize while not dragging leaves the drag alone. Camera look, pan, and orbit do not start during a drag, and the camera does not tick. An active camera capture does not start a drag. Selection revision stays put. The world revision moves because the transform changed.
 

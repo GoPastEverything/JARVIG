@@ -957,25 +957,68 @@ mod tests {
         male_build.document.instantiate_preserving_ids(&mut world, male_origin).unwrap();
         assert_placed_pose(&world, &base_build.document, &base_assembly, base_origin);
         assert_placed_pose(&world, &male_build.document, &male_assembly, male_origin);
+        let base_json = base_build.document.to_json();
+        let male_json = male_build.document.to_json();
+        assert!(male_json.contains("upperArmMesh.002"));
+        assert!(!base_json.contains("foreArmMesh.002"));
+        assert!(!male_json.contains("foreArmMesh.002"));
+        assert!(!base_json.to_ascii_lowercase().contains(".fbx"));
+        assert!(!male_json.to_ascii_lowercase().contains(".fbx"));
+        assert_eq!(base_json.matches("\"cast_shadows\": true").count() + male_json.matches("\"cast_shadows\": true").count(), 132);
+        assert_eq!(base_json.matches("\"kind\": \"Fixed\"").count(), 1);
+        assert_eq!(male_json.matches("\"kind\": \"Fixed\"").count(), 1);
+        assert_eq!(base_json.matches("\"kind\": \"Ball\"").count(), 65);
+        assert_eq!(male_json.matches("\"kind\": \"Ball\"").count(), 65);
         let level_id = crate::EntityId::parse("33333333-3333-4333-8333-3333333333ee").unwrap();
-        let level = LevelDocument::capture(&world, level_id, "Base Characters").unwrap();
-        assert_eq!(level.format_version, crate::LEVEL_JOINT_VERSION);
+        let start_id = crate::EntityId::parse("33333333-3333-4333-8333-3333333333e1").unwrap();
+        let mut level = crate::empty_world_level();
+        level.format_version = crate::LEVEL_PLAYER_START_VERSION;
+        level.level_uuid = level_id;
+        level.name = "Base Characters".into();
+        level.world_settings.entity = settings;
+        level.world_settings.intensity = 0.2;
+        level.world_settings.upper = [0.55, 0.68, 0.86];
+        level.world_settings.lower = [0.22, 0.16, 0.11];
+        level.entities[0].uuid = settings;
+        level.entities.push(crate::EntityRecord {
+            uuid: start_id,
+            name: "Player Start".into(),
+            parent_uuid: None,
+            components: vec![
+                crate::ComponentRecord::Transform {
+                    translation: crate::Vec3::new(0.0, 0.0, 0.0),
+                    rotation: crate::Quat::IDENTITY,
+                    scale: crate::Vec3::new(1.0, 1.0, 1.0),
+                },
+                crate::ComponentRecord::PlayerStart(crate::PlayerStartRecord {
+                    player: "Content/Players/DefaultPlayer.jarvigplayer".into(),
+                    preview: false,
+                }),
+            ],
+        });
         let json = level.to_json();
-        assert!(json.contains("\"Joint\""));
-        assert!(json.contains("upperArmMesh.002"));
-        assert!(!json.contains("foreArmMesh.002"));
+        assert_eq!(level.format_version, crate::LEVEL_PLAYER_START_VERSION);
+        assert!(json.contains("\"PlayerStart\""));
+        assert!(!json.contains("\"Joint\""));
+        assert!(!json.contains("upperArmMesh.002"));
         assert!(!json.to_ascii_lowercase().contains("c:\\tmp"));
         assert!(!json.to_ascii_lowercase().contains(".fbx"));
-        assert_eq!(json.matches("\"cast_shadows\": true").count(), 132);
-        assert_eq!(json.matches("\"kind\": \"Fixed\"").count(), 2);
-        assert_eq!(json.matches("\"kind\": \"Ball\"").count(), 130);
         let level_path = root.join("Content/Levels/Base.jarviglevel");
         fs::create_dir_all(level_path.parent().unwrap()).unwrap();
         fs::write(&level_path, &json).unwrap();
         let characters = root.join("Content/Characters");
         fs::create_dir_all(&characters).unwrap();
-        fs::write(characters.join("Base.jarvigcharacter"), base_build.document.to_json()).unwrap();
-        fs::write(characters.join("Base Male.jarvigcharacter"), male_build.document.to_json()).unwrap();
+        fs::write(characters.join("Base.jarvigcharacter"), base_json).unwrap();
+        fs::write(characters.join("Base Male.jarvigcharacter"), male_json).unwrap();
+        let players = root.join("Content/Players");
+        fs::create_dir_all(&players).unwrap();
+        let player = crate::PlayerDocument {
+            format_version: crate::PLAYER_FORMAT_VERSION,
+            uuid: crate::EntityId::parse("33333333-3333-4333-8333-3333333333e0").unwrap(),
+            name: "DefaultPlayer".into(),
+            character: "Content/Characters/Base Male.jarvigcharacter".into(),
+        };
+        fs::write(players.join("DefaultPlayer.jarvigplayer"), player.to_json()).unwrap();
         let mut report = String::new();
         report.push_str(&base_build.report);
         report.push_str(&format!("\nviewing_offset_m: one rigid root translation t=({:.6}, 0, {:.6}). Part deltas match the source. The character file stays in source space.\n\n", base_origin.x, base_origin.z));

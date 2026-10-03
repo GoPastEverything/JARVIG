@@ -6,6 +6,10 @@ Procedural detail defaults off. The included provider draws nothing, or one flat
 
 The editor toolbar has three workspaces over one level: Level, Land, and Character. Level is the authored world. Land creates and sculpts one heightfield. Character isolates a rig when the level has one. Those are editor views of the same project. They are not a second copy of the world.
 
+A Block is a parametric solid. Extrude, Inset, and Bevel share one session: a toolbar icon, an Amount field, and one viewport arrow. Dragging the arrow, or the session face, changes the amount in 0.05 m steps. A typed amount is exact. Apply stores one editor undo entry. Cancel restores the solid from when the session opened. The Move and Rotate gizmo stays hidden while that session is open. Choosing Move or Rotate on the toolbar closes the preview.
+
+Selection on a parametric solid is Auto, Object, or Face. A single click selects the face in Auto and in Face, and the whole object in Object. A double-click selects the owning object and leaves the mode alone. Shift-click adds. Ctrl-click toggles. In Select mode, a drag on empty space draws a marquee: left to right selects objects fully inside, and right to left selects objects the rectangle touches. Editor undo and redo are Edit menu commands, Ctrl+Z and Ctrl+Y. One drag is one undo. The feature list shows the current size and any nonzero bevel or inset. It does not replay earlier steps.
+
 Users start at [getting-started.md](../getting-started.md): a new project, a terrain, glTF or GLB import, save, and play.
 
 The editor cold start is:

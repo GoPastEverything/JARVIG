@@ -166,6 +166,8 @@ impl PlayControl {
         if length > 1.0e-8 {
             translation = translation + direction.scale(speed * dt);
         }
+        // Analytic oriented box. A zero move still ejects a pawn that started inside. Not JRV-0090.
+        translation = world.separate_from_blocks(translation);
         world.set_entity_local_translation(pawn, translation).map_err(|error| error.to_string())?;
         world.set_entity_local_rotation(pawn, rotation).map_err(|error| error.to_string())?;
         Ok(())

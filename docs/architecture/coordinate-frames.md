@@ -40,6 +40,28 @@ The long-term content hierarchy is universe, star system, planet, city, station,
 
 JRV-0045 renders one triangle through that path. The vertices are object-local meters. The root frame of the bootstrap scene sits at one billion meters. The GPU uniform does not contain that number. Native code is `jarvig_core::space`. The TypeScript `FrameGraph` remains the same contract for the prototype. They are not two worlds.
 
+## JARVIG world coordinates
+
+This table is engine law. ADR-0020 and ADR-0004 already fixed the signs. Do not flip them to match another engine. A block, a camera, a light, and a collider use this frame.
+
+| | |
+| --- | --- |
+| Handedness | Right-handed |
+| Up | +Y |
+| Forward | −Z |
+| Right | +X |
+| World unit | 1 meter |
+| Angles | Radians in the engine. The inspector shows some Euler fields in degrees. |
+| Transforms | Translation plus a unit quaternion. Scale is not a frame property. |
+| Yaw | About +Y. +90° takes +X to −Z. |
+| Pitch | About local +X. Editor-camera roll stays 0. |
+| GPU matrices | Column-major. `clip = projection * view * model * local` |
+| Depth | Reversed-Z, infinite far. Near maps to 1. Opaque clear is 0. Compare is greater-or-equal. |
+| Render origin | The camera. The bootstrap root sits at 1e9 m on X. Do not store an absolute float32 world position. |
+| Block size | The solid's dimensions in meters. Not entity scale. |
+
+Physics transfer across a frame boundary is not implemented. Do not fake it with a global origin shift.
+
 ## Render convention
 
 ADR: [ADR-0020](../adr/ADR-0020-render-space-and-clip-convention.md). It does not replace ADR-0004.

@@ -23,6 +23,10 @@ pub const LEVEL_CAMERA_VERSION: u32 = 2;
 pub const LEVEL_JOINT_VERSION: u32 = 3;
 /// Terrain is version 4. Versions 1–3 still load. A save writes 4 only when a terrain component is present.
 pub const LEVEL_TERRAIN_VERSION: u32 = 4;
+/// A Player Start is version 5. Versions 1–4 still load. A save writes 5 only when a Player Start is present.
+pub const LEVEL_PLAYER_START_VERSION: u32 = 5;
+/// A parametric block is version 6. Versions 1–5 still load. A save writes 6 only when a block is present.
+pub const LEVEL_BLOCK_VERSION: u32 = 6;
 
 /// Fixed identity for the regression level. Not a runtime slot.
 pub const LIGHTING_LAB_LEVEL_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -56,6 +60,24 @@ pub struct EntityRecord {
     pub components: Vec<ComponentRecord>,
 }
 
+/// One entity in an editor transaction. This is not a level file and not a selection.
+///
+/// `Absent` means the entity did not exist. `Present` is the same record a save would write.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntityMemento {
+    Absent(EntityId),
+    Present(EntityRecord),
+}
+
+impl EntityMemento {
+    pub fn id(&self) -> EntityId {
+        match self {
+            Self::Absent(id) => *id,
+            Self::Present(record) => record.uuid,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComponentRecord {
     Transform { translation: Vec3, rotation: Quat, scale: Vec3 },
@@ -68,6 +90,10 @@ pub enum ComponentRecord {
     Joint(crate::joint::JointRecord),
     /// Authoritative heightfield. Chunk meshes are rebuilt on load and are not stored.
     Terrain(crate::TerrainRecord),
+    /// Where a player definition enters the level. The character body is not this component.
+    PlayerStart(crate::PlayerStartRecord),
+    /// Canonical solid. The triangle mesh is derived at load and is not stored.
+    ParametricBlock(crate::BlockRecord),
     WorldSettings,
 }
 
@@ -165,7 +191,7 @@ impl fmt::Display for LevelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax(text) | Self::Corrupt(text) | Self::UnknownComponent(text) | Self::MissingAsset(text) => write!(formatter, "{text}"),
-            Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_TERRAIN_VERSION}"),
+            Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_BLOCK_VERSION}"),
             Self::DuplicateUuid(uuid) => write!(formatter, "duplicate entity uuid {uuid}"),
             Self::InvalidParent(uuid) => write!(formatter, "parent uuid {uuid} is not in the level"),
             Self::Cycle(uuid) => write!(formatter, "parent cycle includes {uuid}"),
@@ -185,7 +211,7 @@ impl LevelDocument {
         if self.format_version == 0 {
             return Err(LevelError::Corrupt("level format version is missing".into()));
         }
-        if self.format_version > LEVEL_TERRAIN_VERSION {
+        if self.format_version > LEVEL_BLOCK_VERSION {
             return Err(LevelError::UnsupportedVersion(self.format_version));
         }
         if self.name.is_empty() || !self.level_uuid.is_persistent() {
@@ -216,6 +242,9 @@ impl LevelDocument {
                 if let ComponentRecord::MeshRenderer { material, .. } = component {
                     material.validate()?;
                 }
+                if let ComponentRecord::ParametricBlock(block) = component {
+                    block.validate()?;
+                }
                 if let ComponentRecord::ReflectionProbe(probe) = component {
                     if !crate::reflection_probe_resolution_supported(probe.resolution) {
                         return Err(LevelError::Corrupt(format!("probe resolution {} is not 32, 64, 128, or 256", probe.resolution)));
@@ -234,6 +263,8 @@ impl LevelDocument {
                         | ComponentRecord::Camera(_)
                         | ComponentRecord::Joint(_)
                         | ComponentRecord::Terrain(_)
+                        | ComponentRecord::PlayerStart(_)
+                        | ComponentRecord::ParametricBlock(_)
                 )
             });
             if needs_transform && !has_transform {
@@ -256,6 +287,17 @@ impl LevelDocument {
                     return Err(LevelError::Corrupt(format!("entity {text} has terrain, which needs level format {LEVEL_TERRAIN_VERSION}")));
                 }
                 terrain.validate().map_err(|error| LevelError::Corrupt(format!("terrain on {text} is not valid ({error:?})")))?;
+            }
+            if let Some(ComponentRecord::PlayerStart(start)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::PlayerStart(_))) {
+                if self.format_version < LEVEL_PLAYER_START_VERSION {
+                    return Err(LevelError::Corrupt(format!("entity {text} has a player start, which needs level format {LEVEL_PLAYER_START_VERSION}")));
+                }
+                start.validate().map_err(|error| LevelError::Corrupt(format!("player start on {text} is not valid ({error})")))?;
+            }
+            if let Some(ComponentRecord::ParametricBlock(_)) = entity.components.iter().find(|component| matches!(component, ComponentRecord::ParametricBlock(_))) {
+                if self.format_version < LEVEL_BLOCK_VERSION {
+                    return Err(LevelError::Corrupt(format!("entity {text} has a block, which needs level format {LEVEL_BLOCK_VERSION}")));
+                }
             }
         }
         if settings != 1 {
@@ -349,60 +391,22 @@ impl LevelDocument {
         let mut entities = Vec::new();
         let mut settings = None;
         for row in world.entity_outline() {
-            if world.entity_ownership(row.uuid).is_ok_and(|ownership| ownership.capabilities.payload_count() > 1) {
-                return Err(LevelError::Corrupt(format!("{} has more than one payload; level version 1 cannot store it", row.name)));
-            }
-            let parent = world.entity_parent(row.uuid).map_err(|error| LevelError::Corrupt(error.to_string()))?;
-            let mut components = Vec::new();
             if let Some(record) = world.authored_world_settings(row.uuid) {
                 settings = Some(record);
-                components.push(ComponentRecord::WorldSettings);
-            } else if world.entity_ownership(row.uuid).is_ok_and(|ownership| ownership.capabilities.mesh_renderer) {
-                let Some((translation, rotation, scale, visible, cast_shadows, receive_shadows, mesh, material)) = world.authored_mesh(row.uuid) else {
-                    return Err(LevelError::MissingAsset(format!("{} has no builtin mesh or material reference", row.name)));
-                };
-                components.push(ComponentRecord::Transform { translation, rotation, scale });
-                components.push(ComponentRecord::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material });
-            } else if let Some((kind, light)) = world.authored_light(row.uuid) {
-                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
-                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
-                components.push(match kind {
-                    LightKind::Directional => ComponentRecord::DirectionalLight(light),
-                    LightKind::Point => ComponentRecord::PointLight(light),
-                    LightKind::Spot => ComponentRecord::SpotLight(light),
-                });
-            } else if let Some(probe) = world.authored_probe(row.uuid) {
-                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
-                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
-                components.push(ComponentRecord::ReflectionProbe(probe));
-            } else if let Some(camera) = world.authored_camera(row.uuid) {
-                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
-                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
-                components.push(ComponentRecord::Camera(camera));
-            } else if let Some(terrain) = world.authored_terrain(row.uuid) {
-                let (translation, rotation) = world.authored_local_pose(row.uuid).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
-                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
-                components.push(ComponentRecord::Terrain(terrain));
-            } else if let Some((translation, rotation)) = world.authored_local_pose(row.uuid) {
-                components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
             }
-            if world.authored_world_settings(row.uuid).is_none() {
-                if let Some(joint) = world.authored_joint(row.uuid) {
-                    if !components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. })) {
-                        if let Some((translation, rotation)) = world.authored_local_pose(row.uuid) {
-                            components.insert(0, ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
-                        }
-                    }
-                    components.push(ComponentRecord::Joint(joint));
-                }
-            }
-            entities.push(EntityRecord { uuid: row.uuid, name: row.name, parent_uuid: parent, components });
+            entities.push(capture_entity(world, row.uuid)?);
         }
         let world_settings = settings.ok_or(LevelError::MissingWorldSettings)?;
+        let has_block = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::ParametricBlock(_))));
+        let has_player_start = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::PlayerStart(_))));
         let has_terrain = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Terrain(_))));
         let has_joint = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Joint(_))));
         let has_camera = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::Camera(_))));
-        let format_version = if has_terrain {
+        let format_version = if has_block {
+            LEVEL_BLOCK_VERSION
+        } else if has_player_start {
+            LEVEL_PLAYER_START_VERSION
+        } else if has_terrain {
             LEVEL_TERRAIN_VERSION
         } else if has_joint {
             LEVEL_JOINT_VERSION
@@ -626,6 +630,8 @@ impl ComponentRecord {
             Self::Camera(_) => "Camera",
             Self::Joint(_) => "Joint",
             Self::Terrain(_) => "Terrain",
+            Self::PlayerStart(_) => "PlayerStart",
+            Self::ParametricBlock(_) => "ParametricBlock",
             Self::WorldSettings => "WorldSettings",
         }
     }
@@ -680,6 +686,26 @@ impl ComponentRecord {
             Self::Camera(camera) => camera.to_json(),
             Self::Joint(joint) => joint_json(joint),
             Self::Terrain(terrain) => terrain_json(terrain),
+            Self::PlayerStart(start) => Json::object(vec![
+                ("type", Json::string("PlayerStart")),
+                ("version", Json::int(1)),
+                ("player", Json::string(&start.player)),
+                ("preview", Json::bool(start.preview)),
+            ]),
+            Self::ParametricBlock(block) => {
+                let mut fields = vec![
+                    ("type", Json::string("ParametricBlock")),
+                    ("version", Json::int(1)),
+                    ("size_m", Json::array(block.size_m.iter().copied().map(Json::number).collect())),
+                    ("material", block.material.to_json()),
+                ];
+                if !block.is_plain() {
+                    fields.push(("inset_m", Json::array(block.inset_m.iter().copied().map(Json::number).collect())));
+                    fields.push(("bevel_m", Json::number(block.bevel_m)));
+                    fields.push(("history", block_history_json(&block.history)));
+                }
+                Json::object(fields)
+            }
             Self::WorldSettings => Json::object(vec![("type", Json::string("WorldSettings")), ("version", Json::int(1))]),
         }
     }
@@ -716,7 +742,7 @@ pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
         return Err(LevelError::Corrupt(format!("schema {schema} is not {LEVEL_SCHEMA}")));
     }
     let format_version = required_u32(&json, "format_version")?;
-    if format_version > LEVEL_TERRAIN_VERSION {
+    if format_version > LEVEL_BLOCK_VERSION {
         return Err(LevelError::UnsupportedVersion(format_version));
     }
     let level_uuid = parse_uuid(required_str(&json, "level_uuid")?)?;
@@ -730,6 +756,75 @@ pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
     let document = LevelDocument { format_version, level_uuid, name, world_settings, entities };
     document.validate()?;
     Ok(document)
+}
+
+/// One authored entity, in the same shape [`LevelDocument::capture`] writes.
+pub fn capture_entity(world: &SceneWorld, id: EntityId) -> Result<EntityRecord, LevelError> {
+    let outline = world.entity_outline();
+    let row = outline.iter().find(|row| row.uuid == id).ok_or_else(|| LevelError::Corrupt("entity is not authored".into()))?;
+    if world.entity_ownership(id).is_ok_and(|ownership| ownership.capabilities.payload_count() > 1) {
+        return Err(LevelError::Corrupt(format!("{} has more than one payload; level version 1 cannot store it", row.name)));
+    }
+    let parent = world.entity_parent(id).map_err(|error| LevelError::Corrupt(error.to_string()))?;
+    let mut components = Vec::new();
+    if world.authored_world_settings(id).is_some() {
+        components.push(ComponentRecord::WorldSettings);
+    } else if world.entity_ownership(id).is_ok_and(|ownership| ownership.capabilities.mesh_renderer) {
+        let Some((translation, rotation, scale, visible, cast_shadows, receive_shadows, mesh, material)) = world.authored_mesh(id) else {
+            return Err(LevelError::MissingAsset(format!("{} has no builtin mesh or material reference", row.name)));
+        };
+        components.push(ComponentRecord::Transform { translation, rotation, scale });
+        components.push(ComponentRecord::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material });
+    } else if let Some((kind, light)) = world.authored_light(id) {
+        let (translation, rotation) = world.authored_local_pose(id).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+        components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+        components.push(match kind {
+            LightKind::Directional => ComponentRecord::DirectionalLight(light),
+            LightKind::Point => ComponentRecord::PointLight(light),
+            LightKind::Spot => ComponentRecord::SpotLight(light),
+        });
+    } else if let Some(probe) = world.authored_probe(id) {
+        let (translation, rotation) = world.authored_local_pose(id).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+        components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+        components.push(ComponentRecord::ReflectionProbe(probe));
+    } else if let Some(camera) = world.authored_camera(id) {
+        let (translation, rotation) = world.authored_local_pose(id).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+        components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+        components.push(ComponentRecord::Camera(camera));
+    } else if let Some(terrain) = world.authored_terrain(id) {
+        let (translation, rotation) = world.authored_local_pose(id).ok_or_else(|| LevelError::Corrupt(format!("{} has no pose", row.name)))?;
+        components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+        components.push(ComponentRecord::Terrain(terrain));
+    } else if let Some((translation, rotation)) = world.authored_local_pose(id) {
+        components.push(ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+    }
+    if world.authored_world_settings(id).is_none() {
+        if let Some(joint) = world.authored_joint(id) {
+            if !components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. })) {
+                if let Some((translation, rotation)) = world.authored_local_pose(id) {
+                    components.insert(0, ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                }
+            }
+            components.push(ComponentRecord::Joint(joint));
+        }
+        if let Some(start) = world.authored_player_start(id) {
+            if !components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. })) {
+                if let Some((translation, rotation)) = world.authored_local_pose(id) {
+                    components.insert(0, ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                }
+            }
+            components.push(ComponentRecord::PlayerStart(start));
+        }
+        if let Some(block) = world.authored_block(id) {
+            if !components.iter().any(|component| matches!(component, ComponentRecord::Transform { .. })) {
+                if let Some((translation, rotation)) = world.authored_local_pose(id) {
+                    components.insert(0, ComponentRecord::Transform { translation, rotation, scale: Vec3::new(1.0, 1.0, 1.0) });
+                }
+            }
+            components.push(ComponentRecord::ParametricBlock(block));
+        }
+    }
+    Ok(EntityRecord { uuid: id, name: row.name.clone(), parent_uuid: parent, components })
 }
 
 pub(crate) fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settings: &WorldSettingsRecord) -> Result<(), LevelError> {
@@ -782,6 +877,15 @@ pub(crate) fn spawn_entity(world: &mut SceneWorld, entity: &EntityRecord, settin
             }
             ComponentRecord::Terrain(terrain) => {
                 world.spawn_saved_terrain(entity.uuid, &entity.name, entity.parent_uuid, pose, terrain.clone()).map_err(authoring)?;
+            }
+            ComponentRecord::PlayerStart(start) => {
+                if world.entity_ownership(entity.uuid).is_err() {
+                    world.spawn_saved_transform(entity.uuid, &entity.name, entity.parent_uuid, pose).map_err(authoring)?;
+                }
+                world.attach_player_start(entity.uuid, start.clone()).map_err(authoring)?;
+            }
+            ComponentRecord::ParametricBlock(block) => {
+                world.spawn_saved_block(entity.uuid, &entity.name, entity.parent_uuid, pose, block.clone()).map_err(authoring)?;
             }
         }
     }
@@ -973,6 +1077,31 @@ fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
         })),
         "Joint" => Ok(ComponentRecord::Joint(parse_joint(json)?)),
         "Terrain" => Ok(ComponentRecord::Terrain(parse_terrain(json)?)),
+        "PlayerStart" => {
+            let start = crate::parse_player_start_fields(required_str(json, "player")?, required_bool(json, "preview")?)
+                .map_err(|error| LevelError::Corrupt(error))?;
+            Ok(ComponentRecord::PlayerStart(start))
+        }
+        "ParametricBlock" => {
+            let size = required_floats(json, "size_m", 3)?;
+            let material = parse_material(json.get("material").ok_or_else(|| LevelError::MissingAsset("block material is missing".into()))?)?;
+            let inset = match optional_floats(json, "inset_m")? {
+                None => [0.0; 6],
+                Some(values) if values.len() == 6 => [values[0], values[1], values[2], values[3], values[4], values[5]],
+                Some(_) => return Err(LevelError::Corrupt("inset_m has the wrong width".into())),
+            };
+            let bevel_m = optional_f64(json, "bevel_m", 0.0)?;
+            let history = parse_block_history(json)?;
+            let block = crate::BlockRecord {
+                size_m: [size[0], size[1], size[2]],
+                inset_m: inset,
+                bevel_m,
+                material,
+                history,
+            };
+            block.validate()?;
+            Ok(ComponentRecord::ParametricBlock(block))
+        }
         "Camera" => Ok(ComponentRecord::Camera(CameraRecord {
             enabled: required_bool(json, "enabled")?,
             orthographic: match required_str(json, "projection")? {
@@ -1140,6 +1269,96 @@ fn optional_bool(json: &Json, key: &str, default: bool) -> Result<bool, LevelErr
     match json.get(key) {
         None => Ok(default),
         Some(_) => required_bool(json, key),
+    }
+}
+
+fn block_history_json(history: &[crate::BlockOp]) -> Json {
+    Json::array(
+        history
+            .iter()
+            .map(|op| match op {
+                crate::BlockOp::Size { size_m } => Json::object(vec![
+                    ("op", Json::string("size")),
+                    ("size_m", Json::array(size_m.iter().copied().map(Json::number).collect())),
+                ]),
+                crate::BlockOp::ExtrudeFace { face, distance_m } => Json::object(vec![
+                    ("op", Json::string("extrude")),
+                    ("face", Json::int(*face as i64)),
+                    ("distance_m", Json::number(*distance_m)),
+                ]),
+                crate::BlockOp::InsetFace { face, distance_m } => Json::object(vec![
+                    ("op", Json::string("inset")),
+                    ("face", Json::int(*face as i64)),
+                    ("distance_m", Json::number(*distance_m)),
+                ]),
+                crate::BlockOp::Bevel { distance_m } => Json::object(vec![
+                    ("op", Json::string("bevel")),
+                    ("distance_m", Json::number(*distance_m)),
+                ]),
+                crate::BlockOp::Mirror { axis } => Json::object(vec![
+                    ("op", Json::string("mirror")),
+                    ("axis", Json::int(*axis as i64)),
+                ]),
+            })
+            .collect(),
+    )
+}
+
+fn parse_block_history(json: &Json) -> Result<Vec<crate::BlockOp>, LevelError> {
+    let Some(entries) = json.get("history") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries.as_array().ok_or_else(|| LevelError::Corrupt("block history is not a list".into()))?;
+    let mut history = Vec::new();
+    for entry in entries {
+        let name = required_str(entry, "op")?;
+        let op = match name {
+            "size" => {
+                let size = required_floats(entry, "size_m", 3)?;
+                crate::BlockOp::Size { size_m: [size[0], size[1], size[2]] }
+            }
+            "extrude" => crate::BlockOp::ExtrudeFace { face: block_face_index(entry)?, distance_m: required_f64(entry, "distance_m")? },
+            "inset" => crate::BlockOp::InsetFace { face: block_face_index(entry)?, distance_m: required_f64(entry, "distance_m")? },
+            "bevel" => crate::BlockOp::Bevel { distance_m: required_f64(entry, "distance_m")? },
+            "mirror" => crate::BlockOp::Mirror { axis: block_axis_index(entry)? },
+            other => return Err(LevelError::Corrupt(format!("unknown block edit {other}"))),
+        };
+        history.push(op);
+    }
+    if history.len() > crate::BLOCK_HISTORY_LIMIT {
+        let extra = history.len() - crate::BLOCK_HISTORY_LIMIT;
+        history.drain(0..extra);
+    }
+    Ok(history)
+}
+
+fn block_face_index(json: &Json) -> Result<u8, LevelError> {
+    let face = required_u32(json, "face")?;
+    if face > 5 {
+        return Err(LevelError::Corrupt("block face is outside 0..5".into()));
+    }
+    Ok(face as u8)
+}
+
+fn block_axis_index(json: &Json) -> Result<u8, LevelError> {
+    let axis = required_u32(json, "axis")?;
+    if axis > 2 {
+        return Err(LevelError::Corrupt("block axis is outside 0..2".into()));
+    }
+    Ok(axis as u8)
+}
+
+fn optional_floats(json: &Json, key: &str) -> Result<Option<Vec<f64>>, LevelError> {
+    match json.get(key) {
+        None => Ok(None),
+        Some(_) => required_floats(json, key, json.get(key).and_then(Json::as_array).map(|values| values.len()).unwrap_or(0)).map(Some),
+    }
+}
+
+fn optional_f64(json: &Json, key: &str, default: f64) -> Result<f64, LevelError> {
+    match json.get(key) {
+        None => Ok(default),
+        Some(_) => required_f64(json, key),
     }
 }
 
@@ -1478,8 +1697,8 @@ mod tests {
         document.entities[2].parent_uuid = Some(document.entities[1].uuid);
         assert!(matches!(document.validate(), Err(LevelError::Cycle(_))));
         document = lighting_lab_level();
-        document.format_version = 5;
-        assert!(matches!(document.validate(), Err(LevelError::UnsupportedVersion(5))));
+        document.format_version = LEVEL_BLOCK_VERSION + 1;
+        assert!(matches!(document.validate(), Err(LevelError::UnsupportedVersion(7))));
         let mut text = lighting_lab_level().to_json();
         text.truncate(24);
         assert!(matches!(parse_level(&text), Err(LevelError::Syntax(_))));

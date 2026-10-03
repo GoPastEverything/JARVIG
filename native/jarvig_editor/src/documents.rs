@@ -1,5 +1,8 @@
 //! Project and level files. The editor does not own the world, and the files do not own the GPU.
 //!
+//! Replacing a level tells the renderer to drop that world's residency. Mesh ids from
+//! the previous world must not draw in the next one. ADR-0063.
+//!
 //! Editor camera, dock layout, exposure, and lighting debug stay out of `.jarviglevel`.
 //! A viewport pose and the editor workspace may be written under `Saved/Editor` and are not gameplay truth.
 
@@ -8,17 +11,29 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use jarvig_core::{
-    autosave_path, create_project_directories, empty_world_level, load_level_file, load_project_file, parse_character, save_level_atomic,
-    save_project_atomic, EntityId, LevelDocument, ProjectDocument, RegistryAsset, Vec3,
+    autosave_path, create_project_at, empty_world_level, hub_recent_file, load_level_file, load_project_file, load_recent_at, parse_character, parse_player,
+    project_file_missing, remember_recent_at, save_level_atomic, save_project_atomic, EntityId, LevelDocument, ProjectDocument, ProjectTemplate,
+    RegistryAsset, Vec3, PLAYER_TEMPLATE_NOTE,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDCANCEL, IDNO, IDYES, MB_YESNOCANCEL};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDCANCEL, IDOK, IDNO, IDYES, MB_OKCANCEL, MB_YESNOCANCEL};
 
 use super::{wide, Editor};
 
 const AUTOSAVE_SECONDS: f64 = 60.0;
+
+/// The level that was open before a character asset replaced the live world.
+pub(super) struct AuthoredStash {
+    pub document: LevelDocument,
+    pub path: Option<PathBuf>,
+    pub dirty: bool,
+    pub yaw: f64,
+    pub pitch: f64,
+    pub position: Vec3,
+    pub speed_m_s: f64,
+}
 
 fn material_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/materials")
@@ -158,28 +173,19 @@ impl Editor {
             self.append(&format!("Opened project {} from --project.", path.display()));
             return Ok(());
         }
-        if let Some(path) = find_up("samples/lighting-lab/LightingLab.jarvigproject") {
-            match self.open_project_at(&path) {
-                Ok(()) => {
-                    self.append(&format!("Opened project {} and its startup level from disk.", path.display()));
-                    return Ok(());
-                }
-                Err(error) => {
-                    eprintln!("JARVIG Lighting Lab project was found but did not load: {error}");
-                    self.append(&format!("Lighting Lab project was found but did not load: {error}"));
-                }
-            }
+        self.append("No project was opened. Lighting Lab is a sample, not the startup project.");
+        if self.content_check {
+            self.append("Content check needs --project samples/lighting-lab/LightingLab.jarvigproject. No sample was opened in its place.");
         }
-        self.engine.world_mut().set_reflection_probe_resolution(64).map_err(|error| error.to_string())?;
-        self.engine.install_lighting_lab()?;
-        self.saved_revision = self.engine.world().revision();
-        self.append("Lighting Lab project file was not found. The lab was built in memory. Use File > Save As to write a level.");
         Ok(())
     }
 
     pub(super) fn level_dirty(&self) -> bool {
         if self.self_test || self.level_name.is_empty() {
             return false;
+        }
+        if let Some(stash) = &self.authored_stash {
+            return stash.dirty;
         }
         self.unsaved_policy || self.engine.world().revision() != self.saved_revision
     }
@@ -189,8 +195,13 @@ impl Editor {
             return;
         }
         let star = if self.level_dirty() { "*" } else { "" };
-        let title = if self.character_workspace && !self.level_name.is_empty() {
-            format!("Character: {}{star} - JARVIGEditor", self.level_name)
+        let character_name = if self.authored_stash.is_some() && !self.character_asset_name.is_empty() {
+            self.character_asset_name.as_str()
+        } else {
+            self.level_name.as_str()
+        };
+        let title = if self.character_workspace && !character_name.is_empty() {
+            format!("Character: {character_name}{star} - JARVIGEditor")
         } else if self.land_mode && !self.level_name.is_empty() {
             format!("Land: {}{star} - JARVIGEditor", self.level_name)
         } else if self.level_name.is_empty() {
@@ -208,6 +219,9 @@ impl Editor {
     }
 
     pub(super) fn maybe_autosave(&mut self) {
+        if self.authored_stash.is_some() {
+            return;
+        }
         if self.self_test || !self.level_dirty() {
             return;
         }
@@ -232,47 +246,27 @@ impl Editor {
     }
 
     pub(super) fn file_new_project(&mut self) {
-        self.file_new_from_template("empty");
+        self.file_new_from_template("blank");
     }
 
-    /// Empty World, Terrain World, Third Person, or FPS. The level is World Settings only.
+    /// Blank, First Person, Third Person, or Landscape. The files come from `create_project_at`.
     pub(super) fn file_new_from_template(&mut self, template: &str) {
+        self.forget_character_asset();
         self.stop_play();
         if !self.confirm_save_or_discard() {
             return;
         }
+        let Some(kind) = ProjectTemplate::parse(template) else {
+            self.append(&format!("Unknown project template {template}."));
+            return;
+        };
         let Some(path) = save_dialog(self.frame, "New JARVIG Project", "JARVIG Project\0*.jarvigproject\0", "jarvigproject") else { return };
         let path = ensure_extension(&path, "jarvigproject");
         let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Project").to_string();
-        let mut project = ProjectDocument::lighting_lab();
-        project.display_name = name.clone();
-        project.project_uuid = EntityId::new();
-        project.startup_level = format!("Content/Levels/{name}.jarviglevel");
-        if let Err(error) = create_project_directories(&path, &project) {
-            self.append(&format!("Project folders were not created: {error}"));
+        if let Err(error) = create_project_at(&path, &name, kind) {
+            self.append(&format!("Project was not written: {error}"));
             return;
         }
-        let backup = path.parent().unwrap_or(Path::new(".")).join("Saved/Backup");
-        if let Err(error) = save_project_atomic(&path, &backup, &project) {
-            self.append(&format!("Project file was not written: {error}"));
-            return;
-        }
-        let mut level = empty_world_level();
-        level.name = name;
-        let level_path = match project.startup_level_path(&path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.append(&error.to_string());
-                return;
-            }
-        };
-        if let Err(error) = save_level_atomic(&level_path, &backup, &level) {
-            self.append(&format!("Startup level was not written: {error}"));
-            return;
-        }
-        let settings = path.parent().unwrap_or(Path::new(".")).join(&project.settings);
-        let _ = fs::write(settings, "JARVIG project settings placeholder. This is not a level and not a GPU resource.\n");
-        write_template_file(&path, &project, template);
         if let Err(error) = self.open_project_at(&path) {
             self.append(&format!("Project was written but did not open: {error}"));
         }
@@ -291,6 +285,7 @@ impl Editor {
     }
 
     pub(super) fn file_close_project(&mut self) {
+        self.forget_character_asset();
         self.stop_play();
         if !self.confirm_save_or_discard() {
             return;
@@ -307,7 +302,11 @@ impl Editor {
     }
 
     pub(super) fn file_new_level(&mut self) {
+        self.forget_character_asset();
         self.stop_play();
+        if !self.confirm_empty_level() {
+            return;
+        }
         if !self.confirm_save_or_discard() {
             return;
         }
@@ -324,7 +323,16 @@ impl Editor {
             self.append(&format!("New level was written but did not become the world: {error}"));
         } else {
             self.restore_workspace();
+            self.append("Empty level. World Settings only. The ground grid and axis triad are editor reference: +X right, +Y up, −Z forward, 1 m. They are not saved and they do not draw in Play.");
         }
+    }
+
+    fn confirm_empty_level(&self) -> bool {
+        let text = wide(
+            "NEW LEVEL\n\nEmpty\n\nUnits: meters\nCoordinate: JARVIG World (+X right, +Y up, −Z forward)\n\nThe level contains World Settings only.\nThe ground grid and axis triad are editor reference.\nThey are not saved and they do not draw in Play.",
+        );
+        let title = wide("JARVIGEditor");
+        (unsafe { MessageBoxW(self.frame, text.as_ptr(), title.as_ptr(), MB_OKCANCEL) }) == IDOK
     }
 
     pub(super) fn file_open_level(&mut self) {
@@ -397,6 +405,10 @@ impl Editor {
     }
 
     pub(super) fn file_save(&mut self) {
+        if self.authored_stash.is_some() {
+            self.append("Character preview is not the level. Nothing was written.");
+            return;
+        }
         let Some(path) = self.level_file.clone() else {
             self.file_save_as();
             return;
@@ -407,6 +419,10 @@ impl Editor {
     }
 
     pub(super) fn file_save_as(&mut self) {
+        if self.authored_stash.is_some() {
+            self.append("Character preview is not the level. Nothing was written.");
+            return;
+        }
         let Some(path) = save_dialog(self.frame, "Save JARVIG Level", "JARVIG Level\0*.jarviglevel\0", "jarviglevel") else { return };
         let path = ensure_extension(&path, "jarviglevel");
         if let Err(error) = self.save_level_to(&path) {
@@ -425,8 +441,12 @@ impl Editor {
     }
 
     pub(super) fn file_recent_project(&mut self, index: usize) {
-        self.stop_play();
         let Some(path) = self.recent_projects.get(index).cloned() else { return };
+        if project_file_missing(&path) {
+            self.append(&format!("{} is missing. It was not replaced.", path.display()));
+            return;
+        }
+        self.stop_play();
         if !self.confirm_save_or_discard() {
             return;
         }
@@ -483,6 +503,7 @@ impl Editor {
     }
 
     fn load_level_from(&mut self, path: &Path, detail: &str) -> Result<(), String> {
+        self.forget_character_asset();
         let outer = self.load_depth == 0;
         if outer {
             self.begin_load();
@@ -511,22 +532,27 @@ impl Editor {
         if outer {
             self.begin_load();
         }
-        self.report("Opening project", &path.display().to_string(), None);
+        self.forget_character_asset();
+        self.report("Reading project manifest", &path.display().to_string(), None);
         self.pump_loading();
         let result = (|| {
             let project = load_project_file(path).map_err(|error| error.to_string())?;
             let level_path = project.startup_level_path(path).map_err(|error| error.to_string())?;
-            self.report("Loading level file", &level_path.display().to_string(), None);
+            self.report("Loading startup level", &level_path.display().to_string(), None);
             self.pump_loading();
             let document = load_level_file(&level_path).map_err(|error| format!("startup level was not loaded. The current world is unchanged. {error}"))?;
             self.project_file = Some(path.to_path_buf());
             self.project_name = project.display_name.clone();
             self.adopt_level(document, Some(level_path))?;
+            self.report("Restoring editor workspace", "The saved mode, or the template when no workspace file exists.", None);
+            self.pump_loading();
             let templated_land = self.apply_saved_template();
             if !self.restore_workspace() && templated_land {
                 self.append(Self::workspace_line(super::chrome::WorkspaceMode::Land));
             }
             self.remember_project(path);
+            self.report("Scanning asset registry", "Queued. The content browser fills when the scan finishes.", None);
+            self.pump_loading();
             self.append(&format!("Project {} is open. Startup level is {}.", project.display_name, project.startup_level));
             self.queue_asset_registry();
             Ok(())
@@ -538,12 +564,15 @@ impl Editor {
     }
 
     fn adopt_level(&mut self, document: LevelDocument, path: Option<PathBuf>) -> Result<(), String> {
+        self.authored_stash = None;
+        self.preview_ids.clear();
+        self.preview_owners.clear();
         let name = document.name.clone();
         let uuid = document.level_uuid;
         if let Some(project_file) = self.project_file.clone() {
             let project = load_project_file(&project_file).map_err(|error| error.to_string())?;
             let root = project_file.parent().ok_or("project file has no directory")?;
-            self.report("Loading derived meshes", "Canonical meshes and stored meshlets.", None);
+            self.report("Loading meshes", "Canonical meshes and stored meshlets.", None);
             self.pump_loading();
             let assets = jarvig_core::load_project_mesh_assets(root, &project.content_directory, &project.intermediate_directory)?;
             self.note_loaded_meshlets(&assets);
@@ -561,11 +590,19 @@ impl Editor {
             self.fail_progress("Creating entities", &error);
             return Err(error);
         }
+        self.release_replaced_world();
         self.level_file = path.clone();
         self.level_name = name;
         self.level_uuid = Some(uuid);
         self.unsaved_policy = false;
         self.saved_revision = self.engine.world().revision();
+        self.modeling_session = None;
+        self.face_drag = None;
+        self.gizmo_drag = None;
+        self.marquee = None;
+        self.selected_face = None;
+        self.history.clear();
+        self.refresh_edit_menu();
         self.last_autosave = Instant::now();
         if let Some(controller) = self.editor_camera.as_mut() {
             controller.reference_frame = self.engine.front_camera().frame;
@@ -582,20 +619,98 @@ impl Editor {
             self.remember_level(&path);
         }
         self.append(&format!("Level {} is the authored world. The editor camera was not loaded from the level.", self.level_name));
+        self.sync_spawn_preview();
         self.refresh_title();
         Ok(())
     }
 
-    /// Loads one character asset into the open world and enters the Character Editor.
-    ///
-    /// The character file stays put. Save still writes a `.jarviglevel`.
-    pub(super) fn open_character_document(&mut self, asset: &RegistryAsset) -> Result<(), String> {
-        let project = self.project_file.clone().ok_or("Open a project before opening a character.")?;
-        let root = project.parent().ok_or("project file has no directory")?;
-        let path = root.join(&asset.path);
-        let text = fs::read_to_string(&path).map_err(|error| format!("character file was not read: {error}"))?;
-        let character = parse_character(&text).map_err(|error| error.to_string())?;
-        let (level_uuid, settings_uuid) = if character.name == "Base Male" {
+    /// The world document changed. GPU meshes, meshlets, hierarchy, and Einstein
+    /// patches from the previous world are dropped. Play does not call this: its
+    /// runtime copy aliases the authored mesh ids on purpose.
+    fn release_replaced_world(&mut self) {
+        self.scene_meshes.clear();
+        self.meshlet_bound = None;
+        let cancel_parent = self.parent_job.take();
+        let cancel_micro = self.micro_job.take();
+        if cancel_parent.is_some() || cancel_micro.is_some() {
+            self.job_line.clear();
+        }
+        if let Some(job) = cancel_parent {
+            self.jobs.cancel(job.id);
+            let _ = self.jobs.take_result::<jarvig_core::ParentGeometry>(job.id);
+        }
+        if let Some(job) = cancel_micro {
+            self.jobs.cancel(job.id);
+            let _ = self.jobs.take_result::<super::MicroJobProduct>(job.id);
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            if let Err(error) = renderer.release_world_scene() {
+                self.append(&format!("The previous world's render scene was not fully released. {error}"));
+                return;
+            }
+        }
+        self.append("Previous world render scene released. Its mesh buffers, meshlets, hierarchy, and Einstein patches are gone. Project assets stay in the library and are not instances of this world.");
+    }
+
+    fn forget_character_asset(&mut self) {
+        self.character_asset_path = None;
+        self.character_asset_name.clear();
+    }
+
+    /// Keeps the open level aside so a character asset can occupy the viewport.
+    fn remember_authored_level(&mut self) -> Result<bool, String> {
+        if self.authored_stash.is_some() {
+            return Ok(false);
+        }
+        let uuid = self.level_uuid.ok_or_else(|| "Open a level before opening a character.".to_string())?;
+        let dirty = self.level_dirty();
+        self.clear_spawn_preview();
+        if !dirty {
+            self.saved_revision = self.engine.world().revision();
+        }
+        let document = self.engine.export_level(uuid, &self.level_name)?;
+        let (yaw, pitch, position, speed_m_s) = self
+            .editor_camera
+            .as_ref()
+            .map(|camera| (camera.yaw, camera.pitch, camera.position, camera.speed_m_s))
+            .unwrap_or((0.0, 0.0, Vec3::new(0.0, 0.0, 0.0), 5.0));
+        self.authored_stash = Some(AuthoredStash {
+            document,
+            path: self.level_file.clone(),
+            dirty,
+            yaw,
+            pitch,
+            position,
+            speed_m_s,
+        });
+        Ok(true)
+    }
+
+    pub(super) fn restore_authored_level(&mut self) -> Result<(), String> {
+        let Some(stash) = self.authored_stash.take() else { return Ok(()) };
+        self.adopt_level(stash.document, stash.path)?;
+        if stash.dirty {
+            let revision = self.engine.world().revision();
+            if revision == 0 {
+                self.unsaved_policy = true;
+            } else {
+                self.saved_revision = revision - 1;
+            }
+        }
+        if let Some(controller) = self.editor_camera.as_mut() {
+            controller.yaw = stash.yaw;
+            controller.pitch = stash.pitch;
+            controller.position = stash.position;
+            controller.speed_m_s = stash.speed_m_s;
+        }
+        let _ = self.push_editor_camera();
+        self.append("Character preview was not written. The level is unchanged.");
+        self.refresh_title();
+        Ok(())
+    }
+
+    fn preview_document_ids(name: &str) -> (EntityId, EntityId) {
+        if name == "Base Male" {
             (
                 EntityId::parse("33333333-3333-4333-8333-3333333333b2").expect("male level uuid"),
                 EntityId::parse("33333333-3333-4333-8333-3333333333a2").expect("male settings uuid"),
@@ -605,12 +720,92 @@ impl Editor {
                 EntityId::parse("33333333-3333-4333-8333-3333333333b1").expect("base level uuid"),
                 EntityId::parse("33333333-3333-4333-8333-3333333333a1").expect("base settings uuid"),
             )
+        }
+    }
+
+    /// Shows one character asset. The level file and its identity stay where they were.
+    pub(super) fn open_character_preview(&mut self, relative: &str) -> Result<(), String> {
+        let created = self.remember_authored_level()?;
+        let loaded = (|| {
+            let project = self.project_file.clone().ok_or("Open a project before opening a character.")?;
+            let root = project.parent().ok_or("project file has no directory")?;
+            let text = fs::read_to_string(root.join(relative)).map_err(|error| format!("character file was not read: {error}"))?;
+            let character = parse_character(&text).map_err(|error| error.to_string())?;
+            let (level_uuid, settings_uuid) = Self::preview_document_ids(&character.name);
+            let document = character.open_as_level(level_uuid, settings_uuid).map_err(|error| error.to_string())?;
+            self.engine.load_level(&document)?;
+            self.release_replaced_world();
+            Ok::<String, String>(character.name)
+        })();
+        let name = match loaded {
+            Ok(name) => name,
+            Err(error) => {
+                if created {
+                    self.authored_stash = None;
+                }
+                return Err(error);
+            }
         };
-        let document = character.open_as_level(level_uuid, settings_uuid).map_err(|error| error.to_string())?;
-        self.adopt_level(document, None)?;
-        self.set_character_workspace(true);
+        self.character_asset_path = Some(relative.to_string());
+        self.character_asset_name = name.clone();
+        self.land_mode = false;
+        self.character_workspace = true;
+        self.outliner_parts = false;
+        self.selection.clear_from(crate::selection::SelectionSource::Outliner);
+        self.selection_view_ready = false;
+        if let Some(controller) = self.editor_camera.as_mut() {
+            controller.reference_frame = self.engine.front_camera().frame;
+        }
         self.focus_character_body();
-        self.append(&format!("Opened {}. Double-click did not place a copy. Save writes a level, not the character file.", character.name));
+        self.inspector_force_realize = true;
+        self.request_inspector_refresh();
+        self.sync_outliner();
+        self.sync_view_menu();
+        self.refresh_title();
+        self.append(&format!("Character: {name}. Joints are the contact hierarchy, not a separate skeleton. The level was not changed."));
+        Ok(())
+    }
+
+    /// Double-click opens the asset. It does not place a copy in the level.
+    pub(super) fn open_character_document(&mut self, asset: &RegistryAsset) -> Result<(), String> {
+        self.open_character_preview(&asset.path)
+    }
+
+    pub(super) fn describe_player_asset(&mut self, asset: &RegistryAsset) {
+        let Some(project) = self.project_file.clone() else {
+            self.append("Open a project before reading a player definition.");
+            return;
+        };
+        let Some(root) = project.parent() else { return };
+        match fs::read_to_string(root.join(&asset.path)).ok().and_then(|text| parse_player(&text).ok()) {
+            Some(document) => self.append(&format!("{} uses {}. It was not placed in the level.", document.name, document.character)),
+            None => self.append(&format!("{} was not placed. A player definition is not a body.", asset.name)),
+        }
+    }
+
+    pub(super) fn player_character_path(&self, player_path: &str) -> String {
+        if player_path.is_empty() {
+            return String::new();
+        }
+        let Some(root) = self.project_file.as_ref().and_then(|path| path.parent()) else { return String::new() };
+        fs::read_to_string(root.join(player_path)).ok().and_then(|text| parse_player(&text).ok()).map(|document| document.character).unwrap_or_default()
+    }
+
+    pub(super) fn write_player_character(&mut self, player_path: &str, character_path: &str) -> Result<(), String> {
+        if player_path.is_empty() {
+            return Err("Choose a player definition before choosing its character.".into());
+        }
+        let project = self.project_file.clone().ok_or("Open a project before editing a player definition.")?;
+        let root = project.parent().ok_or("project file has no directory")?;
+        let path = root.join(player_path);
+        let text = fs::read_to_string(&path).map_err(|error| format!("player definition was not read: {error}"))?;
+        let mut document = parse_player(&text)?;
+        if document.character == character_path {
+            return Ok(());
+        }
+        document.character = character_path.to_string();
+        document.validate()?;
+        fs::write(&path, document.to_json()).map_err(|error| format!("player definition was not written: {error}"))?;
         Ok(())
     }
 
@@ -778,20 +973,20 @@ impl Editor {
         let _ = fs::write(path, text);
     }
 
-    /// A Terrain World opens in Land when no workspace file has been saved yet.
+    /// A Landscape template opens in Land when no workspace file has been saved yet.
     /// The call does not write `workspace.json`, so a later restore still wins.
     fn apply_saved_template(&mut self) -> bool {
         let Some(word) = self.read_project_template() else { return false };
-        match word.as_str() {
-            "terrain" | "land" => {
+        match ProjectTemplate::parse(&word) {
+            Some(ProjectTemplate::Landscape) => {
                 self.switch_editor_mode(super::chrome::WorkspaceMode::Land, false, false);
                 true
             }
-            "third-person" | "fps" => {
-                self.append("This template is an empty world. A pawn is not in this foundation.");
+            Some(ProjectTemplate::FirstPerson | ProjectTemplate::ThirdPerson) => {
+                self.append(PLAYER_TEMPLATE_NOTE);
                 false
             }
-            _ => false,
+            Some(ProjectTemplate::Blank) | None => false,
         }
     }
 
@@ -804,8 +999,21 @@ impl Editor {
         if word.is_empty() { None } else { Some(word) }
     }
 
+    pub(super) fn load_hub_recents(&mut self) {
+        match load_recent_at(&hub_recent_file()) {
+            Ok(list) => {
+                self.recent_projects = list.projects.into_iter().take(8).map(|entry| entry.path).collect();
+                self.rebuild_recent_menus();
+            }
+            Err(error) => self.append(&format!("Recent projects were not read: {error}")),
+        }
+    }
+
     fn remember_project(&mut self, path: &Path) {
         remember(&mut self.recent_projects, path);
+        if let Err(error) = remember_recent_at(&hub_recent_file(), path) {
+            self.append(&format!("Recent projects were not saved: {error}"));
+        }
         self.persist_recent();
         self.rebuild_recent_menus();
     }
@@ -818,8 +1026,8 @@ impl Editor {
 
     fn rebuild_recent_menus(&self) {
         unsafe {
-            fill_menu(self.recent_project_menu, &self.recent_projects, super::ID_FILE_RECENT_PROJECT);
-            fill_menu(self.recent_level_menu, &self.recent_levels, super::ID_FILE_RECENT_LEVEL);
+            fill_menu(self.recent_project_menu, &self.recent_projects, super::ID_FILE_RECENT_PROJECT, true);
+            fill_menu(self.recent_level_menu, &self.recent_levels, super::ID_FILE_RECENT_LEVEL, false);
         }
     }
 
@@ -828,12 +1036,7 @@ impl Editor {
         let Ok(document) = load_project_file(project) else { return };
         let Ok(directory) = document.directory(project, "Saved/Editor") else { return };
         let _ = fs::create_dir_all(&directory);
-        let mut text = String::from("projects\n");
-        for path in &self.recent_projects {
-            text.push_str(&path.display().to_string());
-            text.push('\n');
-        }
-        text.push_str("levels\n");
+        let mut text = String::from("levels\n");
         for path in &self.recent_levels {
             text.push_str(&path.display().to_string());
             text.push('\n');
@@ -842,17 +1045,11 @@ impl Editor {
     }
 }
 
-fn write_template_file(project_path: &Path, project: &ProjectDocument, word: &str) {
-    let Ok(directory) = project.directory(project_path, "Saved/Editor") else { return };
-    let _ = fs::create_dir_all(&directory);
-    let _ = fs::write(directory.join("template.txt"), format!("{word}\n"));
-}
-
 fn backup_dir(project_file: &Path) -> PathBuf {
     project_file.parent().unwrap_or(Path::new(".")).join("Saved/Backup")
 }
 
-unsafe fn fill_menu(menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU, paths: &[PathBuf], base: usize) {
+unsafe fn fill_menu(menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU, paths: &[PathBuf], base: usize, mark_missing: bool) {
     if menu.is_null() {
         return;
     }
@@ -864,7 +1061,12 @@ unsafe fn fill_menu(menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU, pa
         return;
     }
     for (index, path) in paths.iter().enumerate().take(8) {
-        super::append(menu, base + index, &path.display().to_string());
+        let label = if mark_missing && project_file_missing(path) {
+            format!("{} (missing)", path.display())
+        } else {
+            path.display().to_string()
+        };
+        super::append(menu, base + index, &label);
     }
 }
 
@@ -883,30 +1085,6 @@ fn ensure_extension(path: &Path, extension: &str) -> PathBuf {
         name.push(extension);
         PathBuf::from(name)
     }
-}
-
-fn find_up(relative: &str) -> Option<PathBuf> {
-    let mut starts = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        starts.push(cwd);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            starts.push(parent.to_path_buf());
-        }
-    }
-    for mut dir in starts {
-        for _ in 0..8 {
-            let candidate = dir.join(relative);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-    }
-    None
 }
 
 fn parse_viewport(text: &str) -> Option<(Vec3, f64, f64, f64)> {

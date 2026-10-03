@@ -31,7 +31,10 @@ The arrow stops at the snapshot. The renderer does not call back into the regist
 | World Settings | environment record | Stack role, no transform |
 | Editor cameras | `SceneWorld` front and side cameras | Not actors. Not the runtime camera |
 | Camera | `WorldCamera` (`CameraId`) on the actor Transform | Version 2 only when a level contains one |
-| Project and level files | `jarvig.project`, `jarvig.level` | Version 1 stays version 1 |
+| Project and level files | `jarvig.project`, `jarvig.level` | Version 1 stays version 1. A Player Start writes version 5. A parametric block writes version 6 |
+| Character asset | `jarvig.character` version 1 | Rigid parts on SpatialFrame and Joint. ADR-0055, ADR-0059 |
+| Player definition | `jarvig.player` version 1 | Names one character asset. No controller, input, camera, or movement |
+| Player Start | Component on an ordinary entity | Spawn pose. The body is not this component. ADR-0059 |
 | Game application | `GameApplication` | Survives level replacement |
 | Runtime world | Instantiated `SceneWorld` | Discarded on stop |
 | Extraction | `RenderSceneSnapshot` | Still the only renderer input |
@@ -40,16 +43,14 @@ The arrow stops at the snapshot. The renderer does not call back into the regist
 
 ## What is only named
 
-These words are reserved so later work does not invent a second set. None of them are implemented. Camera actors and the runtime world are no longer in this list.
+These words are reserved so later work does not invent a second set. A character asset and a player definition now exist. ADR-0059. Movement, a controller, input, and a camera on that player do not. Camera actors and the runtime world are no longer in this list.
 
 | Name | Lifetime | Not |
 | --- | --- | --- |
 | Game mode | Rules for one world | A renderer feature |
 | Game state | Shared match data | The editor selection |
-| Player | Logical player | An `EntityHandle` in the level file |
 | Player controller | Input and network commands into the world | The Win32 message pump |
 | Pawn | A controllable actor | A subclass of mesh |
-| Character | A pawn with character movement | An inheritance tier |
 | Camera controller | Chooses the active game view | `RenderView` itself |
 | HUD | Player-facing UI | The editor dock |
 | Save game | Runtime progress | The authored level |
@@ -70,6 +71,8 @@ The stack lists only what the entity owns, in this order:
 7. Reflection Probe
 8. Camera
 9. World Settings
+
+Terrain and Player Start are further roles on that same stack. ADR-0058 and ADR-0059. Membership order is the order the entity owns.
 
 Camera is a real component. It is multiplicity One, requires Transform, and stores no second pose. The inspector prints the owned names in stack order. A level names its runtime camera with `world_settings.startup_camera` or it has none. The key is omitted when absent. Nothing selects the first Camera found.
 

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 jarvig_core = { path = "../jarvig_core" }
+jarvig_hub = { path = "../jarvig_hub" }
 png = "0.18.1"
 jarvig_engine = { path = "../jarvig_engine" }
 jarvig_renderer = { path = "../jarvig_renderer" }

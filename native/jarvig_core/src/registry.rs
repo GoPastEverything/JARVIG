@@ -247,6 +247,9 @@ fn classify(path: &str, file_name: &str) -> Option<(&'static str, String, String
     if extension == "jarvigcharacter" {
         return Some(("Character", "Character".into(), format));
     }
+    if extension == "jarvigplayer" {
+        return Some(("Player", "Player".into(), format));
+    }
     if matches!(extension, "wav" | "ogg") {
         return Some(("Audio", "Audio".into(), format));
     }

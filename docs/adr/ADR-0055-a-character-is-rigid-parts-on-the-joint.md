@@ -1,6 +1,6 @@
 # ADR-0055 — A character document is rigid parts on the joint
 
-Status: Accepted. Partially superseded by ADR-0056: the frame origin is the ball that joins the part to its parent. Vertices stay in the source world place.
+Status: Accepted. Partially superseded by ADR-0056: the frame origin is the ball that joins the part to its parent. Vertices stay in the source world place. Partially superseded by ADR-0059: the startup level does not hold both bodies.
 Date: 2026-10-01
 
 ## Context

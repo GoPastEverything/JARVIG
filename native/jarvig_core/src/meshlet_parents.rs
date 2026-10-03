@@ -65,6 +65,10 @@ pub struct HierarchySubmission {
     pub parent_nodes: Vec<u32>,
     pub triangles: u32,
     pub leaf_reference: u32,
+    /// Leaves represented by a drawn parent or by a submitted leaf.
+    pub covered_leaf_descendants: u32,
+    /// Selected leaves that the cut neither draws nor covers. Acceptance is zero.
+    pub uncovered_leaf_descendants: u32,
 }
 
 #[derive(Clone)]
@@ -149,7 +153,7 @@ pub fn build_parent_geometry_with(
         simplify(&mut working);
         let finite = working.positions.iter().all(|position| position.iter().all(|lane| lane.is_finite()));
         if !finite || working.indices.len() < 3 {
-            if let Some(saved) = fallback {
+            if let Some(saved) = fallback.clone() {
                 working = saved;
             }
         }
@@ -170,7 +174,13 @@ pub fn build_parent_geometry_with(
             None => working.indices.len() >= 3,
         };
         if !covers {
-            working.error = working.error.max(0.02);
+            // A parent that misses its children is not a drawable LOD. Keep the
+            // pre-simplify surface for ancestors when it still fits in memory.
+            hierarchy.nodes[node as usize].error = INELIGIBLE_ERROR;
+            if let Some(saved) = fallback {
+                alive[node as usize] = Some(saved);
+            }
+            continue;
         }
         let geometric = working.error.max(0.003 * working.level.max(1) as f32);
         if working.indices.len() >= 3 && geometric.is_finite() {
@@ -213,6 +223,30 @@ pub fn submission_for_cut(
     cut: &ClusterCut,
     visible: Option<&[bool]>,
 ) -> HierarchySubmission {
+    let drawable = vec![true; hierarchy.nodes.len()];
+    submission_keeping_coverage(hierarchy, ranges, leaf_counts, leaf_triangles, cut, visible, &drawable)
+}
+
+/// One entry per hierarchy node. A parent is drawable only when its triangles contain every child center.
+pub fn drawable_parent_mask(geometry: &ParentGeometry) -> Vec<bool> {
+    (0..geometry.hierarchy.nodes.len())
+        .map(|node| {
+            geometry.hierarchy.nodes[node].child_count > 0
+                && parent_covers_child_centers(&geometry.hierarchy, &geometry.vertices, &geometry.indices, &geometry.ranges, node)
+        })
+        .collect()
+}
+
+/// Same cut as [`submission_for_cut`], except a parent in `drawable` that is false expands back to its leaves.
+pub fn submission_keeping_coverage(
+    hierarchy: &ClusterHierarchy,
+    ranges: &[ParentRange],
+    leaf_counts: &[u32],
+    leaf_triangles: u32,
+    cut: &ClusterCut,
+    visible: Option<&[bool]>,
+    drawable: &[bool],
+) -> HierarchySubmission {
     let mut leaf_meshlets = Vec::new();
     let mut parent_nodes = Vec::new();
     let mut triangles = 0u32;
@@ -224,7 +258,8 @@ pub fn submission_for_cut(
         }
         let range = ranges.get(node as usize).cloned().unwrap_or_else(empty_range);
         let shown = visible.map(|flags| subtree_visible(hierarchy, node, flags)).unwrap_or(true);
-        if range.index_count > 0 && range.triangles > 0 && shown {
+        let drawable_parent = drawable.get(node as usize).copied().unwrap_or(false);
+        if drawable_parent && range.index_count > 0 && range.triangles > 0 && shown {
             parent_nodes.push(node);
             triangles = triangles.saturating_add(range.triangles);
             continue;
@@ -235,7 +270,53 @@ pub fn submission_for_cut(
     }
     leaf_meshlets.sort_unstable();
     leaf_meshlets.dedup();
-    HierarchySubmission { leaf_meshlets, parent_nodes, triangles, leaf_reference: leaf_triangles }
+    let (covered_leaf_descendants, uncovered_leaf_descendants) = tally_cut_coverage(hierarchy, cut, visible, &leaf_meshlets, &parent_nodes);
+    HierarchySubmission {
+        leaf_meshlets,
+        parent_nodes,
+        triangles,
+        leaf_reference: leaf_triangles,
+        covered_leaf_descendants,
+        uncovered_leaf_descendants,
+    }
+}
+
+fn tally_cut_coverage(hierarchy: &ClusterHierarchy, cut: &ClusterCut, visible: Option<&[bool]>, leaf_meshlets: &[u32], parent_nodes: &[u32]) -> (u32, u32) {
+    let mut represented = leaf_meshlets.to_vec();
+    for &node in parent_nodes {
+        represented.extend(leaves_under(hierarchy, node));
+    }
+    represented.sort_unstable();
+    represented.dedup();
+    let mut expected = Vec::new();
+    for &node in &cut.selected {
+        let Some(record) = hierarchy.nodes.get(node as usize) else { continue };
+        if record.child_count == 0 {
+            let shown = visible.map(|flags| flags.get(record.leaf as usize).copied().unwrap_or(false)).unwrap_or(true);
+            if shown {
+                expected.push(record.leaf);
+            }
+            continue;
+        }
+        for leaf in leaves_under(hierarchy, node) {
+            let shown = visible.map(|flags| flags.get(leaf as usize).copied().unwrap_or(false)).unwrap_or(true);
+            if shown {
+                expected.push(leaf);
+            }
+        }
+    }
+    expected.sort_unstable();
+    expected.dedup();
+    let mut covered = 0u32;
+    let mut uncovered = 0u32;
+    for leaf in expected {
+        if represented.binary_search(&leaf).is_ok() {
+            covered = covered.saturating_add(1);
+        } else {
+            uncovered = uncovered.saturating_add(1);
+        }
+    }
+    (covered, uncovered)
 }
 
 pub fn parent_draw_indices(indices: &[u32], ranges: &[ParentRange], nodes: &[u32]) -> Vec<u32> {
@@ -1306,6 +1387,76 @@ mod tests {
                 assert!(!leaves_under(&geometry.hierarchy, *node).contains(leaf));
             }
         }
+    }
+
+    #[test]
+    fn a_covering_parent_stays_and_an_uncovered_parent_returns_its_leaves() {
+        let (mesh, meshlets) = two_quads();
+        let geometry = build_parent_geometry(&mesh, &meshlets);
+        let parent = geometry.hierarchy.roots[0] as usize;
+        let mask = drawable_parent_mask(&geometry);
+        assert_eq!(mask.len(), geometry.hierarchy.nodes.len());
+        assert!(mask[parent], "two quads cover their children");
+        let far = select_cluster_cut(&geometry.hierarchy, |_| 4000.0, 0.577, 1080.0, 1.0);
+        let kept = submission_keeping_coverage(
+            &geometry.hierarchy,
+            &geometry.ranges,
+            &geometry.leaf_counts,
+            geometry.leaf_triangles,
+            &far,
+            None,
+            &mask,
+        );
+        assert_eq!(kept.parent_nodes, vec![parent as u32]);
+        assert!(kept.leaf_meshlets.is_empty());
+        assert_eq!(kept.uncovered_leaf_descendants, 0);
+        assert_eq!(kept.covered_leaf_descendants, 2);
+        let mut blocked = mask.clone();
+        blocked[parent] = false;
+        let expanded = submission_keeping_coverage(
+            &geometry.hierarchy,
+            &geometry.ranges,
+            &geometry.leaf_counts,
+            geometry.leaf_triangles,
+            &far,
+            None,
+            &blocked,
+        );
+        assert!(expanded.parent_nodes.is_empty());
+        assert_eq!(expanded.leaf_meshlets, vec![0, 1]);
+        assert_eq!(expanded.uncovered_leaf_descendants, 0);
+        assert_eq!(expanded.covered_leaf_descendants, 2);
+        assert_eq!(expanded.triangles, geometry.leaf_triangles);
+    }
+
+    #[test]
+    fn hierarchy_without_occlusion_does_not_leave_uncovered_leaves() {
+        let (_mesh, meshlets) = two_quads();
+        let geometry = build_parent_geometry(&_mesh, &meshlets);
+        let leaf_count = geometry.hierarchy.leaf_count as usize;
+        let flags = vec![1u32; leaf_count];
+        let triangles: Vec<u32> = meshlets.meshlets.iter().map(|meshlet| meshlet.index_count / 3).collect();
+        let visible = crate::meshlet_hierarchy::cut_visible_hierarchy(&geometry.hierarchy, &flags, &triangles, |_| 4000.0, 0.577, 1080.0, 1.0);
+        assert_eq!(visible.occlusion_rejected, 0);
+        let cut = ClusterCut { selected: visible.selected, coarseness: visible.coarseness, covered_leaves: visible.covered_leaves };
+        let mask = drawable_parent_mask(&geometry);
+        let kept = submission_keeping_coverage(
+            &geometry.hierarchy,
+            &geometry.ranges,
+            &geometry.leaf_counts,
+            geometry.leaf_triangles,
+            &cut,
+            None,
+            &mask,
+        );
+        assert_eq!(kept.uncovered_leaf_descendants, 0);
+        let mut represented = kept.leaf_meshlets.clone();
+        for node in &kept.parent_nodes {
+            represented.extend(leaves_under(&geometry.hierarchy, *node));
+        }
+        represented.sort_unstable();
+        represented.dedup();
+        assert_eq!(represented.len(), leaf_count);
     }
 
     #[test]

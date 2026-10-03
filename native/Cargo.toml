@@ -1,3 +1,3 @@
 [workspace]
-members = ["jarvig_core", "jarvig_material", "jarvig_rhi", "jarvig_renderer", "jarvig_engine", "jarvig_platform", "jarvig_rhi_wgpu", "jarvig_editor_host", "jarvig_editor", "jarvig_game"]
+members = ["jarvig_core", "jarvig_material", "jarvig_rhi", "jarvig_renderer", "jarvig_engine", "jarvig_platform", "jarvig_rhi_wgpu", "jarvig_editor_host", "jarvig_editor", "jarvig_hub", "jarvig_game"]
 resolver = "2"

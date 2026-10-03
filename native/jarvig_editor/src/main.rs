@@ -11,11 +11,14 @@ mod documents;
 mod png_decode;
 mod gizmo;
 mod inspector;
+mod reference;
 
 mod outliner;
 mod progress;
 mod rfc_runtime;
 mod selection;
+mod edit_history;
+mod marquee;
 
 use std::num::NonZeroIsize;
 use std::time::Instant;
@@ -25,9 +28,11 @@ use dock::{
     Layout, PanelId, WorkspaceCommand, CONTENT, INSPECTOR, OUTLINER, OUTPUT, PERSPECTIVE, SCHEMA_VERSION,
 };
 use jarvig_core::{
-    camera_relative_f32, environment_diffuse_for, environment_specular_for, perspective_ray, pick_snapshot_skipping, plus_z_normal, reflection_probe_influence,
-    reflection_probe_lod, render_light_record, visible_side_normal, EntityHandle, EntityUuid, FocusError, LightKind, PropertyValue, Quat,
-    RenderFrameId, ResolvedPose, ValueKind, Vec3, FIELD_LOCAL_ROTATION, REFLECTION_PROBE_MIP_COUNT, TYPE_CAMERA, TYPE_SPATIAL_FRAME,
+    camera_relative_f32, environment_diffuse_for, environment_specular_for, face_from_local_point, face_name, perspective_ray,
+    pick_snapshot_skipping, plus_z_normal, reflection_probe_influence, reflection_probe_lod, render_light_record, snap_dimension, visible_side_normal,
+    AuthoringCapabilities, EntityHandle, EntityUuid, FocusError, LightKind, PropertyValue, Quat, RenderFrameId, ResolvedPose, ValueKind, Vec3,
+    BLOCK_POSITION_SNAP_M, FIELD_LOCAL_ROTATION, REFLECTION_PROBE_MIP_COUNT, TYPE_CAMERA, TYPE_PARAMETRIC_BLOCK,
+    TYPE_SPATIAL_FRAME,
 };
 use jarvig_engine::{AuthoringCommand, EngineSession, FrameError};
 use jarvig_renderer::{
@@ -60,7 +65,7 @@ use windows_sys::Win32::UI::Controls::{
     TVINSERTSTRUCTW, TVITEMW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
+    AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, EnableMenuItem, ModifyMenuW,
     GetMenuItemCount,
     CallWindowProcW, GetClientRect, GetCursorPos, GetMessageW, GetParent, GetWindowRect, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, IsDialogMessageW, IsIconic, KillTimer, LoadCursorW,
@@ -68,7 +73,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetCursorPos, SetProcessDPIAware,
     SetTimer, SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
     SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE,
-    GWLP_WNDPROC, IDC_ARROW, IDC_SIZENS, IDC_SIZEWE, IDI_APPLICATION, MB_OK, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    GWLP_WNDPROC, IDC_ARROW, IDC_SIZENS, IDC_SIZEWE, IDI_APPLICATION, MB_OK, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
     MF_UNCHECKED, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -87,12 +92,19 @@ const ID_FILE_SAVE_ALL: usize = 1017;
 const ID_FILE_RELOAD: usize = 1018;
 const ID_FILE_IMPORT_MESH: usize = 1019;
 const ID_EDIT_UNDO: usize = 1020;
+const ID_EDIT_REDO: usize = 1021;
+const ID_EDIT_DUPLICATE: usize = 1022;
+const ID_EDIT_DELETE: usize = 1023;
+const ID_EDIT_SELECT_ALL: usize = 1024;
+const ID_EDIT_DESELECT: usize = 1025;
+const ID_EDIT_INVERT: usize = 1026;
 const ID_FILE_RECENT_PROJECT: usize = 1040;
 const ID_FILE_RECENT_LEVEL: usize = 1050;
 const ID_FILE_TEMPLATE_EMPTY: usize = 1060;
 const ID_FILE_TEMPLATE_TERRAIN: usize = 1061;
 const ID_FILE_TEMPLATE_THIRD: usize = 1062;
 const ID_FILE_TEMPLATE_FPS: usize = 1063;
+const ID_CREATE_BLOCK: usize = 1070;
 const ID_FILE_EXIT: usize = 1001;
 const ID_PLAY: usize = 1101;
 const ID_PLAY_STANDALONE: usize = 1102;
@@ -107,6 +119,7 @@ const ID_VIEW_JOINTS: usize = 1392;
 const ID_VIEW_JOINT_LIMITS: usize = 1393;
 const ID_VIEW_ALL_JOINTS: usize = 1394;
 const ID_VIEW_LAND: usize = 1395;
+const ID_VIEW_MESH_PARTS: usize = 1396;
 const ID_VIEW_INSPECTOR: usize = 1302;
 const ID_VIEW_CONTENT: usize = 1303;
 const ID_VIEW_OUTPUT: usize = 1304;
@@ -166,6 +179,24 @@ const ID_VIEW_ERROR_FOUR: usize = 1375;
 const ID_VIEW_EINSTEIN: usize = 1376;
 const ID_VIEW_MICRO: usize = 1377;
 const ID_VIEW_MICRO_COLOR: usize = 1378;
+const ID_VIEW_LEAF_TRUTH: usize = 1379;
+const ID_VIEW_MICRO_ON: usize = 1380;
+const ID_VIEW_MICRO_OFF: usize = 1381;
+const ID_VIEW_MICRO_ACTIVE: usize = 1382;
+const ID_VIEW_MICRO_ELIGIBLE: usize = 1383;
+const ID_VIEW_MICRO_ERROR: usize = 1384;
+const ID_VIEW_MICRO_STATE: usize = 1385;
+const ID_VIEW_MICRO_REJECT: usize = 1386;
+const ID_VIEW_CUT_REASONS: usize = 1387;
+const ID_VIEW_VG_NORMAL: usize = 1410;
+const ID_VIEW_VG_FRUSTUM: usize = 1411;
+const ID_VIEW_VG_HIER: usize = 1412;
+const ID_VIEW_VG_OCC: usize = 1413;
+const ID_VIEW_VG_LEVELS: usize = 1414;
+const ID_VIEW_RESET_DEBUG: usize = 1415;
+const ID_VIEW_EINSTEIN_OFF: usize = 1416;
+const ID_VIEW_FREEZE_DIAGNOSTIC: usize = 1417;
+const ID_VIEW_COMPARE_LEAF: usize = 1418;
 const ID_VIEW_RECAPTURE: usize = 1327;
 const ID_PROBE_STATIC: usize = 1328;
 const ID_PROBE_ON_DEMAND: usize = 1329;
@@ -216,7 +247,7 @@ const TPM_NONOTIFY: u32 = 0x0080;
 const NM_SETFOCUS: u32 = 4294967289;
 const SW_HIDE: i32 = 0;
 const PW_RENDERFULLCONTENT: u32 = 0x0002;
-const TOOLBAR_DIP: f32 = 40.0;
+const TOOLBAR_DIP: f32 = 58.0;
 const STATUS_DIP: f32 = 22.0;
 const CLASS_TOOLBAR: &str = "JARVIGEditorToolbar";
 const CLASS_FRAME: &str = "JARVIGEditorFrame";
@@ -296,6 +327,53 @@ enum CaptureKind {
     Orbit,
     Gizmo,
     Terrain,
+    Face,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelingTool {
+    Extrude,
+    Inset,
+    Bevel,
+}
+
+/// Viewport pick resolution. Edge and vertex wait until a solid has those elements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    Auto,
+    Object,
+    Face,
+}
+
+/// One open modeling operation. The viewport handle and the amount field share this state.
+#[derive(Clone, Copy)]
+struct ModelingSession {
+    tool: ModelingTool,
+    entity: EntityUuid,
+    face: u8,
+    baseline_size: [f64; 3],
+    baseline_inset: [f64; 6],
+    baseline_bevel: f64,
+    baseline_local: Vec3,
+    amount: f64,
+}
+
+#[derive(Clone, Copy)]
+struct FaceDrag {
+    entity: EntityUuid,
+    face: u8,
+    baseline_size: [f64; 3],
+    baseline_inset: [f64; 6],
+    baseline_bevel: f64,
+    baseline_local: Vec3,
+    plane_point: Vec3,
+    /// Direction the arrow points. Motion along it increases the amount.
+    world_normal: Vec3,
+    /// Camera-facing plane that contains the arrow. The face plane does not.
+    plane_normal: Vec3,
+    start_hit: Vec3,
+    /// Amount when this drag began. The preview is this plus a snapped delta, from the session baseline.
+    amount_origin: f64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -519,6 +597,7 @@ struct Editor {
     boot_failed: bool,
     panels: [(PanelId, HWND); 5],
     view_menu: HMENU,
+    edit_menu: HMENU,
     lighting_menu: HMENU,
     lighting_debug: LightingDebug,
     /// Session quality. Not saved in the level and not chosen from the adapter.
@@ -567,12 +646,19 @@ struct Editor {
     meshlet_occlusion: bool,
     meshlet_freeze: bool,
     meshlet_highlight: bool,
+    leaf_truth: bool,
+    geometry_diagnostic: jarvig_core::GeometryDiagnostic,
+    visualization: jarvig_core::DiagnosticVisualization,
+    diagnostic_freeze: bool,
     cluster_hierarchy: bool,
     hierarchy_error_px: f32,
+    parent_autoload: Option<jarvig_core::AssetId>,
     einstein_debug: bool,
     einstein_seed: u64,
     einstein_uvs: Vec<[f32; 2]>,
     micro_enabled: bool,
+    micro_mode: jarvig_core::MicrogeometryMode,
+    micro_debug: jarvig_core::MicroDebugMode,
     micro_surface: bool,
     micro_color: bool,
     micro_seed: u64,
@@ -583,6 +669,11 @@ struct Editor {
     rfc0002_transition: bool,
     rfc0002_refine: bool,
     rfc0002_async: bool,
+    rfc0002_settle: bool,
+    settle_fingerprint: u64,
+    settle_tris: u32,
+    settle_done: bool,
+    settle_fault: String,
     async_close: f64,
     async_far: f64,
     async_step: u32,
@@ -636,9 +727,20 @@ struct Editor {
     content_search: HWND,
     content_press: Option<(i32, i32, jarvig_core::AssetId)>,
     content_drag: Option<jarvig_core::AssetId>,
-    content_undo: Vec<Vec<jarvig_core::EntityId>>,
-    /// Character workspace over the same frames and joints. Not a second skeleton.
+    history: edit_history::EditHistory,
+    /// Character workspace. An asset preview stashes the level. A rig already in the level stays in place.
     character_workspace: bool,
+    /// Flat mesh-part list. The joint tree stays the contact hierarchy.
+    outliner_parts: bool,
+    outliner_parts_shown: bool,
+    joints_note_logged: bool,
+    /// Authored level held while a character asset is previewed. None while the level itself is showing.
+    authored_stash: Option<documents::AuthoredStash>,
+    preview_ids: Vec<jarvig_core::EntityId>,
+    /// Preview entity, then the Player Start that owns it.
+    preview_owners: Vec<(jarvig_core::EntityId, jarvig_core::EntityId)>,
+    character_asset_path: Option<String>,
+    character_asset_name: String,
     /// Land workspace over the same world. Not a second editor.
     land_mode: bool,
     outliner_land: bool,
@@ -685,11 +787,11 @@ struct Editor {
     bind_pose_index: u8,
     bind_pose_capture_next: bool,
     job_line: String,
-    meshlet_bound: Option<(jarvig_core::EntityId, bool)>,
+    meshlet_bound: Option<(jarvig_core::EntityId, jarvig_core::MeshId, bool)>,
     scene_meshes: Vec<jarvig_core::MeshId>,
     status_base: String,
     project_file: Option<std::path::PathBuf>,
-    /// Set by `--project`. Cold start still opens Lighting Lab when this is empty.
+    /// Set by `--project` or by the hub. Empty means no project. Lighting Lab is not a fallback.
     startup_project: Option<std::path::PathBuf>,
     project_name: String,
     level_file: Option<std::path::PathBuf>,
@@ -728,6 +830,12 @@ struct Editor {
     transform_space: gizmo::TransformSpace,
     gizmo_drag: Option<gizmo::GizmoDrag>,
     gizmo_hover: Option<gizmo::GizmoHandle>,
+    face_drag: Option<FaceDrag>,
+    face_hover: Option<u8>,
+    modeling_session: Option<ModelingSession>,
+    selected_face: Option<(EntityUuid, u8)>,
+    selection_mode: SelectionMode,
+    marquee: Option<marquee::MarqueeDrag>,
     pick_requests: u64,
     pick_hits: u64,
     pick_misses: u64,
@@ -926,7 +1034,26 @@ impl HasDisplayHandle for ViewportHandle {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let startup_project = match explicit_project(&args) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("JARVIG_FAIL {error}");
+            std::process::exit(1);
+        }
+    };
     let self_test = args.iter().any(|arg| arg == "--self-test");
+    let startup_project = if startup_project.is_none() && !harness_args(&args) {
+        match jarvig_hub::pick_project() {
+            Ok(Some(path)) => Some(path),
+            Ok(None) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("JARVIG_FAIL {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        startup_project
+    };
     let limit = args.iter().position(|arg| arg == "--frames").and_then(|index| {
         args.get(index + 1).and_then(|value| value.parse::<u32>().ok())
     });
@@ -973,6 +1100,10 @@ fn main() {
         editor.lod_capture = true;
         editor.rfc0002_async = true;
     }
+    if args.iter().any(|arg| arg == "--rfc0002-settle") {
+        editor.lod_capture = true;
+        editor.rfc0002_settle = true;
+    }
     if args.iter().any(|arg| arg == "--content-check") {
         editor.content_check = true;
     }
@@ -983,13 +1114,7 @@ fn main() {
         };
         editor.bind_pose_dir = Some(std::path::PathBuf::from(path));
     }
-    if let Some(index) = args.iter().position(|arg| arg == "--project") {
-        let Some(path) = args.get(index + 1) else {
-            eprintln!("JARVIG_FAIL --project needs a .jarvigproject path");
-            std::process::exit(1);
-        };
-        editor.startup_project = Some(std::path::PathBuf::from(path));
-    }
+    editor.startup_project = startup_project;
     if let Err(error) = editor.run() {
         eprintln!("JARVIG_FAIL {error}");
         std::process::exit(1);
@@ -999,6 +1124,35 @@ fn main() {
         std::process::exit(1);
     }
     println!("JARVIG_OK editor frames={}", editor.frames);
+}
+
+/// `--project` bypasses the hub. A missing path is a failure, not a sample.
+fn explicit_project(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(index) = args.iter().position(|arg| arg == "--project") else {
+        return Ok(None);
+    };
+    let path = args.get(index + 1).filter(|path| !path.starts_with('-')).ok_or("--project needs a .jarvigproject path")?;
+    Ok(Some(std::path::PathBuf::from(path)))
+}
+
+/// Harness flags stay on the editor process. They do not open Lighting Lab by themselves.
+fn harness_args(args: &[String]) -> bool {
+    const FLAGS: &[&str] = &[
+        "--self-test",
+        "--frames",
+        "--lod-capture",
+        "--rfc0001",
+        "--rfc0001-runtime",
+        "--rfc0002",
+        "--rfc0002-micro",
+        "--rfc0002-transition",
+        "--rfc0002-refine",
+        "--rfc0002-async",
+        "--rfc0002-settle",
+        "--content-check",
+        "--bind-pose-shots",
+    ];
+    args.iter().any(|arg| FLAGS.contains(&arg.as_str()))
 }
 
 impl Editor {
@@ -1028,6 +1182,7 @@ impl Editor {
             boot_failed: false,
             panels: [(OUTLINER, std::ptr::null_mut()); 5],
             view_menu: std::ptr::null_mut(),
+            edit_menu: std::ptr::null_mut(),
             lighting_menu: std::ptr::null_mut(),
             lighting_debug: LightingDebug::default(),
             render_quality: jarvig_core::RenderQuality::Baseline,
@@ -1068,17 +1223,24 @@ impl Editor {
             pick_mesh_us: 0,
             selection_change_us: 0,
             meshlet_debug: false,
-            meshlet_shade: false,
+            meshlet_shade: true,
             meshlet_frustum: true,
             meshlet_occlusion: true,
             meshlet_freeze: false,
             meshlet_highlight: false,
-            cluster_hierarchy: false,
+            leaf_truth: false,
+            geometry_diagnostic: jarvig_core::GeometryDiagnostic::Normal,
+            visualization: jarvig_core::DiagnosticVisualization::None,
+            diagnostic_freeze: false,
+            cluster_hierarchy: true,
+            parent_autoload: None,
             hierarchy_error_px: 1.0,
             einstein_debug: false,
             einstein_seed: 1,
             einstein_uvs: Vec::new(),
             micro_enabled: false,
+            micro_mode: jarvig_core::MicrogeometryMode::Auto,
+            micro_debug: jarvig_core::MicroDebugMode::Off,
             micro_surface: true,
             micro_color: false,
             micro_seed: 1,
@@ -1089,6 +1251,11 @@ impl Editor {
             rfc0002_transition: false,
             rfc0002_refine: false,
             rfc0002_async: false,
+            rfc0002_settle: false,
+            settle_fingerprint: 0,
+            settle_tris: 0,
+            settle_done: false,
+            settle_fault: String::new(),
             async_close: 0.0,
             async_far: 0.0,
             async_step: 0,
@@ -1142,8 +1309,16 @@ impl Editor {
             content_search: std::ptr::null_mut(),
             content_press: None,
             content_drag: None,
-            content_undo: Vec::new(),
+            history: edit_history::EditHistory::default(),
             character_workspace: false,
+            outliner_parts: false,
+            outliner_parts_shown: false,
+            joints_note_logged: false,
+            authored_stash: None,
+            preview_ids: Vec::new(),
+            preview_owners: Vec::new(),
+            character_asset_path: None,
+            character_asset_name: String::new(),
             land_mode: false,
             outliner_land: false,
             land_tool: LandTool::Create,
@@ -1230,6 +1405,12 @@ impl Editor {
             transform_space: gizmo::TransformSpace::World,
             gizmo_drag: None,
             gizmo_hover: None,
+            face_drag: None,
+            face_hover: None,
+            modeling_session: None,
+            selected_face: None,
+            selection_mode: SelectionMode::Auto,
+            marquee: None,
             pick_requests: 0,
             pick_hits: 0,
             pick_misses: 0,
@@ -1308,11 +1489,14 @@ impl Editor {
         unsafe {
             let instance = GetModuleHandleW(std::ptr::null());
             register_classes(instance)?;
-            let (menu, view_menu, lighting_menu, recent_projects, recent_levels) = editor_menu()?;
+            let (menu, edit_menu, view_menu, lighting_menu, recent_projects, recent_levels) = editor_menu()?;
+            self.edit_menu = edit_menu;
             self.view_menu = view_menu;
             self.lighting_menu = lighting_menu;
             self.recent_project_menu = recent_projects;
             self.recent_level_menu = recent_levels;
+            self.refresh_edit_menu();
+            self.load_hub_recents();
             let name = wide(CLASS_FRAME);
             let title = wide("JARVIGEditor");
             let hwnd = CreateWindowExW(
@@ -1663,6 +1847,7 @@ impl Editor {
         if self.outliner.revision() == revision
             && self.outliner_source == source
             && self.outliner_character == self.character_workspace
+            && self.outliner_parts_shown == self.outliner_parts
             && !self.outliner_land
             && !showing_tools
             && !self.tree_keys.is_empty()
@@ -1672,6 +1857,16 @@ impl Editor {
         let mut outline = self.viewed_world().entity_outline();
         if self.character_workspace {
             outline.retain(|row| self.viewed_world().authored_joint(row.uuid).is_some());
+            if self.outliner_parts {
+                outline.retain(|row| self.viewed_world().entity_ownership(row.uuid).is_ok_and(|ownership| ownership.capabilities.mesh_renderer));
+                for row in &mut outline {
+                    row.parent = None;
+                }
+                outline.sort_by(|left, right| left.name.cmp(&right.name));
+            } else if !self.joints_note_logged {
+                self.joints_note_logged = true;
+                self.append("Joint parents are the 0.02 m contact span, not an anatomical bone list. View > Mesh Parts lists imported mesh parts.");
+            }
         }
         if !self.outliner_logged && self.project_file.is_some() {
             self.outliner_logged = true;
@@ -1685,15 +1880,21 @@ impl Editor {
         // A pose or a simulation tick revises the world. The tree is the entity list, so those do not delete it.
         let same_rows = self.outliner_source == source
             && self.outliner_character == self.character_workspace
+            && self.outliner_parts_shown == self.outliner_parts
             && !self.outliner_land
             && !showing_tools
             && !self.tree_keys.is_empty()
             && self.outliner.same_rows(&next);
         self.outliner_source = source;
         self.outliner_character = self.character_workspace;
+        self.outliner_parts_shown = self.outliner_parts;
         self.outliner_land = false;
         self.outliner = next;
-        if self.character_workspace {
+        if self.character_workspace && self.outliner_parts {
+            for row in &outline {
+                self.outliner.set_category(row.uuid, "Mesh");
+            }
+        } else if self.character_workspace {
             for row in &outline {
                 if let Some(joint) = self.viewed_world().authored_joint(row.uuid) {
                     self.outliner.set_category(row.uuid, joint.kind.label());
@@ -1709,12 +1910,21 @@ impl Editor {
     }
 
     fn sync_selection_view(&mut self) {
+        if self.modeling_session.as_ref().is_some_and(|session| self.selection.primary_entity() != Some(session.entity)) {
+            self.cancel_modeling(false);
+        }
         let world_revision = self.viewed_world().revision();
         let source = self.view_source_key();
         let selection_changed = !self.selection_view_ready || self.selection_seen != self.selection.revision() || self.inspector_source != source;
         let world_changed = self.selection_world_seen != world_revision;
         if !selection_changed && !world_changed {
             return;
+        }
+        if selection_changed {
+            let primary = self.selection.primary_entity();
+            if self.selected_face.is_some_and(|(id, _)| Some(id) != primary) {
+                self.selected_face = None;
+            }
         }
         self.selection_seen = self.selection.revision();
         self.selection_world_seen = world_revision;
@@ -1757,9 +1967,44 @@ impl Editor {
                 )
             }
         } else {
-            let mut model = inspector::build_with(&self.selection, self.viewed_world(), &staged, &meshes);
+            let element = match self.selected_face {
+                Some((id, face)) if self.selection.primary_entity() == Some(id) => inspector::SolidElement::Face(face),
+                _ => inspector::SolidElement::Object,
+            };
+            let mode_name = match self.selection_mode {
+                SelectionMode::Auto => "Auto",
+                SelectionMode::Object => "Object",
+                SelectionMode::Face => "Face",
+            };
+            let mut model = inspector::build_solid(&self.selection, self.viewed_world(), &staged, &meshes, element, mode_name);
+            if let Some(session) = self.modeling_session {
+                if self.selection.primary_entity() == Some(session.entity) {
+                    inspector::attach_modeling_session(&mut model, &modeling_view(session));
+                    if let inspector::InspectorBody::Entity { sections } = &mut model.body {
+                        for section in sections.iter_mut() {
+                            for field in &mut section.fields {
+                                if matches!(
+                                    field.field,
+                                    jarvig_core::FIELD_BLOCK_SIZE_X | jarvig_core::FIELD_BLOCK_SIZE_Y | jarvig_core::FIELD_BLOCK_SIZE_Z
+                                ) {
+                                    field.editable = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(entity) = self.selection.primary_entity() {
                 inspector::attach_joint_context(&mut model, self.viewed_world(), entity);
+                let players = self.registry_paths("Player");
+                let characters = self.registry_paths("Character");
+                let character = self
+                    .engine
+                    .world()
+                    .authored_player_start(entity)
+                    .map(|start| self.player_character_path(&start.player))
+                    .unwrap_or_default();
+                inspector::attach_player_start(&mut model, self.viewed_world(), entity, &players, &characters, &character);
             }
             model
         };
@@ -2043,12 +2288,16 @@ impl Editor {
     }
 
     fn commit_inspector_text(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, field: jarvig_core::FieldId, text: &str) {
+        if field == inspector::SOLID_UI_AMOUNT {
+            self.commit_modeling_amount(text);
+            return;
+        }
         let Some(slot) = self.inspector_model.field(type_id, field).cloned() else { return };
         if !slot.editable {
             return;
         }
         let selection_revision = self.selection.revision();
-        let submitted = if slot.kind == ValueKind::Float64 {
+        let value = if slot.kind == ValueKind::Float64 {
             let Some(value) = text.trim().parse::<f64>().ok().and_then(|value| inspector::clamp_number(value, slot.minimum, slot.maximum)) else {
                 self.append("Inspector kept the authoritative value. The text was not a finite number.");
                 self.realize_inspector_controls();
@@ -2057,16 +2306,18 @@ impl Editor {
             if slot.display.parse::<f64>().ok().is_some_and(|current| (current - value).abs() < 1.0e-9) {
                 return;
             }
-            inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::F64(value))
+            PropertyValue::F64(value)
         } else if slot.kind == ValueKind::String {
             if text == slot.display {
                 return;
             }
-            inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::String(text.to_string()))
+            PropertyValue::String(text.to_string())
         } else {
             return;
         };
-        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted);
+        let opened = self.open_property_edit(entity);
+        let submitted = inspector::submit_property(&mut self.engine, entity, type_id, field, value);
+        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted, opened);
     }
 
     fn commit_inspector_axes(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, field: jarvig_core::FieldId) {
@@ -2097,18 +2348,14 @@ impl Editor {
             return;
         }
         let selection_revision = self.selection.revision();
-        let submitted = if slot.widget == inspector::WidgetKind::Euler {
-            inspector::submit_property(
-                &mut self.engine,
-                entity,
-                type_id,
-                field,
-                PropertyValue::Quat(inspector::quat_from_degrees(parts)),
-            )
+        let value = if slot.widget == inspector::WidgetKind::Euler {
+            PropertyValue::Quat(inspector::quat_from_degrees(parts))
         } else {
-            inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::Vec3(Vec3::new(parts[0], parts[1], parts[2])))
+            PropertyValue::Vec3(Vec3::new(parts[0], parts[1], parts[2]))
         };
-        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted);
+        let opened = self.open_property_edit(entity);
+        let submitted = inspector::submit_property(&mut self.engine, entity, type_id, field, value);
+        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted, opened);
     }
 
     fn commit_inspector_choice(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, field: jarvig_core::FieldId, text: &str) {
@@ -2116,10 +2363,26 @@ impl Editor {
         if !slot.editable {
             return;
         }
+        if field == inspector::PLAYER_UI_CHARACTER {
+            let Some(start) = self.engine.world().authored_player_start(entity) else { return };
+            match self.write_player_character(&start.player, text) {
+                Ok(()) => {
+                    self.append(&format!("{text} is the character for {}. The level was not changed.", start.player));
+                    self.sync_spawn_preview();
+                    self.inspector_force_realize = true;
+                    self.request_inspector_refresh();
+                }
+                Err(error) => {
+                    self.append(&format!("Character reference was not stored. {error}"));
+                    self.realize_inspector_controls();
+                }
+            }
+            return;
+        }
         let selection_revision = self.selection.revision();
-        let submitted = if field == jarvig_core::FIELD_PARENT {
+        let value = if field == jarvig_core::FIELD_PARENT {
             match inspector::parent_from_choice(self.engine.world(), entity, text) {
-                Ok(parent) => inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::OptionalEntity(parent)),
+                Ok(parent) => PropertyValue::OptionalEntity(parent),
                 Err(message) => {
                     self.append(&format!("Inspector kept the authoritative value. {message}."));
                     self.realize_inspector_controls();
@@ -2134,13 +2397,15 @@ impl Editor {
             if slot.display.parse::<f64>().ok().is_some_and(|current| (current - value).abs() < 1.0e-9) {
                 return;
             }
-            inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::F64(value))
+            PropertyValue::F64(value)
         } else if text == slot.display {
             return;
         } else {
-            inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::String(text.to_string()))
+            PropertyValue::String(text.to_string())
         };
-        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted);
+        let opened = self.open_property_edit(entity);
+        let submitted = inspector::submit_property(&mut self.engine, entity, type_id, field, value);
+        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted, opened);
     }
 
     fn commit_inspector_check(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, field: jarvig_core::FieldId, checked: bool) {
@@ -2154,8 +2419,9 @@ impl Editor {
             return;
         }
         let selection_revision = self.selection.revision();
+        let opened = self.open_property_edit(entity);
         let submitted = inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::Bool(checked));
-        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted);
+        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted, opened);
     }
 
     fn finish_inspector_submit(
@@ -2164,21 +2430,31 @@ impl Editor {
         display: &str,
         field: jarvig_core::FieldId,
         submitted: Result<jarvig_core::AuthoringResult, jarvig_core::AuthoringError>,
+        opened: bool,
     ) {
         if self.selection.revision() != selection_revision {
             self.append("Inspector edit changed selection. That is a bug.");
         }
         match submitted {
             Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
                 if display.to_ascii_lowercase().contains("emissive") {
                     self.engine.world_mut().note_lighting_edit();
                 }
                 if field == jarvig_core::FIELD_UPDATE_MODE {
                     self.note_policy_edit();
                 }
+                if field == jarvig_core::FIELD_PREVIEW_CHARACTER || field == jarvig_core::FIELD_PLAYER_DEFINITION {
+                    self.sync_spawn_preview();
+                }
                 self.request_inspector_refresh();
             }
             Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
                 self.append(&format!("Inspector command failed: {error}"));
                 self.inspector_force_realize = true;
                 self.request_inspector_refresh();
@@ -2248,19 +2524,46 @@ impl Editor {
     }
 
     fn run_inspector_command(&mut self, command: inspector::InspectorCommand, type_id: jarvig_core::TypeId) {
-        if command == inspector::InspectorCommand::CreateTerrain {
-            self.create_land_terrain();
-            return;
+        match command {
+            inspector::InspectorCommand::CreateTerrain => {
+                self.create_land_terrain();
+                return;
+            }
+            inspector::InspectorCommand::SelectionAuto => {
+                self.set_selection_mode(SelectionMode::Auto);
+                return;
+            }
+            inspector::InspectorCommand::SelectionObject => {
+                self.set_selection_mode(SelectionMode::Object);
+                return;
+            }
+            inspector::InspectorCommand::SelectionFace => {
+                self.set_selection_mode(SelectionMode::Face);
+                return;
+            }
+            _ => {}
         }
         let Some(entity) = self.inspector_target() else { return };
         match command {
             inspector::InspectorCommand::RemoveComponent => {
+                let opened = self.history_begin("Remove Component", &[entity]);
                 match self.engine.execute_authoring(AuthoringCommand::RemoveComponent { target: entity, type_id, slot: 0 }) {
-                    Ok(_) => self.sync_outliner(),
-                    Err(jarvig_core::AuthoringError::InvalidOperation) => {
-                        self.append("That component is required by another one. Remove the dependent component first.");
+                    Ok(_) => {
+                        if opened {
+                            self.history_commit();
+                        }
+                        self.sync_outliner();
                     }
-                    Err(error) => self.append(&format!("Remove component failed: {error}")),
+                    Err(error) => {
+                        if opened {
+                            let _ = self.history_cancel();
+                        }
+                        if error == jarvig_core::AuthoringError::InvalidOperation {
+                            self.append("That component is required by another one. Remove the dependent component first.");
+                        } else {
+                            self.append(&format!("Remove component failed: {error}"));
+                        }
+                    }
                 }
             }
             inspector::InspectorCommand::ResetTransform => self.reset_authored_transform(entity),
@@ -2273,10 +2576,333 @@ impl Editor {
             }
             inspector::InspectorCommand::ResetPose => self.reset_character_pose(),
             inspector::InspectorCommand::CreateTerrain => self.create_land_terrain(),
+            inspector::InspectorCommand::ResetShape => {
+                self.cancel_modeling(false);
+                self.reset_block_shape(entity);
+            }
+            inspector::InspectorCommand::ExtrudeFace => self.begin_modeling(ModelingTool::Extrude),
+            inspector::InspectorCommand::InsetFace => self.begin_modeling(ModelingTool::Inset),
+            inspector::InspectorCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
+            inspector::InspectorCommand::CancelModeling => self.cancel_modeling(true),
+            inspector::InspectorCommand::ApplyModeling => self.apply_modeling(),
+            inspector::InspectorCommand::MirrorX => self.mirror_selected_block(entity, 0),
+            inspector::InspectorCommand::MirrorY => self.mirror_selected_block(entity, 1),
+            inspector::InspectorCommand::MirrorZ => self.mirror_selected_block(entity, 2),
+            inspector::InspectorCommand::Duplicate => self.duplicate_selected(),
+            inspector::InspectorCommand::AlignToGround => self.align_selected_block(entity),
+            inspector::InspectorCommand::SnapTranslation => self.snap_selected_block(entity),
+            inspector::InspectorCommand::EditBevel => self.begin_modeling(ModelingTool::Bevel),
+            inspector::InspectorCommand::EditInset(face) => {
+                self.selected_face = Some((entity, face));
+                self.begin_modeling(ModelingTool::Inset);
+            }
+            inspector::InspectorCommand::SelectionAuto
+            | inspector::InspectorCommand::SelectionObject
+            | inspector::InspectorCommand::SelectionFace => {}
+        }
+    }
+
+    fn set_selection_mode(&mut self, mode: SelectionMode) {
+        self.selection_mode = mode;
+        if mode == SelectionMode::Object {
+            self.selected_face = None;
+        }
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        self.refresh_status();
+    }
+
+    fn selection_element_suffix(&self) -> String {
+        if self.selection.is_empty() {
+            return String::new();
+        }
+        if let Some((id, face)) = self.selected_face {
+            if self.selection.primary_entity() == Some(id) {
+                return format!(" · Face {}", face_name(face));
+            }
+        }
+        " · Object".into()
+    }
+
+    fn reset_block_shape(&mut self, entity: EntityUuid) {
+        let opened = self.history_begin("Reset Shape", &[entity]);
+        match self.engine.execute_authoring(AuthoringCommand::ResetBlockShape { target: entity }) {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("The block shape is already the 2 m solid.");
+            }
+            Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("Reset the block shape. The position stayed.");
+                self.sync_outliner();
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Reset shape failed: {error}."));
+            }
+        }
+    }
+
+    fn begin_modeling(&mut self, tool: ModelingTool) {
+        if self.session_active() {
+            self.append("Stop play before modeling a solid.");
+            return;
+        }
+        if self.land_mode || self.character_workspace {
+            self.append("Return to the level before modeling a solid.");
+            return;
+        }
+        let Some(entity) = self.selection.primary_entity() else {
+            self.append("Select a parametric solid first.");
+            return;
+        };
+        let Ok(ownership) = self.engine.world().entity_ownership(entity) else { return };
+        if !AuthoringCapabilities::from_entity(ownership.capabilities).parametric_solid {
+            self.append("That actor is not a parametric solid.");
+            return;
+        }
+        if self.modeling_session.is_some_and(|session| session.tool == tool && session.entity == entity) {
+            return;
+        }
+        if self.modeling_session.is_some() {
+            self.cancel_modeling(false);
+        } else if self.history.gesture_open() {
+            let _ = self.history_cancel();
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("That actor is not a parametric solid.");
+            return;
+        };
+        let Ok(local) = self.engine.world().entity_local_pose(entity) else { return };
+        let face = if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
+            face
+        } else {
+            if tool != ModelingTool::Bevel {
+                self.append(&format!("{} used +X. Select a face to choose another.", modeling_tool_name(tool)));
+            }
+            self.selected_face = Some((entity, 0));
+            0
+        };
+        let amount = match tool {
+            ModelingTool::Extrude => 0.0,
+            ModelingTool::Inset => record.inset_m[face as usize],
+            ModelingTool::Bevel => record.bevel_m,
+        };
+        self.history_begin(modeling_tool_name(tool), &[entity]);
+        self.modeling_session = Some(ModelingSession {
+            tool,
+            entity,
+            face,
+            baseline_size: record.size_m,
+            baseline_inset: record.inset_m,
+            baseline_bevel: record.bevel_m,
+            baseline_local: local.translation,
+            amount,
+        });
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    fn commit_modeling_amount(&mut self, text: &str) {
+        if self.modeling_session.is_none() {
+            return;
+        }
+        let Some(slot) = self.inspector_model.field(TYPE_PARAMETRIC_BLOCK, inspector::SOLID_UI_AMOUNT).cloned() else { return };
+        let Some(value) = text.trim().parse::<f64>().ok().and_then(|value| inspector::clamp_number(value, slot.minimum, slot.maximum)) else {
+            self.realize_inspector_controls();
+            return;
+        };
+        self.preview_modeling_amount(value);
+    }
+
+    fn preview_modeling_amount(&mut self, amount: f64) {
+        let Some(session) = self.modeling_session else { return };
+        let applied = clamp_modeling_amount(session, amount);
+        if (applied - session.amount).abs() < 1.0e-9 {
+            return;
+        }
+        let result = match session.tool {
+            ModelingTool::Extrude => self.engine.execute_authoring(AuthoringCommand::PushBlockFace {
+                target: session.entity,
+                face: session.face,
+                baseline_size: session.baseline_size,
+                baseline_local: session.baseline_local,
+                outward_m: applied,
+            }),
+            ModelingTool::Inset => self.engine.execute_authoring(AuthoringCommand::PreviewBlockInset {
+                target: session.entity,
+                face: session.face,
+                meters: applied,
+            }),
+            ModelingTool::Bevel => self.engine.execute_authoring(AuthoringCommand::PreviewBlockBevel { target: session.entity, meters: applied }),
+        };
+        if result.is_err() {
+            self.realize_inspector_controls();
+            return;
+        }
+        if let Some(session) = self.modeling_session.as_mut() {
+            session.amount = applied;
+        }
+        self.rebuild_inspector();
+    }
+
+    fn apply_modeling(&mut self) {
+        let Some(session) = self.modeling_session.take() else { return };
+        self.face_drag.take();
+        if self.capture == Some(CaptureKind::Face) {
+            self.end_capture(true, false);
+        }
+        let name = modeling_tool_name(session.tool);
+        let result = match session.tool {
+            ModelingTool::Extrude => self.engine.execute_authoring(AuthoringCommand::CommitBlockFace {
+                target: session.entity,
+                face: session.face,
+                baseline_size: session.baseline_size,
+            }),
+            ModelingTool::Inset => self.engine.execute_authoring(AuthoringCommand::CommitBlockInset {
+                target: session.entity,
+                face: session.face,
+                baseline_m: session.baseline_inset[session.face as usize],
+            }),
+            ModelingTool::Bevel => self.engine.execute_authoring(AuthoringCommand::CommitBlockBevel {
+                target: session.entity,
+                baseline_m: session.baseline_bevel,
+            }),
+        };
+        match result {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                self.history_commit();
+                self.append(&format!("{name} left the solid unchanged."));
+            }
+            Ok(_) => {
+                self.history_commit();
+                self.append(&format!("Applied {name}."));
+            }
+            Err(error) => {
+                let _ = self.history_cancel();
+                self.append(&format!("{name} was not applied: {error}."));
+            }
+        }
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    /// Restores the session baseline. Does not append or erase history. `announce` is for an explicit Cancel.
+    fn cancel_modeling(&mut self, announce: bool) {
+        let Some(session) = self.modeling_session.take() else { return };
+        self.face_drag = None;
+        self.gizmo_drag = None;
+        if !self.history_cancel() {
+            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
+                target: session.entity,
+                size_m: session.baseline_size,
+                inset_m: session.baseline_inset,
+                bevel_m: session.baseline_bevel,
+                translation: session.baseline_local,
+            });
+        }
+        if matches!(self.capture, Some(CaptureKind::Face | CaptureKind::Gizmo)) {
+            self.end_capture(true, false);
+        }
+        if announce {
+            self.append("Canceled the modeling preview.");
+        }
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    fn mirror_selected_block(&mut self, entity: EntityUuid, axis: u8) {
+        self.cancel_modeling(false);
+        let opened = self.history_begin("Mirror", &[]);
+        match self.engine.execute_authoring(AuthoringCommand::MirrorBlock { target: entity, axis }) {
+            Ok(jarvig_core::AuthoringResult::Duplicated(created)) => {
+                self.history_note_created(created);
+                if opened {
+                    self.history_commit();
+                }
+                self.append(&format!("Mirrored {entity} as {created}. The copy is independent."));
+                self.selected_face = None;
+                let _ = self.selection.replace_from(selection::SelectionItem::Entity(created), selection::SelectionSource::Inspector);
+                self.sync_outliner();
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Mirror did not return a copy.");
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Mirror failed: {error}."));
+            }
+        }
+    }
+
+    fn align_selected_block(&mut self, entity: EntityUuid) {
+        self.cancel_modeling(false);
+        let opened = self.history_begin("Align", &[entity]);
+        match self.engine.execute_authoring(AuthoringCommand::AlignBlockToGround { target: entity }) {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("The block is already on the ground.");
+            }
+            Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("Aligned the block to the ground.");
+                self.sync_outliner();
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Align failed: {error}."));
+            }
+        }
+    }
+
+    fn snap_selected_block(&mut self, entity: EntityUuid) {
+        self.cancel_modeling(false);
+        let opened = self.history_begin("Snap", &[entity]);
+        match self.engine.execute_authoring(AuthoringCommand::SnapBlock { target: entity, step_m: BLOCK_POSITION_SNAP_M }) {
+            Ok(jarvig_core::AuthoringResult::Unchanged) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("The block is already on the 0.1 m grid.");
+            }
+            Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.append("Snapped the block to 0.1 m.");
+                self.sync_outliner();
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Snap failed: {error}."));
+            }
         }
     }
 
     fn reset_authored_transform(&mut self, entity: EntityUuid) {
+        let opened = self.history_begin("Reset Transform", &[entity]);
         if let Some(joint) = self.engine.world().authored_joint(entity) {
             let _ = inspector::submit_property(
                 &mut self.engine,
@@ -2293,6 +2919,9 @@ impl Editor {
                 PropertyValue::Quat(joint.rest_rotation),
             );
             self.append("Joint returned to its rest pose.");
+            if opened {
+                self.history_commit();
+            }
             return;
         }
         let _ = inspector::submit_property(
@@ -2318,12 +2947,19 @@ impl Editor {
                 PropertyValue::Vec3(Vec3::new(1.0, 1.0, 1.0)),
             );
         }
+        if opened {
+            self.history_commit();
+        }
         self.sync_outliner();
     }
 
     fn reset_material_instance(&mut self, entity: EntityUuid) {
+        let opened = self.history_begin("Reset Material", &[entity]);
         for field in [jarvig_core::FIELD_UV_SCALE, jarvig_core::FIELD_ROUGHNESS_FACTOR, jarvig_core::FIELD_METALLIC_FACTOR, jarvig_core::FIELD_NORMAL_SCALE] {
             let _ = inspector::submit_property(&mut self.engine, entity, jarvig_core::TYPE_MESH_RENDERER, field, PropertyValue::F64(1.0));
+        }
+        if opened {
+            self.history_commit();
         }
         self.sync_outliner();
     }
@@ -2355,8 +2991,9 @@ impl Editor {
         }
         let Some(color) = choose_linear_color(self.panel_hwnd(INSPECTOR), Vec3::new(parts[0], parts[1], parts[2])) else { return };
         let selection_revision = self.selection.revision();
+        let opened = self.open_property_edit(entity);
         let submitted = inspector::submit_property(&mut self.engine, entity, type_id, field, PropertyValue::Vec3(color));
-        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted);
+        self.finish_inspector_submit(selection_revision, &slot.display, field, submitted, opened);
     }
 
     fn open_add_component_menu(&mut self) {
@@ -2390,6 +3027,7 @@ impl Editor {
     }
 
     fn add_inspector_component(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, name: &str) {
+        let opened = self.history_begin("Add Component", &[entity]);
         let requires = jarvig_core::find_type(type_id).map(|info| info.requires.to_vec()).unwrap_or_default();
         let owned = inspector::owned_types(self.engine.world(), entity);
         for required in requires {
@@ -2400,6 +3038,9 @@ impl Editor {
             match self.engine.execute_authoring(AuthoringCommand::AddComponent { target: entity, type_id: required }) {
                 Ok(_) => self.append(&format!("{required_name} was added because {name} needs it.")),
                 Err(error) => {
+                    if opened {
+                        let _ = self.history_cancel();
+                    }
                     self.append(&format!("{name} needs {required_name}, and that could not be added ({error})."));
                     return;
                 }
@@ -2407,16 +3048,30 @@ impl Editor {
         }
         match self.engine.execute_authoring(AuthoringCommand::AddComponent { target: entity, type_id }) {
             Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
                 self.append(&format!("{name} added."));
                 self.sync_outliner();
             }
             Err(jarvig_core::AuthoringError::InvalidOperation) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
                 self.append(&format!("{name} is already on this actor, or this actor cannot take it."));
             }
             Err(jarvig_core::AuthoringError::Unsupported) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
                 self.append(&format!("{name} cannot be added from the inspector."));
             }
-            Err(error) => self.append(&format!("Could not add {name}: {error}")),
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Could not add {name}: {error}"));
+            }
         }
     }
 
@@ -2590,8 +3245,10 @@ impl Editor {
         unsafe { SendMessageW(hwnd, TVM_DELETEITEM, 0, TVI_ROOT); }
         let root = if self.session_active() {
             "Runtime"
+        } else if self.character_workspace && self.outliner_parts {
+            "Mesh Parts"
         } else if self.character_workspace {
-            "Skeleton"
+            "Joints"
         } else {
             "World"
         };
@@ -3296,13 +3953,29 @@ impl Editor {
         self.tick_editor_camera(delta)?;
         self.maybe_autosave();
         self.publish_gizmo();
+        self.publish_reference();
         self.sync_meshlet_debug();
+        self.consider_cached_parents();
+        let facts = self.selected_detail_facts();
+        if !self.micro_harness_active() {
+            self.micro_enabled = jarvig_core::microgeometry_active(self.micro_mode, &facts);
+        }
         if self.einstein_debug || self.rfc0002 {
             self.ensure_einstein_uvs();
         }
+        let detail_compatible = jarvig_core::microgeometry_active(jarvig_core::MicrogeometryMode::Auto, &facts);
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_geometry_diagnostic(self.geometry_diagnostic);
+            renderer.set_diagnostic_visualization(self.visualization);
+            renderer.set_diagnostic_freeze(self.diagnostic_freeze);
+            renderer.set_meshlet_frustum(self.meshlet_frustum);
+            renderer.set_meshlet_occlusion(self.meshlet_occlusion);
+            renderer.set_cluster_hierarchy(self.cluster_hierarchy);
             renderer.set_einstein_debug(self.einstein_debug, self.einstein_seed);
+            renderer.set_micro_debug(self.micro_debug);
+            renderer.set_micro_compatible(detail_compatible);
             renderer.set_micro_surface(self.micro_surface);
+            renderer.set_detail_exact(facts.exact);
             renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
         }
         self.publish_land_view();
@@ -3361,6 +4034,9 @@ impl Editor {
         }
         if self.gizmo_drag.is_some() {
             self.cancel_gizmo();
+        }
+        if self.face_drag.is_some() {
+            self.cancel_face();
         }
         self.viewport_resize_requests = self.viewport_resize_requests.saturating_add(1);
         if width == 0 || height == 0 {
@@ -3933,6 +4609,7 @@ impl Editor {
         mark_quality(ID_PRESENT_BEFORE, self.presentation == PresentationMode::BeforeCurve);
         mark_quality(ID_VIEW_CHARACTER, self.character_workspace);
         mark_quality(ID_VIEW_LAND, self.land_mode);
+        mark_quality(ID_VIEW_MESH_PARTS, self.character_workspace && self.outliner_parts);
         mark_quality(ID_VIEW_JOINTS, self.character_workspace && self.show_joint_debug);
         mark_quality(ID_VIEW_ALL_JOINTS, self.character_workspace && self.show_all_joints);
         mark_quality(ID_VIEW_JOINT_LIMITS, self.character_workspace && self.show_joint_limits);
@@ -3942,9 +4619,25 @@ impl Editor {
         mark_quality(ID_VIEW_MESHLET_OCCLUSION, self.meshlet_occlusion);
         mark_quality(ID_VIEW_MESHLET_FREEZE, self.meshlet_freeze);
         mark_quality(ID_VIEW_MESHLET_HIGHLIGHT, self.meshlet_highlight);
+        mark_quality(ID_VIEW_VG_NORMAL, self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::Normal);
+        mark_quality(ID_VIEW_LEAF_TRUTH, self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::LeafTruth);
+        mark_quality(ID_VIEW_VG_FRUSTUM, self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::FrustumOnly);
+        mark_quality(ID_VIEW_VG_HIER, self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::HierarchyNoOcclusion);
+        mark_quality(ID_VIEW_VG_OCC, self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::HierarchyWithOcclusion);
+        mark_quality(ID_VIEW_CUT_REASONS, self.visualization == jarvig_core::DiagnosticVisualization::CutReasons);
+        mark_quality(ID_VIEW_VG_LEVELS, self.visualization == jarvig_core::DiagnosticVisualization::HierarchyLevels);
+        mark_quality(ID_VIEW_FREEZE_DIAGNOSTIC, self.diagnostic_freeze);
+        mark_quality(ID_VIEW_EINSTEIN_OFF, self.visualization == jarvig_core::DiagnosticVisualization::None);
         mark_quality(ID_VIEW_CLUSTER_HIERARCHY, self.cluster_hierarchy);
-        mark_quality(ID_VIEW_EINSTEIN, self.einstein_debug);
-        mark_quality(ID_VIEW_MICRO, self.micro_enabled);
+        mark_quality(ID_VIEW_EINSTEIN, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinDetail);
+        mark_quality(ID_VIEW_MICRO_ACTIVE, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinActive);
+        mark_quality(ID_VIEW_MICRO_ELIGIBLE, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinEligible);
+        mark_quality(ID_VIEW_MICRO_ERROR, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinLodError);
+        mark_quality(ID_VIEW_MICRO_STATE, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinState);
+        mark_quality(ID_VIEW_MICRO_REJECT, self.visualization == jarvig_core::DiagnosticVisualization::EinsteinReject);
+        mark_quality(ID_VIEW_MICRO, self.micro_mode == jarvig_core::MicrogeometryMode::Auto);
+        mark_quality(ID_VIEW_MICRO_ON, self.micro_mode == jarvig_core::MicrogeometryMode::On);
+        mark_quality(ID_VIEW_MICRO_OFF, self.micro_mode == jarvig_core::MicrogeometryMode::Off);
         mark_quality(ID_VIEW_MICRO_COLOR, self.micro_color);
         mark_quality(ID_VIEW_ERROR_HALF, (self.hierarchy_error_px - 0.5).abs() < 0.01);
         mark_quality(ID_VIEW_ERROR_ONE, (self.hierarchy_error_px - 1.0).abs() < 0.01);
@@ -4262,9 +4955,10 @@ impl Editor {
             .as_ref()
             .map(|controller| format!("{:.1} m/s", controller.speed_m_s))
             .unwrap_or_else(|| "—".into());
-        let observed = selection::status_selection(&self.selection, |id| {
+        let mut observed = selection::status_selection(&self.selection, |id| {
             self.outliner.display_name(id).unwrap_or("Missing").to_string()
         });
+        observed.push_str(&self.selection_element_suffix());
         let space = match self.transform_space {
             gizmo::TransformSpace::World => "world",
             gizmo::TransformSpace::Local => "local",
@@ -4391,20 +5085,27 @@ impl Editor {
             return String::new();
         }
         format!(
-            " GPU scene inst {}/{} geom {} meshlets {}/{} fru {} occ {} cons {} tris {} cull {} us {} {}{}{}{} |",
+            " GPU scene inst {}/{} geom {} meshlets {}/{} cand {} fru {} occ {} cons {} parents {} leaves {} tris {} hz {}x{} cull {} us {} {}{} pipeline {} viz {}{} {} | legacy {} meshlet {} parent {} micro {} |",
             stats.instances_visible,
             stats.instances,
             stats.geometries,
             stats.meshlets_submitted,
             stats.meshlets,
+            stats.meshlets,
             stats.meshlets_rejected,
             stats.occlusion_rejected,
             stats.conservative_visible,
+            stats.hierarchy_parents,
+            stats.hierarchy_leaves,
             stats.triangles_submitted,
+            stats.hz_width,
+            stats.hz_height,
             stats.cull_us,
             if stats.frustum { "frustum on" } else { "frustum off" },
             if stats.occlusion { "occlusion on" } else { "occlusion off" },
             if stats.frozen { " frozen" } else { "" },
+            self.geometry_diagnostic.label(),
+            self.visualization.label(),
             if stats.hierarchy && stats.hierarchy_leaf_triangles > 0 {
                 let percent = if stats.hierarchy_leaf_triangles == 0 {
                     0.0
@@ -4412,14 +5113,16 @@ impl Editor {
                     (stats.hierarchy_lod_triangles as f32 / stats.hierarchy_leaf_triangles as f32 - 1.0) * 100.0
                 };
                 format!(
-                    " LOD depth {} | leaves {} | parents {} | submitted {} | tris {} / {} | {:+.1}% | select {:.2} ms | err {:.1} px",
+                    " LOD depth {} | nodes {} | leaves {} | parents {} | submitted {} | tris {} / {} | {:+.1}% | uncov {} | select {:.2} ms | err {:.1} px",
                     stats.hierarchy_depth,
+                    stats.hierarchy_candidates,
                     stats.hierarchy_leaves,
                     stats.hierarchy_parents,
                     stats.hierarchy_leaves.saturating_add(stats.hierarchy_parents),
                     stats.hierarchy_lod_triangles,
                     stats.hierarchy_leaf_triangles,
                     percent,
+                    stats.hierarchy_uncovered_leaves,
                     stats.hierarchy_select_us as f32 / 1000.0,
                     self.hierarchy_error_px
                 )
@@ -4428,7 +5131,11 @@ impl Editor {
             } else {
                 String::new()
             },
-            self.einstein_status()
+            self.einstein_status(),
+            stats.legacy_draw_triangles,
+            stats.meshlet_draw_triangles,
+            stats.parent_draw_triangles,
+            stats.micro_triangles
         )
     }
 
@@ -4447,6 +5154,9 @@ impl Editor {
             renderer.set_meshlet_freeze(self.meshlet_freeze);
             renderer.set_cluster_hierarchy(self.cluster_hierarchy);
             renderer.set_hierarchy_error_px(self.hierarchy_error_px);
+            renderer.set_geometry_diagnostic(self.geometry_diagnostic);
+            renderer.set_diagnostic_visualization(self.visualization);
+            renderer.set_diagnostic_freeze(self.diagnostic_freeze);
         }
         if fresh.is_empty() {
             return;
@@ -5494,6 +6204,9 @@ impl Editor {
             return;
         }
         self.cancel_gizmo();
+        self.cancel_modeling(false);
+        self.cancel_face();
+        self.marquee = None;
         self.end_capture(true, true);
         let Some(controller) = self.editor_camera.as_ref() else {
             self.append("Play needs the editor camera. It was not started.");
@@ -5638,12 +6351,22 @@ impl Editor {
             self.append("Select a Camera actor first.");
             return;
         };
+        let settings = self.world_settings_entity();
+        let opened = settings.map(|settings| self.history_begin("Startup Camera", &[settings])).unwrap_or(false);
         match self.engine.world_mut().set_startup_camera(Some(id)) {
             Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
                 self.sync_outliner();
                 self.append(&format!("Startup camera is {id}. Play will use that Camera. The editor camera was not changed."));
             }
-            Err(_) => self.append("That actor has no Camera component. The startup camera was not changed."),
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That actor has no Camera component. The startup camera was not changed.");
+            }
         }
     }
 
@@ -5652,12 +6375,18 @@ impl Editor {
             self.refresh_status();
             return Ok(());
         }
+        if self.diagnostic_freeze {
+            self.nav_keys = NavKeys::default();
+            self.nav.clear_gestures();
+            self.refresh_status();
+            return Ok(());
+        }
         if self.pilot_entity.is_some() {
             self.push_pilot_camera()?;
             self.refresh_status();
             return Ok(());
         }
-        if self.capture == Some(CaptureKind::Gizmo) {
+        if matches!(self.capture, Some(CaptureKind::Gizmo | CaptureKind::Face)) {
             self.push_editor_camera()?;
             self.refresh_status();
             return Ok(());
@@ -5924,7 +6653,7 @@ impl Editor {
     }
 
     fn gizmo_target(&self) -> Option<(EntityUuid, ResolvedPose)> {
-        if self.session_active() {
+        if self.session_active() || self.modeling_session.is_some() {
             return None;
         }
         if !matches!(self.object_tool, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) {
@@ -5965,7 +6694,26 @@ impl Editor {
         }
     }
 
-    fn viewport_press(&mut self, hwnd: HWND, x: f64, y: f64, ctrl: bool) {
+    fn viewport_press(&mut self, hwnd: HWND, x: f64, y: f64, ctrl: bool, shift: bool) {
+        // The open modeling arrow and its face come before the transform gizmo.
+        if !ctrl && !shift {
+            if let Some(face) = self.operation_handle_at(x, y) {
+                if self.begin_face_drag(hwnd, face, x, y) {
+                    return;
+                }
+            }
+            let session = self.modeling_session;
+            let on_session_face = session.is_some_and(|session| {
+                self.selection.primary_entity() == Some(session.entity) && self.face_under_cursor(x, y) == Some(session.face)
+            });
+            if on_session_face {
+                if let Some(session) = session {
+                    if self.begin_face_drag(hwnd, session.face, x, y) {
+                        return;
+                    }
+                }
+            }
+        }
         // An axis or ring under the cursor starts a drag before a marker or a mesh can change the selection.
         if let Some(handle) = self.gizmo_handle_at(x, y) {
             self.begin_gizmo_drag(hwnd, handle, x, y);
@@ -5975,11 +6723,7 @@ impl Editor {
         if self.character_workspace {
             if let Some(entity) = self.joint_pivot_at(x, y) {
                 let item = selection::SelectionItem::Entity(entity);
-                if ctrl {
-                    let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
-                } else {
-                    let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
-                }
+                self.apply_click_selection(item, ctrl, shift);
                 self.sync_selection_view();
                 return;
             }
@@ -6005,24 +6749,52 @@ impl Editor {
         match hit {
             Some(hit) => {
                 self.pick_hits = self.pick_hits.saturating_add(1);
-                let entity = self.engine.world().terrain_owner(hit.entity).unwrap_or(hit.entity);
+                let entity = self
+                    .preview_owners
+                    .iter()
+                    .find(|(preview, _)| *preview == hit.entity)
+                    .map(|(_, owner)| *owner)
+                    .or_else(|| self.engine.world().terrain_owner(hit.entity))
+                    .unwrap_or(hit.entity);
                 let item = selection::SelectionItem::Entity(entity);
-                if ctrl {
-                    let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
-                } else {
-                    let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
-                }
+                self.apply_click_selection(item, ctrl, shift);
+                self.assign_picked_element(entity, hit.position);
                 self.selection_change_us = started.elapsed().as_micros();
                 self.sync_selection_view();
             }
             None => {
                 self.pick_misses = self.pick_misses.saturating_add(1);
-                if !ctrl {
+                if !ctrl && !shift {
                     self.selection.clear_from(selection::SelectionSource::Viewport);
+                    self.selected_face = None;
                     self.selection_change_us = started.elapsed().as_micros();
                     self.sync_selection_view();
                 }
             }
+        }
+    }
+
+    fn apply_click_selection(&mut self, item: selection::SelectionItem, ctrl: bool, shift: bool) {
+        if ctrl {
+            let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
+        } else if shift {
+            let _ = self.selection.add_from(item, selection::SelectionSource::Viewport);
+        } else {
+            let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
+        }
+    }
+
+    fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3) {
+        if self.selection_mode == SelectionMode::Object {
+            if self.selected_face.take().is_some() {
+                self.inspector_force_realize = true;
+            }
+            return;
+        }
+        if let Some(face) = self.face_on_block(entity, point) {
+            self.note_selected_face(entity, face);
+        } else if self.selected_face.take().is_some() {
+            self.inspector_force_realize = true;
         }
     }
 
@@ -6046,6 +6818,10 @@ impl Editor {
             gizmo::axis_drag_plane(axis, ray.direction)
         };
         let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, pose.translation, normal) else { return };
+        if !self.history.gesture_open() && !self.session_active() {
+            let label = if handle.is_rotation() { "Rotate" } else { "Move" };
+            self.history_begin(label, &[entity]);
+        }
         self.gizmo_drag = Some(gizmo::GizmoDrag {
             entity,
             handle,
@@ -6058,6 +6834,189 @@ impl Editor {
         });
         self.gizmo_hover = Some(handle);
         self.begin_capture(hwnd, CaptureKind::Gizmo);
+    }
+
+    fn modeling_tools_visible(&self) -> bool {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            return false;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return false };
+        let Ok(ownership) = self.engine.world().entity_ownership(entity) else { return false };
+        AuthoringCapabilities::from_entity(ownership.capabilities).parametric_solid
+    }
+
+    fn modeling_toolbar_command(&self) -> Option<chrome::ToolbarCommand> {
+        self.modeling_session.map(|session| match session.tool {
+            ModelingTool::Extrude => chrome::ToolbarCommand::Extrude,
+            ModelingTool::Inset => chrome::ToolbarCommand::Inset,
+            ModelingTool::Bevel => chrome::ToolbarCommand::Bevel,
+        })
+    }
+
+    fn face_target(&self) -> Option<(EntityUuid, ResolvedPose, [f64; 3])> {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            return None;
+        }
+        let entity = self.selection.primary_entity()?;
+        let ownership = self.engine.world().entity_ownership(entity).ok()?;
+        if !AuthoringCapabilities::from_entity(ownership.capabilities).face_editable {
+            return None;
+        }
+        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        let record = self.engine.world().authored_block(entity)?;
+        Some((entity, pose, record.size_m))
+    }
+
+    fn operation_handle_at(&self, x: f64, y: f64) -> Option<u8> {
+        let session = self.modeling_session?;
+        let (entity, pose, size) = self.face_target()?;
+        if entity != session.entity {
+            return None;
+        }
+        let ray = self.viewport_ray(x, y)?;
+        let length = self.gizmo_length(pose.translation)?;
+        let normal = jarvig_core::face_normal(session.face)?;
+        let mut direction = pose.rotation.rotate(normal);
+        if session.tool == ModelingTool::Inset {
+            direction = direction.scale(-1.0);
+        }
+        let center = jarvig_core::face_center(pose.translation, pose.rotation, size, session.face)?;
+        if gizmo::hit_operation_handle(ray.origin, ray.direction, center, direction, length) {
+            Some(session.face)
+        } else {
+            None
+        }
+    }
+
+    fn face_under_cursor(&self, x: f64, y: f64) -> Option<u8> {
+        let (_entity, pose, size) = self.face_target()?;
+        let ray = self.viewport_ray(x, y)?;
+        let hit = ray_box_local(ray.origin, ray.direction, pose.translation, pose.rotation, size)?;
+        face_from_local_point(hit, size)
+    }
+
+    fn face_on_block(&self, entity: EntityUuid, world_point: Vec3) -> Option<u8> {
+        let ownership = self.engine.world().entity_ownership(entity).ok()?;
+        if !AuthoringCapabilities::from_entity(ownership.capabilities).face_editable {
+            return None;
+        }
+        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        let record = self.engine.world().authored_block(entity)?;
+        let delta = Vec3::new(world_point.x - pose.translation.x, world_point.y - pose.translation.y, world_point.z - pose.translation.z);
+        face_from_local_point(pose.rotation.conjugate().rotate(delta), record.size_m)
+    }
+
+    fn note_selected_face(&mut self, entity: EntityUuid, face: u8) {
+        let next = Some((entity, face));
+        if self.selected_face == next {
+            return;
+        }
+        self.selected_face = next;
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+    }
+
+    fn begin_face_drag(&mut self, hwnd: HWND, face: u8, x: f64, y: f64) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if session.face != face || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let entity = session.entity;
+        let tool = session.tool;
+        let Some(record) = self.engine.world().authored_block(entity) else { return false };
+        let Ok(world_pose) = self.engine.world().entity_world_pose(entity) else { return false };
+        let Some(normal) = jarvig_core::face_normal(face) else { return false };
+        let Some(center) = jarvig_core::face_center(world_pose.translation, world_pose.rotation, record.size_m, face) else { return false };
+        let mut arrow = world_pose.rotation.rotate(normal);
+        if tool == ModelingTool::Inset {
+            arrow = arrow.scale(-1.0);
+        }
+        let Some(ray) = self.viewport_ray(x, y) else { return false };
+        let plane_normal = gizmo::axis_drag_plane(arrow, ray.direction);
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, center, plane_normal) else { return false };
+        self.face_drag = Some(FaceDrag {
+            entity,
+            face,
+            baseline_size: session.baseline_size,
+            baseline_inset: session.baseline_inset,
+            baseline_bevel: session.baseline_bevel,
+            baseline_local: session.baseline_local,
+            plane_point: center,
+            world_normal: arrow,
+            plane_normal,
+            start_hit: hit,
+            amount_origin: session.amount,
+        });
+        self.face_hover = Some(face);
+        self.begin_capture(hwnd, CaptureKind::Face);
+        true
+    }
+
+    fn update_face_drag(&mut self, x: f64, y: f64) {
+        let Some(drag) = self.face_drag else { return };
+        let Some(session) = self.modeling_session else { return };
+        if session.entity != drag.entity {
+            return;
+        }
+        let Some(ray) = self.viewport_ray(x, y) else { return };
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, drag.plane_point, drag.plane_normal) else { return };
+        let delta = Vec3::new(hit.x - drag.start_hit.x, hit.y - drag.start_hit.y, hit.z - drag.start_hit.z);
+        let along = snap_dimension(gizmo::scalar_along(delta, drag.world_normal));
+        let raw = match session.tool {
+            ModelingTool::Extrude => drag.amount_origin + along,
+            ModelingTool::Bevel | ModelingTool::Inset => (drag.amount_origin + along).max(0.0),
+        };
+        self.preview_modeling_amount(raw);
+    }
+
+    /// Mouse-up keeps the preview. Apply writes history. Cancel restores it.
+    fn commit_face(&mut self) {
+        self.face_drag.take();
+        if self.capture == Some(CaptureKind::Face) {
+            self.end_capture(true, false);
+        }
+    }
+
+    fn cancel_face(&mut self) {
+        if self.face_drag.is_some() {
+            self.restore_face_drag();
+        }
+        if self.capture == Some(CaptureKind::Face) {
+            self.end_capture(true, false);
+        }
+    }
+
+    fn restore_face_drag(&mut self) {
+        let Some(drag) = self.face_drag.take() else { return };
+        let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
+            target: drag.entity,
+            size_m: drag.baseline_size,
+            inset_m: drag.baseline_inset,
+            bevel_m: drag.baseline_bevel,
+            translation: drag.baseline_local,
+        });
+        if let Some(session) = self.modeling_session.as_mut() {
+            if session.entity == drag.entity {
+                session.amount = modeling_start_amount(session);
+            }
+        }
+        self.inspector_force_realize = true;
+        self.sync_outliner();
+    }
+
+    fn update_face_hover(&mut self, x: f64, y: f64) {
+        let hover = if self.face_drag.is_some() {
+            self.face_drag.as_ref().map(|drag| drag.face)
+        } else if self.modeling_session.is_some() {
+            self.operation_handle_at(x, y)
+        } else if self.selection_mode == SelectionMode::Object {
+            None
+        } else {
+            self.face_under_cursor(x, y)
+        };
+        if hover != self.face_hover {
+            self.face_hover = hover;
+        }
     }
 
     fn update_gizmo_drag(&mut self, x: f64, y: f64) {
@@ -6111,6 +7070,9 @@ impl Editor {
     fn commit_gizmo(&mut self) {
         if self.gizmo_drag.take().is_some() {
             self.gizmo_commits = self.gizmo_commits.saturating_add(1);
+            if matches!(self.history.open_label(), Some("Move" | "Rotate")) {
+                self.history_commit();
+            }
             self.sync_outliner();
         }
         if self.capture == Some(CaptureKind::Gizmo) {
@@ -6119,11 +7081,21 @@ impl Editor {
     }
 
     fn cancel_gizmo(&mut self) {
-        if self.gizmo_drag.is_some() {
-            self.restore_gizmo_drag();
-        }
         if self.capture == Some(CaptureKind::Gizmo) {
             self.end_capture(true, false);
+            return;
+        }
+        if self.gizmo_drag.is_none() {
+            return;
+        }
+        if matches!(self.history.open_label(), Some("Move" | "Rotate")) {
+            self.gizmo_drag.take();
+            if self.history_cancel() {
+                self.gizmo_cancels = self.gizmo_cancels.saturating_add(1);
+                self.request_inspector_refresh();
+            }
+        } else {
+            self.restore_gizmo_drag();
         }
     }
 
@@ -6156,7 +7128,28 @@ impl Editor {
         }
     }
 
+    fn publish_reference(&mut self) {
+        let show = !self.session_active() && !self.land_mode && !self.character_workspace;
+        let vertices = if show { self.reference_vertices() } else { Vec::new() };
+        let view = self.viewport_view;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_editor_reference(match view {
+                Some(view) if !vertices.is_empty() => Some(EditorOverlay { view, vertices }),
+                _ => None,
+            });
+        }
+    }
+
+    fn reference_vertices(&self) -> Vec<jarvig_renderer::OverlayVertex> {
+        let Some(camera) = self.editor_camera.as_ref() else { return Vec::new() };
+        let Some(renderer) = self.renderer.as_ref() else { return Vec::new() };
+        reference::reference_vertices(camera.position, camera.vertical_fov_radians, renderer.configured_size().1)
+    }
+
     fn toggle_meshlet_freeze(&mut self) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         self.meshlet_freeze = !self.meshlet_freeze;
         self.sync_view_menu();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -6171,6 +7164,9 @@ impl Editor {
     }
 
     fn toggle_cluster_hierarchy(&mut self) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         self.cluster_hierarchy = !self.cluster_hierarchy;
         self.sync_view_menu();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -6190,26 +7186,73 @@ impl Editor {
         self.refresh_status();
     }
 
-    fn toggle_microgeometry(&mut self) {
-        self.micro_enabled = !self.micro_enabled;
+    fn set_micro_mode(&mut self, mode: jarvig_core::MicrogeometryMode) {
+        self.micro_mode = mode;
+        if !self.micro_harness_active() {
+            self.micro_enabled = jarvig_core::microgeometry_active(mode, &self.selected_detail_facts());
+        }
         if !self.micro_enabled {
             self.micro_color = false;
         }
         self.sync_view_menu();
+        let exact = self.selected_detail_facts().exact;
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_detail_exact(exact);
             renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
         }
-        self.append(if self.micro_enabled {
-            "Procedural microgeometry is on. Above 1 px it adds Einstein patches on the selected surface. The ordinary mesh and the hierarchy sidecar stay untouched."
-        } else {
-            "Procedural microgeometry is off. The townshop is the ordinary surface again."
+        self.append(match mode {
+            jarvig_core::MicrogeometryMode::Auto => "Microgeometry is Auto. Opaque solid surfaces can receive Einstein detail when the screen error is above 1 px. Thin, transparent, UI, particle, and skinned surfaces stay ordinary.",
+            jarvig_core::MicrogeometryMode::On => "Microgeometry is On. Above 1 px it adds Einstein patches on the selected surface. The ordinary mesh and the hierarchy sidecar stay untouched.",
+            jarvig_core::MicrogeometryMode::Off => "Microgeometry is Off. Surfaces stay on their ordinary materials.",
         });
         self.refresh_status();
     }
 
+    fn micro_harness_active(&self) -> bool {
+        self.lod_capture || self.rfc0002 || self.rfc0002_micro || self.rfc0002_transition || self.rfc0002_refine || self.rfc0002_async || self.rfc0002_settle
+    }
+
+    fn selected_detail_facts(&self) -> jarvig_core::SurfaceDetailFacts {
+        let reject = jarvig_core::SurfaceDetailFacts {
+            opaque: false,
+            skinned: false,
+            ui: false,
+            particle: false,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            exact: false,
+        };
+        let Some(entity) = self.selection.primary_entity() else { return reject };
+        let skinned = self.engine.world().authored_joint(entity).is_some();
+        if let Some(asset) = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
+            _ => None,
+        }) {
+            let library = self.engine.mesh_asset_library();
+            let opaque = library.imported_surface(asset).is_some_and(|surface| surface.alpha_mode == "OPAQUE");
+            let (bounds_min, bounds_max) = library.record(asset).map(|record| (record.bounds_min, record.bounds_max)).unwrap_or(([0.0; 3], [0.0; 3]));
+            return jarvig_core::SurfaceDetailFacts { opaque, skinned, ui: false, particle: false, bounds_min, bounds_max, exact: false };
+        }
+        if self.engine.world().authored_block(entity).is_some() {
+            let (bounds_min, bounds_max) = self
+                .engine
+                .world()
+                .object_mesh(entity)
+                .and_then(|mesh| self.engine.world().meshes().get(mesh))
+                .map(|mesh| (mesh.bounds().aabb.min, mesh.bounds().aabb.max))
+                .unwrap_or(([0.0; 3], [0.0; 3]));
+            return jarvig_core::SurfaceDetailFacts { opaque: true, skinned, ui: false, particle: false, bounds_min, bounds_max, exact: true };
+        }
+        jarvig_core::SurfaceDetailFacts { skinned, ..reject }
+    }
+
     fn toggle_micro_color(&mut self) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         self.micro_color = !self.micro_color;
         if self.micro_color {
+            self.micro_mode = jarvig_core::MicrogeometryMode::On;
             self.micro_enabled = true;
             self.einstein_debug = false;
         }
@@ -6239,12 +7282,40 @@ impl Editor {
         let generation = stats.map(|stats| stats.micro_generation_us).unwrap_or(0);
         let upload = stats.map(|stats| stats.micro_upload_us).unwrap_or(0);
         let fallbacks = stats.map(|stats| stats.micro_fallbacks).unwrap_or(0);
-        let projected = self.shop_detail_px().unwrap_or(0.0);
+        let near_px = stats.map(|stats| stats.micro_near_px_milli).unwrap_or(0) as f32 / 1000.0;
+        let coverage = format!(
+            "ein eligible {} requested {} generating {} ready {} published {} drawn {} rejected {} pending {} unclassified {} | camera {} | pipeline {} | cut vis {} occ {} frust {} | ",
+            stats.map(|stats| stats.micro_visible_eligible).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_requested).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_generating).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_ready).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_published).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_drawn).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_rejected).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_pending).unwrap_or(0),
+            stats.map(|stats| stats.micro_coverage_unclassified).unwrap_or(0),
+            if stats.is_some_and(|stats| stats.micro_camera_stable) { "stable" } else { "moving" },
+            if stats.is_some_and(|stats| stats.micro_pipeline_settled) { "settled" } else { "busy" },
+            stats.map(|stats| stats.meshlets_submitted).unwrap_or(0),
+            stats.map(|stats| stats.occlusion_rejected).unwrap_or(0),
+            stats.map(|stats| stats.meshlets_rejected).unwrap_or(0),
+        );
         format!(
-            "base tris {} | micro tris +{} | patches {} | samples {} | verts {} | gen {} us | upload {} us | queue {} us | publish {} us | reuse {} | cancelled {} | stale {} | {} | fallback {} | projected {:.2} px | seed {} | ",
+            "{coverage}base tris {} | micro tris +{} | patches {} | below {} | exact {} | lod {} | occ {} | off {} | budg {} | anchor {} | mat {} | near {:.2} px | miss {} | {} | samples {} | verts {} | gen {} us | upload {} us | queue {} us | publish {} us | reuse {} | cancelled {} | stale {} | fallback {} | seed {} | elig {} = det {} + below {} + exact {} + def {} + unsup {} | unclass {} | req {} ready {} pub {} | ",
             grouped(base),
             grouped(triangles),
             patches,
+            stats.map(|stats| stats.micro_below).unwrap_or(0),
+            stats.map(|stats| stats.micro_exact).unwrap_or(0),
+            stats.map(|stats| stats.micro_replaced).unwrap_or(0),
+            stats.map(|stats| stats.micro_occluded).unwrap_or(0),
+            stats.map(|stats| stats.micro_offscreen).unwrap_or(0),
+            stats.map(|stats| stats.micro_budget_rejected).unwrap_or(0),
+            stats.map(|stats| stats.micro_no_anchor).unwrap_or(0),
+            stats.map(|stats| stats.micro_incompatible).unwrap_or(0),
+            near_px,
+            stats.map(|stats| stats.micro_missing).unwrap_or(0),
+            self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready"),
             samples,
             vertices,
             generation,
@@ -6254,10 +7325,18 @@ impl Editor {
             stats.map(|stats| stats.micro_reused).unwrap_or(0),
             stats.map(|stats| stats.micro_cancelled).unwrap_or(0),
             stats.map(|stats| stats.micro_stale_discarded).unwrap_or(0),
-            self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready"),
             fallbacks,
-            projected,
-            self.micro_seed
+            self.micro_seed,
+            stats.map(|stats| stats.micro_eligible_visible).unwrap_or(0),
+            stats.map(|stats| stats.micro_detail_requested).unwrap_or(0),
+            stats.map(|stats| stats.micro_below).unwrap_or(0),
+            stats.map(|stats| stats.micro_exact).unwrap_or(0),
+            stats.map(|stats| stats.micro_budget_rejected).unwrap_or(0),
+            stats.map(|stats| stats.micro_unsupported).unwrap_or(0),
+            stats.map(|stats| stats.micro_unclassified).unwrap_or(0),
+            stats.map(|stats| stats.micro_detail_requested).unwrap_or(0),
+            stats.map(|stats| stats.micro_detail_ready).unwrap_or(0),
+            stats.map(|stats| stats.micro_detail_published).unwrap_or(0)
         )
     }
 
@@ -7197,17 +8276,68 @@ impl Editor {
         self.finish_lod_capture();
     }
 
-    fn toggle_einstein_debug(&mut self) {
-        self.einstein_debug = !self.einstein_debug;
-        self.sync_view_menu();
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_einstein_debug(self.einstein_debug, self.einstein_seed);
-        }
-        self.append(if self.einstein_debug {
-            "Einstein detail debug is on. A coarse projected error keeps the ordinary material. A fine error draws the hat sample on the same surface. The hierarchy is unchanged."
+    fn set_visualization(&mut self, mode: jarvig_core::DiagnosticVisualization) {
+        let mode = if mode != jarvig_core::DiagnosticVisualization::None && self.visualization == mode {
+            jarvig_core::DiagnosticVisualization::None
         } else {
-            "Einstein detail debug is off. The ordinary material is drawn."
+            mode
+        };
+        self.visualization = mode;
+        match mode {
+            jarvig_core::DiagnosticVisualization::None | jarvig_core::DiagnosticVisualization::CutReasons | jarvig_core::DiagnosticVisualization::HierarchyLevels => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Off;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinActive => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Active;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinEligible => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Eligible;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinLodError => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Error;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinState => {
+                self.micro_debug = jarvig_core::MicroDebugMode::State;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinReject => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Reject;
+                self.einstein_debug = false;
+            }
+            jarvig_core::DiagnosticVisualization::EinsteinDetail => {
+                self.micro_debug = jarvig_core::MicroDebugMode::Off;
+                self.einstein_debug = true;
+            }
+        }
+        self.push_visibility();
+        self.sync_view_menu();
+        self.append(match self.visualization {
+            jarvig_core::DiagnosticVisualization::None => "Visualization is off. The pipeline submission is unchanged.",
+            jarvig_core::DiagnosticVisualization::CutReasons => "Cut Reasons recolors the current pipeline cut. Green is submitted and visible, amber is conservative, and magenta was not classified. Occluded clusters stay in the status count and are not a second mesh.",
+            jarvig_core::DiagnosticVisualization::HierarchyLevels => "Hierarchy Levels recolors the current pipeline cut. Cyan is a fine node. Yellow and orange are coarser parents. The cut is unchanged.",
+            jarvig_core::DiagnosticVisualization::EinsteinActive => "Einstein Active Detail recolors the current pipeline cut. Pink is a selected patch. Gray is submitted and not selected. It does not add triangles.",
+            jarvig_core::DiagnosticVisualization::EinsteinEligible => "Einstein Eligible colors submitted surfaces. Green can receive detail. Orange is over budget. Blue is below 1 px. Purple is incompatible. Gray is submitted and not a detail candidate.",
+            jarvig_core::DiagnosticVisualization::EinsteinLodError => "Einstein LOD / Error colors the current pipeline cut. Blue is just above 1 px. Red is a large screen error. Gray is the ordinary submitted surface.",
+            jarvig_core::DiagnosticVisualization::EinsteinState => "Einstein State colors the same pipeline cut by lifecycle. Green is drawn. Red is rejected. Slate is not eligible, including a parent shell. Yellow through cyan are in flight. Magenta is stale. The cut is unchanged.",
+            jarvig_core::DiagnosticVisualization::EinsteinReject => "Einstein Reject Reason colors the current pipeline cut. Green is selected. Blue is below 1 px. Red is over budget. Purple is incompatible. Gray is submitted and not a detail candidate.",
+            jarvig_core::DiagnosticVisualization::EinsteinDetail => "Einstein Detail Debug annotates the current pipeline cut. A coarse projected error keeps the ordinary material. A fine error draws the hat sample. The cut is unchanged.",
         });
+        self.refresh_status();
+    }
+
+    fn toggle_diagnostic_freeze(&mut self) {
+        self.diagnostic_freeze = !self.diagnostic_freeze;
+        self.push_visibility();
+        self.sync_view_menu();
+        if self.diagnostic_freeze {
+            self.append("Diagnostic frame is frozen. The camera stays put. Switching visualization recolors this cut and does not run frustum, occlusion, or the hierarchy again.");
+        } else {
+            self.append("Diagnostic frame follows the camera again.");
+        }
         self.refresh_status();
     }
 
@@ -7387,11 +8517,105 @@ impl Editor {
     }
 
     fn sync_parent_geometry(&mut self) {
+        self.queue_parent_geometry(true);
+    }
+
+    fn consider_cached_parents(&mut self) {
+        if !self.cluster_hierarchy || self.lod_capture || self.parent_job.is_some() {
+            return;
+        }
+        if self.renderer.as_ref().and_then(|renderer| renderer.parent_geometry_mesh()).is_some() {
+            return;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return };
+        let Some(asset) = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
+            _ => None,
+        }) else {
+            return;
+        };
+        if self.parent_autoload == Some(asset) {
+            return;
+        }
+        self.parent_autoload = Some(asset);
+        let Some(path) = self.parent_cache_path(asset) else { return };
+        let Ok(meta) = std::fs::metadata(&path) else { return };
+        if meta.len() == 0 {
+            return;
+        }
+        if meta.len() > 64 * 1024 * 1024 {
+            self.append("Parent sidecar is over 64 MB. Leaf clusters stay until Cluster Hierarchy is turned off and on.");
+            return;
+        }
+        self.append("Loading cached parent meshes.");
+        self.queue_parent_geometry(false);
+    }
+
+    /// Parent meshes for a parametric solid. The builder is the imported one. Nothing is written.
+    fn queue_derived_parent_geometry(&mut self, entity: jarvig_core::EntityId, build_on_miss: bool) -> bool {
+        if self.engine.runtime_meshlets(entity).is_none() {
+            return false;
+        }
+        if !build_on_miss {
+            return true;
+        }
+        let mesh_id = self.viewed_world().extract(jarvig_core::RenderFrameId(1)).ok().and_then(|snapshot| {
+            snapshot.instances().iter().find(|instance| instance.entity == entity).map(|instance| instance.mesh)
+        });
+        let Some(mesh_id) = mesh_id else {
+            self.append("That mesh is not in this view yet. Parent geometry was not built.");
+            return true;
+        };
+        if self.renderer.as_ref().and_then(|renderer| renderer.parent_geometry_mesh()) == Some(mesh_id) {
+            self.append("Parent geometry is already built for this mesh.");
+            return true;
+        }
+        if self.parent_job.as_ref().is_some_and(|job| !job.finished) {
+            self.append("The parent-mesh job is already queued. Leaf meshlets stay on screen.");
+            return true;
+        }
+        let captured = {
+            let mesh = self.engine.world().meshes().get(mesh_id).cloned();
+            let set = self.engine.runtime_meshlets(entity).cloned();
+            match (mesh, set) {
+                (Some(mesh), Some(set)) => Some((mesh, set)),
+                _ => None,
+            }
+        };
+        let Some((mesh, meshlets)) = captured else {
+            self.append("This solid has no derived clusters. Parent geometry was not built.");
+            return true;
+        };
+        if mesh.streams().first().map(|stream| stream.stride) != Some(60) {
+            self.append("Parent geometry needs the 60-byte vertex layout. The draw stays on the leaves.");
+            return true;
+        }
+        let id = self.jobs.submit(
+            jarvig_core::JobDesc {
+                name: "Build Parent Mesh LODs".into(),
+                asset: None,
+                cache_key: Some(format!("derived-{}:parent-mesh-v{}", mesh_id.0, jarvig_core::PARENT_BUILDER_VERSION)),
+                dependencies: Vec::new(),
+            },
+            move |ctx| {
+                let geometry = jarvig_core::build_parent_geometry_with(&mesh, &meshlets, &|| ctx.cancel_requested(), &|fraction, stage| ctx.report(fraction, stage))?;
+                ctx.report(1.0, "Parent meshes ready. Nothing was written.");
+                Ok(geometry)
+            },
+        );
+        self.parent_job = Some(ParentJob { id, mesh: mesh_id, last_percent: 0, last_state: jarvig_core::JobState::Queued, finished: false });
+        self.job_line = "Build Parent Mesh LODs Queued 0% Queued 00:00".into();
+        self.append("Queued Build Parent Mesh LODs from the derived surface. The level file was not changed. Leaf meshlets stay until the job finishes.");
+        self.refresh_status();
+        true
+    }
+
+    fn queue_parent_geometry(&mut self, build_on_miss: bool) {
         if !self.cluster_hierarchy {
             return;
         }
         let Some(entity) = self.selection.primary_entity() else {
-            self.append("Select townshop, then turn Cluster Hierarchy on.");
+            self.append("Select an imported mesh, then turn Cluster Hierarchy on.");
             return;
         };
         let asset = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
@@ -7399,6 +8623,9 @@ impl Editor {
             _ => None,
         });
         let Some(asset) = asset else {
+            if self.queue_derived_parent_geometry(entity, build_on_miss) {
+                return;
+            }
             self.append("This actor has no imported mesh. Parent geometry was not built.");
             return;
         };
@@ -7406,7 +8633,7 @@ impl Editor {
             snapshot.instances().iter().find(|instance| instance.entity == entity).map(|instance| instance.mesh)
         });
         let Some(mesh_id) = mesh_id else {
-            self.append("Townshop is not in this view yet. Parent geometry was not built.");
+            self.append("That mesh is not in this view yet. Parent geometry was not built.");
             return;
         };
         if self.renderer.as_ref().and_then(|renderer| renderer.parent_geometry_mesh()) == Some(mesh_id) {
@@ -7437,7 +8664,7 @@ impl Editor {
         let cache_path = self.parent_cache_path(asset);
         let id = self.jobs.submit(
             jarvig_core::JobDesc {
-                name: "RFC-0001 / townshop / Build Parent Mesh LODs".into(),
+                name: "Build Parent Mesh LODs".into(),
                 asset: Some(asset),
                 cache_key: Some(cache_key),
                 dependencies: Vec::new(),
@@ -7448,6 +8675,10 @@ impl Editor {
                         ctx.report(1.0, "Loaded parent meshes from the sidecar");
                         return Ok(loaded);
                     }
+                }
+                if !build_on_miss {
+                    ctx.report(1.0, "No parent sidecar. Leaf meshlets stay.");
+                    return Err("no parent sidecar".into());
                 }
                 let geometry = jarvig_core::build_parent_geometry_with(&mesh, &meshlets, &|| ctx.cancel_requested(), &|fraction, stage| ctx.report(fraction, stage))?;
                 if let Some(path) = &cache_path {
@@ -7460,8 +8691,10 @@ impl Editor {
             },
         );
         self.parent_job = Some(ParentJob { id, mesh: mesh_id, last_percent: 0, last_state: jarvig_core::JobState::Queued, finished: false });
-        self.job_line = "RFC-0001 / townshop / Build Parent Mesh LODs Queued 0% Queued 00:00".into();
-        self.append("Queued RFC-0001 / townshop / Build Parent Mesh LODs. The editor keeps drawing the leaf meshlets. View > Cancel Background Job stops it. View > Background Jobs lists the queue.");
+        self.job_line = "Build Parent Mesh LODs Queued 0% Queued 00:00".into();
+        if build_on_miss {
+            self.append("Queued Build Parent Mesh LODs. The editor keeps drawing the leaf meshlets. View > Cancel Background Job stops it. View > Background Jobs lists the queue.");
+        }
         self.refresh_status();
     }
 
@@ -7544,10 +8777,14 @@ impl Editor {
         if let Some(asset) = self.browser.assets.iter().find(|asset| asset.kind == "Model" && asset.name == "townshop").cloned() {
             match self.engine.place_existing_mesh(asset.id, 1.0, 0.0, 1.0) {
                 Ok(entity) => {
-                    self.content_undo.push(vec![entity]);
+                    let opened = self.history_begin("Place Mesh", &[]);
+                    self.history_note_created(entity);
+                    if opened {
+                        self.history_commit();
+                    }
                     let before = self.engine.world().entity_count();
-                    self.undo_content_drop();
-                    if self.engine.world().entity_count() != before.saturating_sub(1) && self.content_undo.is_empty() {
+                    self.undo_edit();
+                    if self.engine.world().entity_count() != before.saturating_sub(1) {
                         reasons.push(format!("undo left {} entities", self.engine.world().entity_count()));
                     }
                 }
@@ -7638,9 +8875,14 @@ impl Editor {
             self.place_prefab_asset(&asset, jarvig_core::Vec3::new(hit.x, hit.y, hit.z));
             return;
         }
+        self.prepare_authored_action();
+        let opened = self.history_begin("Place Mesh", &[]);
         match self.engine.place_existing_mesh(asset.id, hit.x, hit.y, hit.z) {
             Ok(entity) => {
-                self.content_undo.push(vec![entity]);
+                self.history_note_created(entity);
+                if opened {
+                    self.history_commit();
+                }
                 if let Ok(item) = crate::selection::SelectionItem::entity(entity) {
                     let _ = self.selection.replace(item);
                 }
@@ -7648,7 +8890,12 @@ impl Editor {
                 self.refresh_title();
                 self.append(&format!("Placed {} at {:.2}, {:.2}, {:.2}. Ctrl+Z removes that actor.", asset.name, hit.x, hit.y, hit.z));
             }
-            Err(error) => self.append(&format!("Mesh was not placed. {error}")),
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Mesh was not placed. {error}"));
+            }
         }
         self.refresh_status();
     }
@@ -7664,15 +8911,22 @@ impl Editor {
             self.refresh_status();
             return;
         };
+        self.prepare_authored_action();
+        let opened = self.history_begin("Place Prefab", &[]);
         match self.engine.instantiate_prefab_file(&root.join(&asset.path), hit) {
             Ok(entities) => {
                 let count = entities.len();
+                for id in &entities {
+                    self.history_note_created(*id);
+                }
+                if opened {
+                    self.history_commit();
+                }
                 if let Some(root_entity) = entities.first().copied() {
                     if let Ok(item) = crate::selection::SelectionItem::entity(root_entity) {
                         let _ = self.selection.replace(item);
                     }
                 }
-                self.content_undo.push(entities);
                 self.sync_outliner();
                 self.refresh_title();
                 self.append(&format!(
@@ -7680,28 +8934,14 @@ impl Editor {
                     asset.name, count, hit.x, hit.y, hit.z
                 ));
             }
-            Err(error) => self.append(&format!("Prefab was not placed. {error}")),
-        }
-        self.refresh_status();
-    }
-
-    fn undo_content_drop(&mut self) {
-        let Some(group) = self.content_undo.pop() else {
-            self.append("No mesh placement to undo.");
-            return;
-        };
-        let count = group.len();
-        for entity in group.into_iter().rev() {
-            if let Err(error) = self.engine.execute_authoring(AuthoringCommand::DestroyEntity { target: entity }) {
-                self.append(&format!("Undo failed: {error}."));
-                self.sync_outliner();
-                self.refresh_title();
-                return;
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Prefab was not placed. {error}"));
             }
         }
-        self.append(&format!("Undid placement of {count} actor(s)."));
-        self.sync_outliner();
-        self.refresh_title();
+        self.refresh_status();
     }
 
     fn select_character_root(&mut self) {
@@ -7735,7 +8975,7 @@ impl Editor {
         match mode {
             chrome::WorkspaceMode::Level => "Level. Characters, props, lights, and terrain stay visible. The terrain grid and rig helpers stay in their own workspaces.",
             chrome::WorkspaceMode::Land => "Land. The grid follows the terrain. Characters stay hidden until Show Full Level. Wheel over the terrain changes brush radius. Einstein detail does not write height.",
-            chrome::WorkspaceMode::Character => "Character. The rig is isolated over the same level. Terrain and props are hidden here and stay in the level.",
+            chrome::WorkspaceMode::Character => "Character. Joints are the contact hierarchy, not a separate skeleton. View > Mesh Parts lists imported mesh parts. Skin, animation, and physics are not in this editor.",
         }
     }
 
@@ -7745,12 +8985,31 @@ impl Editor {
 
     /// One authored world. `announce` is for a click. Restore and a project template stay quiet.
     fn switch_editor_mode(&mut self, mode: chrome::WorkspaceMode, persist: bool, announce: bool) {
-        if mode == chrome::WorkspaceMode::Character && !self.level_has_rig() {
-            self.append("Character workspace needs a rig in this level. Level stays on the authored world.");
-            self.sync_view_menu();
+        if self.editor_mode() == mode {
             return;
         }
-        if self.editor_mode() == mode {
+        self.cancel_modeling(false);
+        if self.authored_stash.is_some() && mode != chrome::WorkspaceMode::Character {
+            if let Err(error) = self.restore_authored_level() {
+                self.append(&format!("The level was not restored. {error}"));
+                return;
+            }
+        }
+        if mode == chrome::WorkspaceMode::Character && self.authored_stash.is_none() && !self.level_has_rig() {
+            if let Some(path) = self.character_asset_path.clone() {
+                if let Err(error) = self.open_character_preview(&path) {
+                    self.append(&error);
+                } else if announce {
+                    self.append(Self::workspace_line(mode));
+                }
+                if persist {
+                    self.persist_workspace();
+                }
+                self.sync_view_menu();
+                return;
+            }
+            self.append("Character opens a character asset. Level stays on the authored world.");
+            self.sync_view_menu();
             return;
         }
         self.land_stamp = None;
@@ -7773,6 +9032,7 @@ impl Editor {
         if persist {
             self.persist_workspace();
         }
+        self.sync_spawn_preview();
         unsafe {
             InvalidateRect(self.dock_host, std::ptr::null(), 1);
             InvalidateRect(self.toolbar, std::ptr::null(), 0);
@@ -7882,8 +9142,16 @@ impl Editor {
             }
         };
         let local = self.editor_camera.as_ref().map(|camera| Vec3::new(camera.position.x - jarvig_core::BOOTSTRAP_ROOT_M, 0.0, camera.position.z)).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+        self.prepare_authored_action();
+        let opened = self.history_begin("Create Terrain", &[]);
         match self.engine.execute_authoring(AuthoringCommand::CreateTerrain { local, record }) {
             Ok(_) => {
+                if let Some(id) = self.engine.world().terrain_entity() {
+                    self.history_note_created(id);
+                }
+                if opened {
+                    self.history_commit();
+                }
                 self.evict_retired_meshes();
                 if let Some(id) = self.engine.world().terrain_entity() {
                     if let Ok(item) = selection::SelectionItem::entity(id) {
@@ -7903,9 +9171,61 @@ impl Editor {
                 self.refresh_title();
             }
             Err(jarvig_core::AuthoringError::InvalidOperation) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
                 self.append("This world already has a terrain. Select it and sculpt that heightfield.");
             }
-            Err(error) => self.append(&format!("Create Terrain failed: {error}")),
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Create Terrain failed: {error}"));
+            }
+        }
+    }
+
+    fn create_block(&mut self) {
+        self.stop_play();
+        if self.session_active() {
+            self.append("Stop play before adding a block.");
+            return;
+        }
+        if self.character_workspace {
+            self.append("Return to the level before adding a block. A block is level geometry.");
+            return;
+        }
+        let count = self.engine.world().block_count() as f64;
+        let local = Vec3::new(count * 2.5, 1.0, -4.0);
+        self.prepare_authored_action();
+        let opened = self.history_begin("Create Block", &[]);
+        match self.engine.execute_authoring(AuthoringCommand::CreateBlock { local }) {
+            Ok(jarvig_core::AuthoringResult::Created(id)) => {
+                self.history_note_created(id);
+                if opened {
+                    self.history_commit();
+                }
+                self.evict_retired_meshes();
+                if let Ok(item) = selection::SelectionItem::entity(id) {
+                    let _ = self.selection.replace(item);
+                }
+                self.append("Block is a parametric solid. Size is meters on X, Y, and Z. The visible mesh is derived. Collision is the analytic box. Einstein does not define this object.");
+                self.inspector_force_realize = true;
+                self.sync_outliner();
+                self.refresh_title();
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Create Block did not return the new entity.");
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Create Block failed: {error}"));
+            }
         }
     }
 
@@ -8022,6 +9342,9 @@ impl Editor {
             inspector::LAND_UI_SHOW_GAMEPLAY => self.land_show_gameplay = checked,
             inspector::LAND_UI_SHOW_FULL => self.land_show_full = checked,
             _ => return,
+        }
+        if matches!(field, inspector::LAND_UI_SHOW_FULL | inspector::LAND_UI_SHOW_GAMEPLAY) {
+            self.sync_spawn_preview();
         }
         self.request_inspector_refresh();
         self.persist_workspace();
@@ -8209,6 +9532,7 @@ impl Editor {
             if let Some(record) = self.engine.world().authored_terrain(id) {
                 self.append(&record.debug_line(local_x, local_z));
             }
+            self.history_begin("Sculpt", &[id]);
         }
         let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
         let delta = if brush == jarvig_core::TerrainBrush::Sculpt && shift { -self.land_delta.abs() } else { self.land_delta.abs() };
@@ -8242,6 +9566,7 @@ impl Editor {
             }
             Err(error) => {
                 if first {
+                    let _ = self.history_cancel();
                     self.append(&format!("Terrain brush failed: {error}"));
                 }
             }
@@ -8378,6 +9703,91 @@ impl Editor {
         }
     }
 
+    fn registry_paths(&self, kind: &str) -> Vec<String> {
+        let mut paths: Vec<String> = self.browser.assets.iter().filter(|asset| asset.kind == kind).map(|asset| asset.path.clone()).collect();
+        paths.sort();
+        paths
+    }
+
+    fn player_start_gizmo_visible(&self) -> bool {
+        if self.session_active() || self.character_workspace {
+            return false;
+        }
+        if self.land_mode && !self.land_show_full && !self.land_show_gameplay {
+            return false;
+        }
+        true
+    }
+
+    fn clear_spawn_preview(&mut self) {
+        let ids = std::mem::take(&mut self.preview_ids);
+        self.preview_owners.clear();
+        if ids.is_empty() {
+            return;
+        }
+        let roots: Vec<jarvig_core::EntityId> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.engine.world().entity_parent(*id).ok().flatten().is_none_or(|parent| !ids.contains(&parent)))
+            .collect();
+        for id in roots {
+            let _ = self.engine.world_mut().retire_derived(id);
+        }
+    }
+
+    fn sync_spawn_preview(&mut self) {
+        let was_clean = self.authored_stash.is_none() && !self.level_dirty();
+        self.clear_spawn_preview();
+        let hidden_by_land = self.land_mode && !self.land_show_full && !self.land_show_gameplay;
+        if self.authored_stash.is_none() && !self.session_active() && !self.character_workspace && !hidden_by_land {
+            let starts: Vec<(jarvig_core::EntityId, String)> = self
+                .engine
+                .world()
+                .entity_outline()
+                .iter()
+                .filter_map(|row| {
+                    let record = self.engine.world().authored_player_start(row.uuid)?;
+                    if !record.preview || record.player.is_empty() {
+                        return None;
+                    }
+                    Some((row.uuid, record.player))
+                })
+                .collect();
+            for (id, player) in starts {
+                if let Err(error) = self.attach_spawn_preview(id, &player) {
+                    self.append(&format!("Player start preview was not shown. {error}"));
+                }
+            }
+        }
+        self.engine.world_mut().finish_visual_edit();
+        if was_clean {
+            self.saved_revision = self.engine.world().revision();
+        }
+    }
+
+    fn attach_spawn_preview(&mut self, start: jarvig_core::EntityId, player_path: &str) -> Result<(), String> {
+        let project = self.project_file.clone().ok_or("Open a project before previewing a character.")?;
+        let root = project.parent().ok_or("project file has no directory")?;
+        let player_text = std::fs::read_to_string(root.join(player_path)).map_err(|error| format!("player definition was not read: {error}"))?;
+        let player = jarvig_core::parse_player(&player_text)?;
+        let character_text = std::fs::read_to_string(root.join(&player.character)).map_err(|error| format!("character file was not read: {error}"))?;
+        let character = jarvig_core::parse_character(&character_text).map_err(|error| error.to_string())?;
+        let created = character.instantiate(self.engine.world_mut(), Vec3::new(0.0, 0.0, 0.0)).map_err(|error| error.to_string())?;
+        let character_root = created
+            .iter()
+            .copied()
+            .find(|id| self.engine.world().entity_parent(*id).ok().flatten().is_none())
+            .ok_or("character preview has no root")?;
+        self.engine.world_mut().reparent_authored(character_root, Some(start)).map_err(|error| error.to_string())?;
+        for id in created {
+            self.engine.world_mut().mark_derived(id).map_err(|error| error.to_string())?;
+            let _ = self.engine.world_mut().mute_cast_shadows(id);
+            self.preview_ids.push(id);
+            self.preview_owners.push((id, start));
+        }
+        Ok(())
+    }
+
     fn set_character_workspace(&mut self, enabled: bool) {
         self.enter_mode(if enabled { chrome::WorkspaceMode::Character } else { chrome::WorkspaceMode::Level }, true);
     }
@@ -8450,7 +9860,7 @@ impl Editor {
         let provider = request.provider;
         let id = self.jobs.submit(
             jarvig_core::JobDesc {
-                name: "RFC-0002 / townshop / Einstein Surface".into(),
+                name: "Build Einstein Surface".into(),
                 asset: None,
                 cache_key: Some(format!("micro:{key:016x}")),
                 dependencies: Vec::new(),
@@ -8504,7 +9914,11 @@ impl Editor {
                             self.append(&format!("Einstein surface job failed: {error}. The published microgeometry stays."));
                         }
                     }
-                    None => {}
+                    None => {
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.abandon_micro_build(self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0));
+                        }
+                    }
                 },
                 jarvig_core::JobState::Cancelled => {
                     let epoch = self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0);
@@ -8792,6 +10206,115 @@ impl Editor {
         self.finish_lod_capture();
     }
 
+    fn fail_settle(&mut self, reason: &str) {
+        if self.settle_done {
+            return;
+        }
+        self.settle_done = true;
+        self.settle_fault = reason.to_string();
+        self.finish_settle();
+    }
+
+    fn pass_settle(&mut self) {
+        if self.settle_done {
+            return;
+        }
+        self.settle_done = true;
+        self.finish_settle();
+    }
+
+    fn finish_settle(&mut self) {
+        let directory = format!("{}/../target/rfc0002-settle", env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::create_dir_all(&directory);
+        let passed = self.settle_fault.is_empty();
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+        let json = format!(
+            "{{\"verdict\":\"RFC0002_SETTLE_{verdict}\",\"fingerprint\":\"{:x}\",\"triangles\":{},\"patches\":{},\"desired\":{},\"missing\":{},\"partial\":{},\"reason\":\"{}\"}}",
+            self.settle_fingerprint,
+            self.settle_tris,
+            stats.map(|stats| stats.micro_patches).unwrap_or(0),
+            stats.map(|stats| stats.micro_desired_patches).unwrap_or(0),
+            stats.map(|stats| stats.micro_missing).unwrap_or(0),
+            stats.map(|stats| stats.micro_partial).unwrap_or(0),
+            self.settle_fault.replace('"', "'")
+        );
+        let _ = std::fs::write(format!("{directory}/report.json"), &json);
+        println!("RFC0002_SETTLE_{verdict} {directory}");
+        println!("RFC0002_SETTLE_REPORT {json}");
+        self.finish_lod_capture();
+    }
+
+    fn step_settle_phases(&mut self) {
+        if self.settle_done {
+            return;
+        }
+        match self.lod_phase {
+            110 => {
+                if self.lod_hold < 4 {
+                    return;
+                }
+                self.lod_phase = 111;
+                self.lod_hold = 0;
+            }
+            111 => {
+                let mid = (self.async_close + self.async_far) * 0.5;
+                let stops = [self.async_far, self.async_close, mid, self.async_far, self.async_close];
+                self.place_shop_camera(stops[self.lod_hold as usize % stops.len()]);
+                if self.lod_hold >= 16 {
+                    self.place_shop_camera(self.async_close);
+                    self.lod_phase = 112;
+                    self.lod_hold = 0;
+                }
+            }
+            112 => {
+                let job_busy = self.micro_job.as_ref().is_some_and(|job| !job.finished);
+                if !self.micro_publish_settled() || job_busy {
+                    if self.lod_hold > 1200 {
+                        self.fail_settle("the stopped camera did not converge");
+                    }
+                    return;
+                }
+                let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+                let missing = stats.map(|stats| stats.micro_missing).unwrap_or(1);
+                let partial = stats.map(|stats| stats.micro_partial).unwrap_or(1);
+                let desired = stats.map(|stats| stats.micro_desired_patches).unwrap_or(0);
+                let patches = stats.map(|stats| stats.micro_patches).unwrap_or(0);
+                if missing != 0 || partial != 0 || patches != desired {
+                    self.fail_settle(&format!("settled view missing={missing} partial={partial} patches={patches} desired={desired}"));
+                    return;
+                }
+                self.settle_fingerprint = stats.map(|stats| stats.micro_fingerprint).unwrap_or(0);
+                self.settle_tris = stats.map(|stats| stats.micro_triangles).unwrap_or(0);
+                if desired == 0 || self.settle_tris == 0 {
+                    self.fail_settle("the close pose published no detail");
+                    return;
+                }
+                self.lod_phase = 113;
+                self.lod_hold = 0;
+            }
+            113 => {
+                if !self.micro_publish_settled() {
+                    self.fail_settle("the held camera left the settled state");
+                    return;
+                }
+                let stats = self.renderer.as_ref().map(|renderer| renderer.gpu_scene_stats());
+                let fingerprint = stats.map(|stats| stats.micro_fingerprint).unwrap_or(1);
+                let tris = stats.map(|stats| stats.micro_triangles).unwrap_or(0);
+                let missing = stats.map(|stats| stats.micro_missing).unwrap_or(1);
+                let partial = stats.map(|stats| stats.micro_partial).unwrap_or(1);
+                if fingerprint != self.settle_fingerprint || tris != self.settle_tris || missing != 0 || partial != 0 {
+                    self.fail_settle(&format!("held camera changed fingerprint {fingerprint:x} tris {tris} missing {missing} partial {partial}"));
+                    return;
+                }
+                if self.lod_hold >= 300 {
+                    self.pass_settle();
+                }
+            }
+            _ => self.fail_settle("unknown settle phase"),
+        }
+    }
+
     fn step_async_phases(&mut self) {
         match self.lod_phase {
             100 => {
@@ -8905,6 +10428,10 @@ impl Editor {
             return;
         }
         self.lod_hold = self.lod_hold.saturating_add(1);
+        if self.lod_phase >= 110 {
+            self.step_settle_phases();
+            return;
+        }
         if self.lod_phase >= 100 {
             self.step_async_phases();
             return;
@@ -8969,6 +10496,27 @@ impl Editor {
                 return;
             }
             if self.lod_hold < 20 {
+                return;
+            }
+            if self.rfc0002_settle {
+                self.einstein_debug = false;
+                self.micro_debug = jarvig_core::MicroDebugMode::Off;
+                self.micro_enabled = true;
+                self.micro_color = false;
+                self.micro_surface = true;
+                self.micro_seed = 1;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_einstein_debug(false, self.einstein_seed);
+                    renderer.set_micro_debug(jarvig_core::MicroDebugMode::Off);
+                    renderer.set_micro_surface(true);
+                    renderer.set_microgeometry(true, self.micro_seed, false);
+                }
+                self.async_close = self.projected_error_distance(0.02, 3.20);
+                self.async_far = self.projected_error_distance(0.02, 0.50);
+                self.place_shop_camera(self.async_far);
+                self.lod_phase = 110;
+                self.lod_hold = 0;
+                println!("RFC0002_SETTLE_PLAN close={:.2} far={:.2}", self.async_close, self.async_far);
                 return;
             }
             if self.rfc0002_async {
@@ -9936,6 +11484,9 @@ impl Editor {
     }
 
     fn toggle_meshlet_occlusion(&mut self) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         self.meshlet_occlusion = !self.meshlet_occlusion;
         self.sync_view_menu();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -9950,6 +11501,9 @@ impl Editor {
     }
 
     fn toggle_meshlet_frustum(&mut self) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         self.meshlet_frustum = !self.meshlet_frustum;
         self.sync_view_menu();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -9963,7 +11517,262 @@ impl Editor {
         self.refresh_status();
     }
 
+    fn install_geometry_diagnostic(&mut self, mode: jarvig_core::GeometryDiagnostic) {
+        self.geometry_diagnostic = mode;
+        match mode {
+            jarvig_core::GeometryDiagnostic::Normal => {
+                self.leaf_truth = false;
+                self.meshlet_debug = false;
+                self.meshlet_shade = true;
+                self.meshlet_frustum = true;
+                self.meshlet_occlusion = true;
+                self.cluster_hierarchy = true;
+            }
+            jarvig_core::GeometryDiagnostic::LeafTruth => {
+                self.leaf_truth = true;
+                self.meshlet_shade = true;
+                self.meshlet_frustum = false;
+                self.meshlet_occlusion = false;
+                self.cluster_hierarchy = false;
+            }
+            jarvig_core::GeometryDiagnostic::FrustumOnly => {
+                self.leaf_truth = false;
+                self.meshlet_shade = true;
+                self.meshlet_frustum = true;
+                self.meshlet_occlusion = false;
+                self.cluster_hierarchy = false;
+            }
+            jarvig_core::GeometryDiagnostic::HierarchyNoOcclusion => {
+                self.leaf_truth = false;
+                self.meshlet_shade = true;
+                self.meshlet_frustum = true;
+                self.meshlet_occlusion = false;
+                self.cluster_hierarchy = true;
+            }
+            jarvig_core::GeometryDiagnostic::HierarchyWithOcclusion => {
+                self.leaf_truth = false;
+                self.meshlet_shade = true;
+                self.meshlet_frustum = true;
+                self.meshlet_occlusion = true;
+                self.cluster_hierarchy = true;
+            }
+        }
+        self.sync_view_menu();
+        self.push_visibility();
+        let _ = self.sync_meshlet_debug();
+    }
+
+    fn pipeline_owns_switches(&mut self) -> bool {
+        if self.geometry_diagnostic == jarvig_core::GeometryDiagnostic::Normal {
+            return false;
+        }
+        self.append("The pipeline owns frustum, occlusion, hierarchy, and meshlet submission. Choose Pipeline > Normal or Reset Rendering Debug to change those switches.");
+        self.refresh_status();
+        true
+    }
+
+    fn push_visibility(&mut self) {
+        let diagnostic = self.geometry_diagnostic;
+        let frustum = self.meshlet_frustum;
+        let occlusion = self.meshlet_occlusion;
+        let hierarchy = self.cluster_hierarchy;
+        let freeze = self.meshlet_freeze;
+        let micro_debug = self.micro_debug;
+        let einstein = self.einstein_debug;
+        let seed = self.einstein_seed;
+        let micro_enabled = self.micro_enabled;
+        let micro_seed = self.micro_seed;
+        let micro_color = self.micro_color;
+        let visualization = self.visualization;
+        let diagnostic_freeze = self.diagnostic_freeze;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_geometry_diagnostic(diagnostic);
+            renderer.set_diagnostic_visualization(visualization);
+            renderer.set_diagnostic_freeze(diagnostic_freeze);
+            renderer.set_meshlet_frustum(frustum);
+            renderer.set_meshlet_occlusion(occlusion);
+            renderer.set_cluster_hierarchy(hierarchy);
+            renderer.set_meshlet_freeze(freeze);
+            renderer.set_micro_debug(micro_debug);
+            renderer.set_einstein_debug(einstein, seed);
+            renderer.set_microgeometry(micro_enabled, micro_seed, micro_color);
+        }
+    }
+
+    fn set_geometry_diagnostic(&mut self, mode: jarvig_core::GeometryDiagnostic) {
+        let mode = if mode != jarvig_core::GeometryDiagnostic::Normal && self.geometry_diagnostic == mode {
+            jarvig_core::GeometryDiagnostic::Normal
+        } else {
+            mode
+        };
+        self.install_geometry_diagnostic(mode);
+        self.append(match self.geometry_diagnostic {
+            jarvig_core::GeometryDiagnostic::Normal => "Pipeline is Normal. The selected mesh uses its materials. Frustum, occlusion, and the cluster hierarchy are on. Visualization is unchanged.",
+            jarvig_core::GeometryDiagnostic::LeafTruth => "Pipeline is Leaf Truth. Every leaf meshlet of the selected mesh is drawn in its own color. Hierarchy, frustum, and occlusion are off. Visualization is unchanged. The original triangle list is not drawn under those leaves.",
+            jarvig_core::GeometryDiagnostic::FrustumOnly => "Pipeline is Frustum Only. Leaf meshlets inside the camera stay in the Leaf Truth colors. Clusters outside the frustum are not drawn. Hierarchy and occlusion are off. Visualization is unchanged.",
+            jarvig_core::GeometryDiagnostic::HierarchyNoOcclusion => "Pipeline is Hierarchy without occlusion. The parent cut uses frustum culling. Occlusion is off. Visualization is unchanged. A hole here is a parent that does not cover its leaves.",
+            jarvig_core::GeometryDiagnostic::HierarchyWithOcclusion => "Pipeline is Hierarchy with occlusion. A surface may disappear only when nearer geometry proves it hidden. Visualization is unchanged.",
+        });
+        self.refresh_status();
+    }
+
+    fn compare_against_leaf_truth(&mut self) {
+        let Some(camera) = self.editor_camera.as_ref() else {
+            self.append("Compare Against Leaf Truth needs the editor camera.");
+            return;
+        };
+        let pose = camera.pose();
+        let fov = camera.vertical_fov_radians;
+        let near = camera.near_m;
+        let (view_w, view_h) = self.viewport_px;
+        let view_w = view_w.max(16);
+        let view_h = view_h.max(16);
+        let aspect = view_w as f32 / view_h.max(1) as f32;
+        let error_px = self.hierarchy_error_px;
+        let Some(snapshot) = self.viewed_world().extract(jarvig_core::RenderFrameId(1)).ok() else {
+            self.append("Compare Against Leaf Truth could not read the current view.");
+            return;
+        };
+        let selected = self.selection.primary_entity();
+        let parent_mesh = self.renderer.as_ref().and_then(|renderer| renderer.parent_coverage_source().map(|source| source.mesh));
+        let Some(instance) = snapshot
+            .instances()
+            .iter()
+            .find(|instance| Some(instance.entity) == selected)
+            .or_else(|| snapshot.instances().iter().find(|instance| Some(instance.mesh) == parent_mesh))
+            .cloned()
+        else {
+            self.append("Select the mesh, then run Compare Against Leaf Truth.");
+            return;
+        };
+        let asset = self.engine.world().authored_mesh(instance.entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
+            _ => None,
+        });
+        let Some(asset) = asset else {
+            self.append("Compare Against Leaf Truth needs an imported mesh with stored meshlets.");
+            return;
+        };
+        let owned_parent = self.renderer.as_ref().and_then(|renderer| {
+            let source = renderer.parent_coverage_source()?;
+            if source.mesh != instance.mesh || !source.positions_retained || source.positions.is_empty() {
+                return None;
+            }
+            Some((
+                source.positions.to_vec(),
+                source.indices.to_vec(),
+                source.ranges.to_vec(),
+                source.hierarchy.clone(),
+                source.draw_ok.to_vec(),
+                source.leaf_counts.to_vec(),
+            ))
+        });
+        let parents_missing = owned_parent.is_none();
+        let started = std::time::Instant::now();
+        let built = (|| -> Result<(jarvig_core::LeafTruthComparison, usize), String> {
+            let library = self.engine.mesh_asset_library();
+            let mesh = library.get(asset).ok_or_else(|| "Compare Against Leaf Truth could not read the mesh.".to_string())?;
+            let meshlets = library.meshlets(asset).ok_or_else(|| "Compare Against Leaf Truth needs stored meshlets. The source mesh was not changed.".to_string())?;
+            let skipped_submeshes = meshlets.meshlets.iter().filter(|meshlet| meshlet.submesh != 0).count();
+            let parent_input = owned_parent.as_ref().map(|(positions, indices, ranges, hierarchy, draw_ok, leaf_counts)| jarvig_core::ParentCoverageInput {
+                positions,
+                indices,
+                ranges,
+                hierarchy,
+                draw_ok,
+                leaf_counts,
+            });
+            let stages = jarvig_core::assemble_leaf_truth_stages(mesh, meshlets, parent_input, &instance, &pose, fov, near, aspect, view_w, view_h, error_px)
+                .map_err(|error| format!("Compare Against Leaf Truth did not build the stages: {error}."))?;
+            let comparison = jarvig_core::compare_stage_triangles(&stages, &instance, &pose, fov, near, aspect, view_w, view_h)
+                .map_err(|error| format!("Compare Against Leaf Truth did not raster: {error}."))?;
+            Ok((comparison, skipped_submeshes))
+        })();
+        let (comparison, skipped_submeshes) = match built {
+            Ok(ready) => ready,
+            Err(message) => {
+                self.append(&message);
+                return;
+            }
+        };
+        let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.append(&format!(
+            "Compare Against Leaf Truth. Raster {}x{} from the {}x{} camera. LOD error {error_px:.2} px. {:.0} ms. Pipeline {} and visualization {} were not changed. Normal is the shipping base cut. Einstein triangles are not in this buffer.",
+            comparison.width,
+            comparison.height,
+            view_w,
+            view_h,
+            elapsed_ms,
+            self.geometry_diagnostic.label(),
+            self.visualization.label()
+        ));
+        if skipped_submeshes > 0 {
+            self.append(&format!(
+                "{skipped_submeshes} meshlets are on a submesh other than 0. The cut path does not draw those, so this compare omits them too."
+            ));
+        }
+        if parents_missing {
+            self.append("Parent positions were not retained for this mesh. Hierarchy and Normal were not compared. Leaf Truth and Frustum Only still ran.");
+        }
+        let directory = std::path::Path::new(r"C:\temp\jarvig_debug");
+        if let Err(error) = std::fs::create_dir_all(directory) {
+            self.append(&format!("Compare images were not written: {error}."));
+        }
+        for report in &comparison.stages {
+            self.append(&jarvig_core::coverage_stage_line(report));
+            if !report.compared {
+                continue;
+            }
+            let name = match report.stage {
+                jarvig_core::GeometryDiagnostic::LeafTruth => "leaf-compare-leaf-truth.bmp",
+                jarvig_core::GeometryDiagnostic::FrustumOnly => "leaf-compare-frustum-only.bmp",
+                jarvig_core::GeometryDiagnostic::HierarchyNoOcclusion => "leaf-compare-hierarchy.bmp",
+                jarvig_core::GeometryDiagnostic::HierarchyWithOcclusion => "leaf-compare-hierarchy-occlusion.bmp",
+                jarvig_core::GeometryDiagnostic::Normal => "leaf-compare-normal.bmp",
+            };
+            let bytes = jarvig_core::coverage_bmp(comparison.width, comparison.height, &report.rgb);
+            let path = directory.join(name);
+            if let Err(error) = std::fs::write(&path, bytes) {
+                self.append(&format!("Could not write {}: {error}.", path.display()));
+            }
+        }
+        let verdict = match comparison.first_red_stage {
+            Some(stage) => {
+                let report = comparison.stages.iter().find(|item| item.stage == stage);
+                let lost = report.map(|item| item.first_mismatching_pixel_count).unwrap_or(0);
+                let interior = report.map(|item| item.interior_lost_pixels).unwrap_or(0);
+                format!(
+                    "First red stage: {}. Lost {lost} pixels, {interior} of them interior. That stage owns the hole. Black matches. Red is coverage Leaf Truth has and this stage lost. Blue is extra.",
+                    stage.label()
+                )
+            }
+            None if parents_missing => "Leaf Truth and Frustum Only have no red. Hierarchy was not compared.".to_string(),
+            None => "No red pixels. Every compared stage covers the Leaf Truth pixels. Blue, if any, is extra coverage.".to_string(),
+        };
+        self.append(&verdict);
+        self.set_status(&verdict);
+    }
+
+    fn reset_rendering_debug(&mut self) {
+        self.meshlet_freeze = false;
+        self.meshlet_highlight = false;
+        self.visualization = jarvig_core::DiagnosticVisualization::None;
+        self.diagnostic_freeze = false;
+        self.einstein_debug = false;
+        self.micro_debug = jarvig_core::MicroDebugMode::Off;
+        self.micro_color = false;
+        self.install_geometry_diagnostic(jarvig_core::GeometryDiagnostic::Normal);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_meshlet_highlight(None);
+        }
+        self.append("Rendering debug is reset. Pipeline is Normal. Visualization is off. The diagnostic frame follows the camera. Frustum, occlusion, and the cluster hierarchy are on.");
+        self.refresh_status();
+    }
+
     fn toggle_meshlet_debug(&mut self, shade: bool) {
+        if self.pipeline_owns_switches() {
+            return;
+        }
         if shade {
             self.meshlet_shade = !self.meshlet_shade;
         } else {
@@ -9976,7 +11785,12 @@ impl Editor {
         if self.meshlet_debug || self.meshlet_shade {
             let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
             if uploaded {
-                self.append(&format!("JRV-0028 debug upload {elapsed_ms:.1} ms from the stored clusters. The sidecar was not rebuilt. The next toggle of this actor reuses the upload."));
+                let derived = self.selection.primary_entity().is_some_and(|entity| self.engine.runtime_meshlets(entity).is_some());
+                if derived {
+                    self.append(&format!("JRV-0028 debug upload {elapsed_ms:.1} ms from the derived surface. The level was not changed. The next toggle of this actor reuses the upload."));
+                } else {
+                    self.append(&format!("JRV-0028 debug upload {elapsed_ms:.1} ms from the stored clusters. The sidecar was not rebuilt. The next toggle of this actor reuses the upload."));
+                }
             } else {
                 self.append(&format!("JRV-0028 debug toggle reused the upload ({elapsed_ms:.2} ms)."));
             }
@@ -9993,25 +11807,55 @@ impl Editor {
             self.append("Select the imported shop, then use View > Show Meshlet Colors or View > Draw From Meshlets.");
             return;
         };
-        let has_meshlets = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+        let asset_meshlets = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
             jarvig_core::MeshAssetRef::Asset { id, .. } => self.engine.mesh_asset_library().meshlets(id).map(|_| ()),
             _ => None,
         });
-        if has_meshlets.is_none() {
-            self.append("This actor has no stored meshlets. The view stays on the original triangles.");
+        let derived = self.engine.runtime_meshlets(entity).is_some_and(|set| !set.meshlets.is_empty());
+        if asset_meshlets.is_none() && !derived {
+            self.append("This actor has no meshlets. The view stays on the original triangles.");
+            return;
+        }
+        if asset_meshlets.is_none() {
+            let sentence = match (self.meshlet_debug, self.meshlet_shade) {
+                (true, true) => "Meshlet colors are on. This solid is drawn from the clusters built from its surface. Green is a visible leaf. Amber is kept because the occlusion test was unsure. Red is outside the frustum. Blue is occluded. Magenta was not classified. Those clusters are not saved in the level.",
+                (true, false) => "Meshlet colors are on. This solid's derived clusters are colored. The original triangle list is still the shaded draw. The clusters are not saved in the level.",
+                (false, true) => "This solid is drawn from its derived meshlets, with its normal material. Occluded clusters are not submitted. The level still stores only the parametric size.",
+                (false, false) => "Meshlet view is off. This solid uses its original triangle list.",
+            };
+            self.append(sentence);
+            self.append("The derived triangles, meshlets, and hierarchy stay inside the analytic box. Einstein relief was the stage that left the corners. This solid is exact, so that relief draws no extra triangles. Normal matches the 12-triangle box. Micro Off and Auto should look the same.");
             return;
         }
         let sentence = match (self.meshlet_debug, self.meshlet_shade) {
-            (true, true) => "Meshlet colors are on. Green is visible. Amber is kept because the occlusion test was unsure. Red is outside the frustum. Blue is occluded. Draw From Meshlets submits green and amber.",
-            (true, false) => "Meshlet colors are on. Green is visible. Amber is kept because the occlusion test was unsure. Red is outside the frustum. Blue is occluded. The original triangle list is still the shaded draw.",
+            (true, true) => "Meshlet colors are on. Green is a visible leaf. Amber is kept because the occlusion test was unsure. Red is outside the frustum. Blue is occluded. Magenta was not classified. Draw From Meshlets submits green and amber.",
+            (true, false) => "Meshlet colors are on. Green is a visible leaf. Amber is kept because the occlusion test was unsure. Red is outside the frustum. Blue is occluded. Magenta was not classified. The original triangle list is still the shaded draw.",
             (false, true) => "The shop is drawn from meshlets, with its normal materials. Occluded clusters are not submitted. Turn this off to see the original triangle list.",
             (false, false) => "Meshlet view is off. The shop is the original triangle list.",
         };
         self.append(sentence);
     }
 
+    fn meshlet_view_active(&self) -> bool {
+        self.meshlet_debug
+            || self.meshlet_shade
+            || self.visualization.recolors_submission()
+            || self.einstein_debug
+            || self.micro_debug != jarvig_core::MicroDebugMode::Off
+    }
+
+    fn selection_meshlet_draw(&self, entity: jarvig_core::EntityId) -> Option<jarvig_core::MeshletDraw> {
+        if let Some(asset) = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
+            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
+            _ => None,
+        }) {
+            return self.engine.mesh_asset_library().meshlets(asset).map(jarvig_core::meshlet_draw);
+        }
+        self.engine.runtime_meshlets(entity).map(jarvig_core::meshlet_draw)
+    }
+
     fn sync_meshlet_debug(&mut self) -> bool {
-        let active = self.meshlet_debug || self.meshlet_shade;
+        let active = self.meshlet_view_active();
         if !active {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_meshlet_mode(false, false);
@@ -10025,32 +11869,21 @@ impl Editor {
             return false;
         };
         let playing = self.session_active();
-        if self.meshlet_bound == Some((entity, playing)) {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_meshlet_mode(self.meshlet_debug, self.meshlet_shade);
-            }
-            return false;
-        }
         let Some(mesh_id) = self.viewed_world().extract(jarvig_core::RenderFrameId(1)).ok().and_then(|snapshot| {
             snapshot.instances().iter().find(|instance| instance.entity == entity).map(|instance| instance.mesh)
         }) else {
             return false;
         };
-        let asset = self.engine.world().authored_mesh(entity).and_then(|(_, _, _, _, _, _, mesh, _)| match mesh {
-            jarvig_core::MeshAssetRef::Asset { id, .. } => Some(id),
-            _ => None,
-        });
-        let Some(asset) = asset else {
-            self.meshlet_bound = Some((entity, playing));
+        if self.meshlet_bound == Some((entity, mesh_id, playing)) {
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_meshlet_mode(false, false);
+                renderer.set_meshlet_mode(self.meshlet_debug, self.meshlet_shade);
             }
             return false;
-        };
+        }
         self.set_status("Building the meshlet debug view. The asset and the level are unchanged.");
         self.pump_loading();
-        let Some(draw) = self.engine.mesh_asset_library().meshlets(asset).map(jarvig_core::meshlet_draw) else {
-            self.meshlet_bound = Some((entity, playing));
+        let Some(draw) = self.selection_meshlet_draw(entity) else {
+            self.meshlet_bound = Some((entity, mesh_id, playing));
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_meshlet_mode(false, false);
             }
@@ -10077,8 +11910,194 @@ impl Editor {
                 return false;
             }
         }
-        self.meshlet_bound = Some((entity, playing));
+        self.meshlet_bound = Some((entity, mesh_id, playing));
         true
+    }
+
+    fn marquee_should_arm(&self, x: f64, y: f64) -> bool {
+        if self.gizmo_handle_at(x, y).is_some() || self.operation_handle_at(x, y).is_some() {
+            return false;
+        }
+        if self.character_workspace && self.joint_pivot_at(x, y).is_some() {
+            return false;
+        }
+        self.pick_entity_at(x, y).is_none()
+    }
+
+    fn pick_entity_at(&self, x: f64, y: f64) -> Option<EntityUuid> {
+        let ray = self.viewport_ray(x, y)?;
+        let hidden = self.land_hidden_entities();
+        let hit = {
+            let world = self.engine.world();
+            let snapshot = world.extract(RenderFrameId(30)).ok()?;
+            let (hit, _) = pick_snapshot_skipping(ray, &snapshot, world.meshes(), &hidden);
+            hit
+        }?;
+        self.preview_owners
+            .iter()
+            .find(|(preview, _)| *preview == hit.entity)
+            .map(|(_, owner)| *owner)
+            .or_else(|| self.engine.world().terrain_owner(hit.entity))
+            .or(Some(hit.entity))
+    }
+
+    fn arm_marquee(&mut self, hwnd: HWND, x: f64, y: f64, shift: bool, ctrl: bool) {
+        self.marquee = Some(marquee::MarqueeDrag::new(x, y, shift, ctrl));
+        unsafe { SetCapture(hwnd); }
+    }
+
+    fn update_marquee(&mut self, x: f64, y: f64) {
+        if let Some(drag) = self.marquee.as_mut() {
+            drag.update(x, y);
+        }
+    }
+
+    fn finish_marquee(&mut self, x: f64, y: f64) {
+        let Some(mut drag) = self.marquee.take() else { return };
+        drag.update(x, y);
+        unsafe { ReleaseCapture(); }
+        if !drag.moved {
+            self.viewport_press(self.panel_hwnd(PERSPECTIVE), drag.origin_x, drag.origin_y, drag.ctrl, drag.shift);
+            return;
+        }
+        let ids = self.marquee_hits(&drag);
+        self.selected_face = None;
+        if drag.ctrl {
+            for id in ids {
+                if let Ok(item) = selection::SelectionItem::entity(id) {
+                    let _ = self.selection.toggle_from(item, selection::SelectionSource::Viewport);
+                }
+            }
+        } else if drag.shift {
+            for id in ids {
+                if let Ok(item) = selection::SelectionItem::entity(id) {
+                    let _ = self.selection.add_from(item, selection::SelectionSource::Viewport);
+                }
+            }
+        } else {
+            let items: Vec<_> = ids.iter().copied().filter_map(|id| selection::SelectionItem::entity(id).ok()).collect();
+            let _ = self.selection.replace_many_from(&items, selection::SelectionSource::Viewport);
+        }
+        self.inspector_force_realize = true;
+        self.sync_selection_view();
+    }
+
+    fn marquee_hits(&self, drag: &marquee::MarqueeDrag) -> Vec<EntityUuid> {
+        let kind = marquee::kind_for(drag.origin_x, drag.x);
+        let rect = marquee::ScreenRect::from_drag(drag.origin_x, drag.origin_y, drag.x, drag.y);
+        let hidden = self.land_hidden_entities();
+        let boxes = {
+            let world = self.engine.world();
+            let mut boxes: Vec<(EntityUuid, [Vec3; 8])> = Vec::new();
+            let settings = world
+                .entity_outline()
+                .into_iter()
+                .find(|row| row.class == jarvig_core::AuthoringClass::WorldSettings)
+                .map(|row| row.uuid);
+            for row in world.entity_outline() {
+                if row.class == jarvig_core::AuthoringClass::WorldSettings || hidden.contains(&row.uuid) {
+                    continue;
+                }
+                let Some(record) = world.authored_block(row.uuid) else { continue };
+                let Ok(pose) = world.entity_world_pose(row.uuid) else { continue };
+                boxes.push((row.uuid, solid_corners(pose.translation, pose.rotation, record.size_m)));
+            }
+            if let Ok(snapshot) = world.extract(RenderFrameId(31)) {
+                for instance in snapshot.instances() {
+                    if !instance.visible {
+                        continue;
+                    }
+                    let owner = self
+                        .preview_owners
+                        .iter()
+                        .find(|(preview, _)| *preview == instance.entity)
+                        .map(|(_, owner)| *owner)
+                        .or_else(|| world.terrain_owner(instance.entity))
+                        .unwrap_or(instance.entity);
+                    if hidden.contains(&owner) || hidden.contains(&instance.entity) || settings == Some(owner) {
+                        continue;
+                    }
+                    if world.authored_block(owner).is_some() {
+                        continue;
+                    }
+                    boxes.push((owner, instance_corners(instance)));
+                }
+            }
+            boxes
+        };
+        let mut hits = Vec::new();
+        for (id, corners) in boxes {
+            if hits.contains(&id) {
+                continue;
+            }
+            if self.corners_hit(kind, rect, &corners) {
+                hits.push(id);
+            }
+        }
+        hits
+    }
+
+    fn corners_hit(&self, kind: marquee::MarqueeKind, rect: marquee::ScreenRect, corners: &[Vec3; 8]) -> bool {
+        let projected: Vec<_> = corners.iter().copied().map(|corner| self.project_corner(corner)).collect();
+        marquee::selection_hits(kind, rect, &projected)
+    }
+
+    fn project_corner(&self, point: Vec3) -> marquee::ProjectedCorner {
+        let Some(camera) = self.editor_camera.as_ref() else {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        };
+        let (width, height) = renderer.configured_size();
+        if width == 0 || height == 0 {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        }
+        let pose = camera.pose();
+        let forward = pose.rotation.rotate(Vec3::new(0.0, 0.0, -1.0));
+        let right = pose.rotation.rotate(Vec3::new(1.0, 0.0, 0.0));
+        let up = pose.rotation.rotate(Vec3::new(0.0, 1.0, 0.0));
+        let delta = vec_sub(point, pose.translation);
+        let depth = vec_dot(delta, forward);
+        if depth < 1.0e-4 || !depth.is_finite() {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        }
+        let half = (camera.vertical_fov_radians * 0.5).tan();
+        let aspect = width as f64 / height as f64;
+        let denom_x = depth * half * aspect;
+        let denom_y = depth * half;
+        if denom_x.abs() < 1.0e-8 || denom_y.abs() < 1.0e-8 {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        }
+        let ndc_x = vec_dot(delta, right) / denom_x;
+        let ndc_y = vec_dot(delta, up) / denom_y;
+        if !ndc_x.is_finite() || !ndc_y.is_finite() {
+            return marquee::ProjectedCorner { x: 0.0, y: 0.0, in_front: false };
+        }
+        marquee::ProjectedCorner {
+            x: ((ndc_x + 1.0) * 0.5) * width as f64 - 0.5,
+            y: ((1.0 - ndc_y) * 0.5) * height as f64 - 0.5,
+            in_front: true,
+        }
+    }
+
+    fn marquee_segments(&self, drag: marquee::MarqueeDrag) -> Vec<jarvig_renderer::OverlayVertex> {
+        let mut vertices = Vec::new();
+        let Some(camera) = self.editor_camera.as_ref() else { return vertices };
+        let color = match marquee::kind_for(drag.origin_x, drag.x) {
+            marquee::MarqueeKind::Window => [0.29, 0.70, 1.0, 1.0],
+            marquee::MarqueeKind::Crossing => [0.95, 0.75, 0.25, 1.0],
+        };
+        let pixels = [(drag.origin_x, drag.origin_y), (drag.x, drag.origin_y), (drag.x, drag.y), (drag.origin_x, drag.y)];
+        let mut world = [Vec3::ZERO; 4];
+        for (index, (x, y)) in pixels.into_iter().enumerate() {
+            let Some(ray) = self.viewport_ray(x, y) else { return Vec::new() };
+            world[index] = ray.origin + ray.direction.scale(8.0);
+        }
+        for index in 0..4 {
+            gizmo::push_segment(&mut vertices, camera.position, world[index], world[(index + 1) % 4], 0.015, color);
+        }
+        vertices
     }
 
     fn gizmo_vertices(&self) -> Option<Vec<jarvig_renderer::OverlayVertex>> {
@@ -10099,9 +12118,71 @@ impl Editor {
                 self.gizmo_drag.as_ref().map(|drag| drag.handle),
             ));
         }
+        if let Some((entity, pose, size)) = self.face_target() {
+            if let Some(length) = self.gizmo_length(pose.translation) {
+                if let Some(session) = self.modeling_session.filter(|session| session.entity == entity) {
+                    let hot = self.face_hover.filter(|face| *face == session.face);
+                    vertices.extend(gizmo::face_outline_vertices(
+                        pose.translation,
+                        pose.rotation,
+                        size,
+                        camera.position,
+                        length,
+                        &[session.face],
+                        hot,
+                    ));
+                    vertices.extend(gizmo::operation_handle_vertices(
+                        pose.translation,
+                        pose.rotation,
+                        size,
+                        camera.position,
+                        length,
+                        session.face,
+                        session.tool == ModelingTool::Inset,
+                        self.face_drag.is_some(),
+                    ));
+                } else {
+                    let face_selected = self.selected_face.is_some_and(|(id, _)| id == entity);
+                    if !face_selected {
+                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera.position, length));
+                    }
+                    let mut faces = Vec::new();
+                    if self.selection_mode != SelectionMode::Object {
+                        if let Some(face) = self.face_hover {
+                            faces.push(face);
+                        }
+                    }
+                    if let Some((id, face)) = self.selected_face {
+                        if id == entity && !faces.contains(&face) {
+                            faces.push(face);
+                        }
+                    }
+                    if !faces.is_empty() {
+                        vertices.extend(gizmo::face_outline_vertices(
+                            pose.translation,
+                            pose.rotation,
+                            size,
+                            camera.position,
+                            length,
+                            &faces,
+                            self.face_hover,
+                        ));
+                    }
+                }
+            }
+        }
         let segments = self.visible_joint_segments();
         if !segments.is_empty() {
             vertices.extend(gizmo::joint_debug_vertices(&segments, camera.position));
+        }
+        if self.player_start_gizmo_visible() {
+            let spawns = self.engine.world().player_start_segments();
+            if !spawns.is_empty() {
+                vertices.extend(gizmo::joint_debug_vertices(&spawns, camera.position));
+            }
+        }
+        if let Some(drag) = self.marquee.filter(|drag| drag.moved) {
+            vertices.extend(self.marquee_segments(drag));
         }
         if vertices.is_empty() { None } else { Some(vertices) }
     }
@@ -10120,7 +12201,7 @@ impl Editor {
             }
             SetCapture(hwnd);
         }
-        if kind != CaptureKind::Gizmo && kind != CaptureKind::Terrain {
+        if kind != CaptureKind::Gizmo && kind != CaptureKind::Terrain && kind != CaptureKind::Face {
             self.hide_cursor();
         }
         self.capture = Some(kind);
@@ -10132,9 +12213,24 @@ impl Editor {
 
     fn end_capture(&mut self, release: bool, clear_keys: bool) {
         if self.capture == Some(CaptureKind::Gizmo) && self.gizmo_drag.is_some() {
-            self.restore_gizmo_drag();
+            if matches!(self.history.open_label(), Some("Move" | "Rotate")) {
+                self.gizmo_drag.take();
+                if self.history_cancel() {
+                    self.gizmo_cancels = self.gizmo_cancels.saturating_add(1);
+                    self.request_inspector_refresh();
+                }
+            } else {
+                self.restore_gizmo_drag();
+            }
+        }
+        if self.face_drag.is_some() {
+            self.restore_face_drag();
         }
         if self.capture == Some(CaptureKind::Terrain) {
+            if self.history.open_label() == Some("Sculpt") {
+                let _ = self.history_cancel();
+                self.request_inspector_refresh();
+            }
             self.land_stamp = None;
             self.land_flatten = None;
         }
@@ -10189,7 +12285,7 @@ impl Editor {
     }
 
     fn sample_captured_mouse(&mut self) {
-        if self.capture.is_none() || matches!(self.capture, Some(CaptureKind::Gizmo | CaptureKind::Terrain)) {
+        if self.capture.is_none() || matches!(self.capture, Some(CaptureKind::Gizmo | CaptureKind::Terrain | CaptureKind::Face)) {
             return;
         }
         unsafe {
@@ -10207,6 +12303,291 @@ impl Editor {
         }
     }
 
+    /// Closes a preview, a drag, or a sculpt so the next command is its own transaction.
+    fn prepare_authored_action(&mut self) {
+        self.cancel_modeling(false);
+        if self.gizmo_drag.is_some() || self.capture == Some(CaptureKind::Gizmo) {
+            self.cancel_gizmo();
+        }
+        if self.marquee.is_some() {
+            self.marquee = None;
+            unsafe { ReleaseCapture(); }
+        }
+        if self.capture == Some(CaptureKind::Terrain) || self.history.open_label() == Some("Sculpt") {
+            self.end_capture(true, true);
+        }
+        if self.history.gesture_open() {
+            let _ = self.history_cancel();
+        }
+    }
+
+    fn world_settings_entity(&self) -> Option<EntityUuid> {
+        self.engine
+            .world()
+            .entity_outline()
+            .into_iter()
+            .find(|row| row.class == jarvig_core::AuthoringClass::WorldSettings)
+            .map(|row| row.uuid)
+    }
+
+    fn author_probe_policy(&mut self, policy: jarvig_core::ProbeUpdatePolicy) {
+        if self.session_active() {
+            self.append("Probe policy is authored. Stop play before changing it.");
+            return;
+        }
+        let Some(settings) = self.world_settings_entity() else {
+            self.engine.world_mut().set_probe_update_policy(policy);
+            self.note_policy_edit();
+            return;
+        };
+        let opened = self.history_begin("Probe Policy", &[settings]);
+        let changed = self.engine.world_mut().set_authored_probe_policy(policy) != jarvig_core::AuthoringResult::Unchanged;
+        if opened {
+            self.history_commit();
+        }
+        if changed {
+            self.note_policy_edit();
+        }
+    }
+
+    /// Starts one transaction. A second begin, and any begin during Play, does nothing.
+    fn history_begin(&mut self, label: &str, ids: &[EntityUuid]) -> bool {
+        if self.session_active() || self.history.gesture_open() {
+            return false;
+        }
+        self.history.begin(label, self.engine.world(), ids);
+        self.refresh_edit_menu();
+        self.history.gesture_open()
+    }
+
+    fn history_note_created(&mut self, id: EntityUuid) {
+        self.history.note_created(id);
+    }
+
+    fn history_commit(&mut self) {
+        let _pushed = self.history.commit(self.engine.world());
+        self.evict_retired_meshes();
+        self.refresh_edit_menu();
+    }
+
+    /// Restores the open gesture and pushes nothing. Does not refresh the outliner.
+    fn history_cancel(&mut self) -> bool {
+        match self.history.cancel(self.engine.world_mut()) {
+            Ok(Some(apply)) => {
+                self.finish_history_effect(&apply);
+                self.refresh_edit_menu();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.append(&format!("The edit could not be canceled: {error}."));
+                self.refresh_edit_menu();
+                false
+            }
+        }
+    }
+
+    fn open_property_edit(&mut self, entity: EntityUuid) -> bool {
+        self.history_begin("Edit", &[entity])
+    }
+
+    fn finish_history_effect(&mut self, apply: &edit_history::HistoryApply) {
+        if let Some(settings) = apply.settings.clone() {
+            let id = settings.entity;
+            let world = self.engine.world_mut();
+            let _ = world.set_authored_environment_enabled(id, settings.enabled);
+            let _ = world.set_authored_environment_intensity(id, f64::from(settings.intensity));
+            let _ = world.set_authored_environment_upper(
+                id,
+                Vec3::new(f64::from(settings.upper[0]), f64::from(settings.upper[1]), f64::from(settings.upper[2])),
+            );
+            let _ = world.set_authored_environment_lower(
+                id,
+                Vec3::new(f64::from(settings.lower[0]), f64::from(settings.lower[1]), f64::from(settings.lower[2])),
+            );
+            let _ = world.set_authored_probe_policy(settings.probe_update_policy);
+            let _ = world.set_startup_camera(settings.startup_camera);
+        }
+        let mut bind = apply.effect.spawned.clone();
+        for id in &apply.effect.rebound {
+            if !bind.contains(id) {
+                bind.push(*id);
+            }
+        }
+        for id in bind {
+            let _ = self.engine.rebind_entity_material(id);
+        }
+        self.evict_retired_meshes();
+    }
+
+    fn undo_edit(&mut self) {
+        if self.session_active() {
+            self.append("Undo is disabled while playing. Stop returns to the authored world.");
+            return;
+        }
+        if self.modeling_session.is_some() {
+            self.cancel_modeling(true);
+            return;
+        }
+        if self.marquee.is_some() {
+            self.marquee = None;
+            unsafe { ReleaseCapture(); }
+            return;
+        }
+        if self.gizmo_drag.is_some() || self.capture == Some(CaptureKind::Gizmo) {
+            self.cancel_gizmo();
+            return;
+        }
+        if self.history.open_label() == Some("Sculpt") || self.capture == Some(CaptureKind::Terrain) {
+            self.end_capture(true, true);
+            return;
+        }
+        if self.history.gesture_open() {
+            let _ = self.history_cancel();
+            self.request_inspector_refresh();
+            return;
+        }
+        match self.history.undo(self.engine.world_mut()) {
+            Ok(Some(apply)) => {
+                self.finish_history_effect(&apply);
+                let label = self.history.redo_label().unwrap_or("edit").to_string();
+                self.sync_outliner();
+                self.refresh_title();
+                self.refresh_edit_menu();
+                self.append(&format!("Undid {label}."));
+            }
+            Ok(None) => self.append("Nothing to undo."),
+            Err(error) => self.append(&format!("Undo failed: {error}.")),
+        }
+    }
+
+    fn redo_edit(&mut self) {
+        if self.session_active() {
+            self.append("Redo is disabled while playing. Stop returns to the authored world.");
+            return;
+        }
+        if self.history.gesture_open() || self.modeling_session.is_some() || self.marquee.is_some() || self.gizmo_drag.is_some() {
+            self.append("Finish or cancel the current edit before redo.");
+            return;
+        }
+        match self.history.redo(self.engine.world_mut()) {
+            Ok(Some(apply)) => {
+                self.finish_history_effect(&apply);
+                let label = self.history.undo_label().unwrap_or("edit").to_string();
+                self.sync_outliner();
+                self.refresh_title();
+                self.refresh_edit_menu();
+                self.append(&format!("Redid {label}."));
+            }
+            Ok(None) => self.append("Nothing to redo."),
+            Err(error) => self.append(&format!("Redo failed: {error}.")),
+        }
+    }
+
+    fn refresh_edit_menu(&mut self) {
+        let menu = self.edit_menu;
+        if menu.is_null() {
+            return;
+        }
+        let playing = self.session_active();
+        let undo_text = if let Some(label) = self.history.open_label() {
+            format!("Undo {label}\tCtrl+Z")
+        } else if let Some(label) = self.history.undo_label() {
+            format!("Undo {label}\tCtrl+Z")
+        } else {
+            "Undo\tCtrl+Z".to_string()
+        };
+        let redo_text = if self.history.gesture_open() {
+            "Redo\tCtrl+Y".to_string()
+        } else if let Some(label) = self.history.redo_label() {
+            format!("Redo {label}\tCtrl+Y")
+        } else {
+            "Redo\tCtrl+Y".to_string()
+        };
+        let undo_flags = MF_BYCOMMAND | if self.history.can_undo() && !playing { MF_ENABLED } else { MF_GRAYED };
+        let redo_flags = MF_BYCOMMAND | if self.history.can_redo() && !playing { MF_ENABLED } else { MF_GRAYED };
+        unsafe {
+            let undo = wide(&undo_text);
+            let redo = wide(&redo_text);
+            ModifyMenuW(menu, ID_EDIT_UNDO as u32, MF_STRING | MF_BYCOMMAND, ID_EDIT_UNDO, undo.as_ptr());
+            ModifyMenuW(menu, ID_EDIT_REDO as u32, MF_STRING | MF_BYCOMMAND, ID_EDIT_REDO, redo.as_ptr());
+            EnableMenuItem(menu, ID_EDIT_UNDO as u32, undo_flags);
+            EnableMenuItem(menu, ID_EDIT_REDO as u32, redo_flags);
+        }
+        chrome::own_menu_item(menu, 0, &undo_text);
+        chrome::own_menu_item(menu, 1, &redo_text);
+    }
+
+    fn promote_under_cursor(&mut self, x: f64, y: f64) {
+        if self.session_active() {
+            return;
+        }
+        let entity = self.pick_entity_at(x, y).or_else(|| {
+            if self.character_workspace { self.joint_pivot_at(x, y) } else { None }
+        });
+        let Some(entity) = entity else { return };
+        if self.modeling_session.is_some_and(|session| session.entity != entity) {
+            return;
+        }
+        if self.selected_face.take().is_some() {
+            self.inspector_force_realize = true;
+        }
+        if self.selection.primary_entity() != Some(entity) {
+            if let Ok(item) = selection::SelectionItem::entity(entity) {
+                let _ = self.selection.replace_from(item, selection::SelectionSource::Viewport);
+            }
+        }
+        self.selection_view_ready = false;
+        self.sync_selection_view();
+    }
+
+    fn select_all_entities(&mut self) {
+        if self.session_active() {
+            return;
+        }
+        let items = self.selectable_entities();
+        self.selected_face = None;
+        let _ = self.selection.replace_many_from(&items, selection::SelectionSource::Command);
+        self.sync_selection_view();
+    }
+
+    fn deselect_all(&mut self) {
+        if self.session_active() {
+            return;
+        }
+        self.selected_face = None;
+        self.selection.clear_from(selection::SelectionSource::Command);
+        self.sync_selection_view();
+    }
+
+    fn invert_selection(&mut self) {
+        if self.session_active() {
+            return;
+        }
+        let items: Vec<_> = self
+            .engine
+            .world()
+            .entity_outline()
+            .into_iter()
+            .filter(|row| row.class != jarvig_core::AuthoringClass::WorldSettings)
+            .filter_map(|row| selection::SelectionItem::entity(row.uuid).ok())
+            .filter(|item| !self.selection.contains(*item))
+            .collect();
+        self.selected_face = None;
+        let _ = self.selection.replace_many_from(&items, selection::SelectionSource::Command);
+        self.sync_selection_view();
+    }
+
+    fn selectable_entities(&self) -> Vec<selection::SelectionItem> {
+        self.engine
+            .world()
+            .entity_outline()
+            .into_iter()
+            .filter(|row| row.class != jarvig_core::AuthoringClass::WorldSettings)
+            .filter_map(|row| selection::SelectionItem::entity(row.uuid).ok())
+            .collect()
+    }
+
     fn destroy_selected(&mut self) {
         if self.session_active() {
             self.append("Delete is disabled while playing. Stop returns to the authored world.");
@@ -10215,12 +12596,25 @@ impl Editor {
         let Some(target) = self.selection.primary_entity() else {
             return;
         };
+        self.prepare_authored_action();
+        let mut ids = vec![target];
+        ids.extend(self.engine.world().entity_children(target));
+        let opened = self.history_begin("Delete", &ids);
         match self.engine.execute_authoring(AuthoringCommand::DestroyEntity { target }) {
             Ok(_) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.evict_retired_meshes();
                 self.append(&format!("Destroyed {target}."));
                 self.sync_outliner();
             }
-            Err(error) => self.append(&format!("Destroy failed: {error}.")),
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Destroy failed: {error}."));
+            }
         }
     }
 
@@ -10232,13 +12626,30 @@ impl Editor {
         let Some(target) = self.selection.primary_entity() else {
             return;
         };
+        self.prepare_authored_action();
+        let opened = self.history_begin("Duplicate", &[]);
         match self.engine.execute_authoring(AuthoringCommand::DuplicateEntity { target }) {
             Ok(jarvig_core::AuthoringResult::Duplicated(created)) => {
+                self.history_note_created(created);
+                if opened {
+                    self.history_commit();
+                }
+                self.evict_retired_meshes();
                 self.append(&format!("Duplicated {target} as {created}."));
                 self.sync_outliner();
             }
-            Ok(_) => self.append("Duplicate did not return a new entity."),
-            Err(error) => self.append(&format!("Duplicate failed: {error}.")),
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Duplicate did not return a new entity.");
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Duplicate failed: {error}."));
+            }
         }
     }
 
@@ -10345,8 +12756,23 @@ impl Editor {
             return true;
         }
         if wparam == VK_ESCAPE as usize {
-            if self.capture.is_some() || self.gizmo_drag.is_some() {
+            if self.modeling_session.is_some() {
+                self.cancel_modeling(true);
+                return true;
+            }
+            if self.marquee.is_some() {
+                self.marquee = None;
+                unsafe { ReleaseCapture(); }
+                return true;
+            }
+            if self.capture.is_some() || self.gizmo_drag.is_some() || self.face_drag.is_some() {
                 self.end_capture(true, true);
+                return true;
+            }
+            if !self.session_active() && !self.selection.is_empty() {
+                self.selection.clear_from(selection::SelectionSource::Viewport);
+                self.selected_face = None;
+                self.sync_selection_view();
             }
             return true;
         }
@@ -10384,8 +12810,17 @@ impl Editor {
                 self.destroy_selected();
                 return true;
             }
+            let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
             if ctrl && (wparam == 0x5A || wparam == b'z' as usize) {
-                self.undo_content_drop();
+                if shift { self.redo_edit(); } else { self.undo_edit(); }
+                return true;
+            }
+            if ctrl && (wparam == 0x59 || wparam == b'y' as usize) {
+                self.redo_edit();
+                return true;
+            }
+            if ctrl && wparam == VK_A {
+                if shift { self.deselect_all(); } else { self.select_all_entities(); }
                 return true;
             }
             if ctrl && wparam == VK_D {
@@ -10442,8 +12877,12 @@ impl Editor {
         }
         match message {
             WM_RBUTTONDOWN => {
-                if self.gizmo_drag.is_some() {
+                if self.gizmo_drag.is_some() || self.face_drag.is_some() {
                     return true;
+                }
+                if self.marquee.is_some() {
+                    self.marquee = None;
+                    unsafe { ReleaseCapture(); }
                 }
                 self.begin_capture(hwnd, CaptureKind::Look);
                 true
@@ -10455,8 +12894,12 @@ impl Editor {
                 true
             }
             WM_MBUTTONDOWN => {
-                if self.gizmo_drag.is_some() {
+                if self.gizmo_drag.is_some() || self.face_drag.is_some() {
                     return true;
+                }
+                if self.marquee.is_some() {
+                    self.marquee = None;
+                    unsafe { ReleaseCapture(); }
                 }
                 self.begin_capture(hwnd, CaptureKind::Pan);
                 true
@@ -10471,12 +12914,12 @@ impl Editor {
                 self.note_child_focus(PERSPECTIVE.raw());
                 let alt = (unsafe { GetKeyState(VK_MENU as i32) } as u16) & 0x8000 != 0;
                 if alt {
-                    if self.gizmo_drag.is_none() {
+                    if self.gizmo_drag.is_none() && self.face_drag.is_none() {
                         self.begin_capture(hwnd, CaptureKind::Orbit);
                     }
                     return true;
                 }
-                if matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit | CaptureKind::Terrain)) {
+                if matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit | CaptureKind::Terrain | CaptureKind::Face)) {
                     return true;
                 }
                 let x = (lparam & 0xffff) as u16 as i16 as f64;
@@ -10487,13 +12930,35 @@ impl Editor {
                     return true;
                 }
                 let ctrl = (unsafe { GetKeyState(VK_CONTROL as i32) } as u16) & 0x8000 != 0;
-                self.viewport_press(hwnd, x, y, ctrl);
+                let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
+                if self.object_tool == chrome::ToolbarCommand::Select && self.marquee_should_arm(x, y) {
+                    self.arm_marquee(hwnd, x, y, shift, ctrl);
+                    return true;
+                }
+                self.viewport_press(hwnd, x, y, ctrl, shift);
+                true
+            }
+            WM_LBUTTONDBLCLK => {
+                let x = (lparam & 0xffff) as u16 as i16 as f64;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                self.promote_under_cursor(x, y);
                 true
             }
             WM_LBUTTONUP => {
-                if self.capture == Some(CaptureKind::Gizmo) {
+                if self.marquee.is_some() {
+                    let x = (lparam & 0xffff) as u16 as i16 as f64;
+                    let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                    self.finish_marquee(x, y);
+                } else if self.capture == Some(CaptureKind::Gizmo) {
                     self.commit_gizmo();
-                } else if self.capture == Some(CaptureKind::Orbit) || self.capture == Some(CaptureKind::Terrain) {
+                } else if self.capture == Some(CaptureKind::Face) {
+                    self.commit_face();
+                } else if self.capture == Some(CaptureKind::Orbit) {
+                    self.end_capture(true, false);
+                } else if self.capture == Some(CaptureKind::Terrain) {
+                    if self.history.open_label() == Some("Sculpt") {
+                        self.history_commit();
+                    }
                     self.end_capture(true, false);
                 }
                 true
@@ -10501,19 +12966,26 @@ impl Editor {
             WM_MOUSEMOVE => {
                 let x = (lparam & 0xffff) as u16 as i16 as f64;
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                if self.marquee.is_some() {
+                    self.update_marquee(x, y);
+                    return true;
+                }
                 if self.capture == Some(CaptureKind::Gizmo) {
                     self.update_gizmo_drag(x, y);
+                } else if self.capture == Some(CaptureKind::Face) {
+                    self.update_face_drag(x, y);
                 } else if self.capture == Some(CaptureKind::Terrain) {
                     self.stamp_land(x, y, false);
                 } else {
                     self.sample_captured_mouse();
                     self.update_gizmo_hover(x, y);
+                    self.update_face_hover(x, y);
                     self.track_land_hover(x, y);
                 }
                 true
             }
             WM_MOUSEWHEEL => {
-                if self.capture == Some(CaptureKind::Gizmo) {
+                if matches!(self.capture, Some(CaptureKind::Gizmo | CaptureKind::Face)) {
                     return true;
                 }
                 if self.navigation_open() {
@@ -10538,6 +13010,10 @@ impl Editor {
                 true
             }
             WM_CAPTURECHANGED => {
+                let gained = lparam as HWND;
+                if self.marquee.is_some() && self.capture.is_none() && gained != hwnd {
+                    self.marquee = None;
+                }
                 if !self.capture_ending && self.capture.is_some() {
                     self.end_capture(false, true);
                 }
@@ -10751,7 +13227,7 @@ impl Editor {
         self.object_tool = chrome::ToolbarCommand::Select;
         let center_x = width as f64 * 0.5 - 0.5;
         let center_y = height as f64 * 0.5 - 0.5;
-        self.viewport_press(hwnd, center_x, center_y, false);
+        self.viewport_press(hwnd, center_x, center_y, false, false);
         if self.selection.primary_entity() != Some(near) || self.selection.count() != 1 {
             return Err(format!("center click selected {:?} count {}", self.selection.primary_entity(), self.selection.count()));
         }
@@ -10783,7 +13259,7 @@ impl Editor {
             return Err(format!("x axis hit {:?} at {axis_x:.1},{axis_y:.1}", self.gizmo_handle_at(axis_x, axis_y)));
         }
         let selection_during = self.selection.revision();
-        self.viewport_press(hwnd, axis_x, axis_y, false);
+        self.viewport_press(hwnd, axis_x, axis_y, false, false);
         if self.gizmo_drag.as_ref().map(|drag| drag.handle) != Some(gizmo::GizmoHandle::AxisX) {
             return Err("x axis press did not begin a drag".into());
         }
@@ -10822,7 +13298,7 @@ impl Editor {
         if self.transform_space != gizmo::TransformSpace::Local {
             return Err("local toggle did not enter local space".into());
         }
-        self.viewport_press(hwnd, axis_x, axis_y, false);
+        self.viewport_press(hwnd, axis_x, axis_y, false, false);
         if self.gizmo_drag.as_ref().map(|drag| drag.handle) != Some(gizmo::GizmoHandle::AxisX) {
             return Err("local x axis did not begin a drag".into());
         }
@@ -10842,7 +13318,7 @@ impl Editor {
         if self.transform_space != gizmo::TransformSpace::World {
             return Err("local toggle did not return to world space".into());
         }
-        self.viewport_press(hwnd, axis_x, axis_y, false);
+        self.viewport_press(hwnd, axis_x, axis_y, false, false);
         self.nudge_gizmo(0.25)?;
         if self.engine.world().revision() == world_before_pick {
             return Err("translation drag did not revise the world".into());
@@ -10866,7 +13342,7 @@ impl Editor {
         let far_point = Vec3::new(camera_pose.x + 1.8, camera_pose.y - 1.2, camera_pose.z - 5.0);
         let (far_x, far_y) = self.pixel_for_world_point(far_point)?;
         self.object_tool = chrome::ToolbarCommand::Select;
-        self.viewport_press(hwnd, far_x, far_y, true);
+        self.viewport_press(hwnd, far_x, far_y, true, false);
         if self.selection.count() != 2
             || self.selection.primary_entity() != Some(far)
             || !self.selection.contains(selection::SelectionItem::Entity(near))
@@ -10885,21 +13361,21 @@ impl Editor {
             return Err("multi-select gizmo did not follow the primary".into());
         }
         self.object_tool = chrome::ToolbarCommand::Select;
-        self.viewport_press(hwnd, 0.0, height as f64 - 1.0, true);
+        self.viewport_press(hwnd, 0.0, height as f64 - 1.0, true, false);
         if self.selection.count() != 2 {
             return Err("ctrl click on empty space changed the selection".into());
         }
-        self.viewport_press(hwnd, 0.0, height as f64 - 1.0, false);
+        self.viewport_press(hwnd, 0.0, height as f64 - 1.0, false, false);
         if !self.selection.is_empty() || self.gizmo_vertices().is_some() {
             return Err("empty click did not clear selection".into());
         }
-        self.viewport_press(hwnd, center_x, center_y, false);
+        self.viewport_press(hwnd, center_x, center_y, false, false);
         if self.selection.primary_entity() != Some(near) || self.selection.count() != 1 {
             return Err("second center click did not select the near triangle".into());
         }
         self.object_tool = chrome::ToolbarCommand::Translate;
         let selection_at_commit = self.selection.revision();
-        self.viewport_press(hwnd, axis_x, axis_y, false);
+        self.viewport_press(hwnd, axis_x, axis_y, false, false);
         if self.gizmo_drag.is_none() {
             return Err("commit drag did not start".into());
         }
@@ -10933,7 +13409,7 @@ impl Editor {
         if self.gizmo_handle_at(ring_x, ring_y) != Some(gizmo::GizmoHandle::RingZ) {
             return Err(format!("z ring hit {:?}", self.gizmo_handle_at(ring_x, ring_y)));
         }
-        self.viewport_press(hwnd, ring_x, ring_y, false);
+        self.viewport_press(hwnd, ring_x, ring_y, false, false);
         if self.gizmo_drag.as_ref().map(|drag| drag.handle) != Some(gizmo::GizmoHandle::RingZ) {
             return Err("z ring press did not begin a rotation".into());
         }
@@ -11147,9 +13623,9 @@ impl Editor {
         }
         match id {
             ID_FILE_NEW_PROJECT | ID_FILE_TEMPLATE_EMPTY => self.file_new_project(),
-            ID_FILE_TEMPLATE_TERRAIN => self.file_new_from_template("terrain"),
+            ID_FILE_TEMPLATE_TERRAIN => self.file_new_from_template("landscape"),
             ID_FILE_TEMPLATE_THIRD => self.file_new_from_template("third-person"),
-            ID_FILE_TEMPLATE_FPS => self.file_new_from_template("fps"),
+            ID_FILE_TEMPLATE_FPS => self.file_new_from_template("first-person"),
             ID_FILE_OPEN_PROJECT => self.file_open_project(),
             ID_FILE_CLOSE_PROJECT => self.file_close_project(),
             ID_FILE_NEW_LEVEL => self.file_new_level(),
@@ -11159,7 +13635,14 @@ impl Editor {
             ID_FILE_SAVE_AS => self.file_save_as(),
             ID_FILE_SAVE_ALL => self.file_save_all(),
             ID_FILE_IMPORT_MESH => self.file_import_mesh(),
-            ID_EDIT_UNDO => self.undo_content_drop(),
+            ID_EDIT_UNDO => self.undo_edit(),
+            ID_EDIT_REDO => self.redo_edit(),
+            ID_EDIT_DUPLICATE => self.duplicate_selected(),
+            ID_EDIT_DELETE => self.destroy_selected(),
+            ID_EDIT_SELECT_ALL => self.select_all_entities(),
+            ID_EDIT_DESELECT => self.deselect_all(),
+            ID_EDIT_INVERT => self.invert_selection(),
+            ID_CREATE_BLOCK => self.create_block(),
             id if (ID_FILE_RECENT_PROJECT..ID_FILE_RECENT_PROJECT + 8).contains(&id) => self.file_recent_project(id - ID_FILE_RECENT_PROJECT),
             id if (ID_FILE_RECENT_LEVEL..ID_FILE_RECENT_LEVEL + 8).contains(&id) => self.file_recent_level(id - ID_FILE_RECENT_LEVEL),
             ID_FILE_EXIT => unsafe { PostMessageW(self.frame, WM_CLOSE, 0, 0); },
@@ -11178,6 +13661,16 @@ impl Editor {
             ID_VIEW_OUTLINER => self.toggle_panel(OUTLINER),
             ID_VIEW_CHARACTER => self.set_character_workspace(!self.character_workspace),
             ID_VIEW_LAND => self.set_land_mode(!self.land_mode),
+            ID_VIEW_MESH_PARTS => {
+                if !self.character_workspace {
+                    self.append("Mesh Parts is a Character Editor view. Level stays on the authored world.");
+                } else {
+                    self.outliner_parts = !self.outliner_parts;
+                    self.sync_outliner();
+                    self.persist_workspace();
+                }
+                self.sync_view_menu();
+            }
             ID_VIEW_RESET_POSE => self.reset_character_pose(),
             ID_VIEW_JOINTS => {
                 if !self.character_workspace {
@@ -11237,9 +13730,27 @@ impl Editor {
             ID_VIEW_MESHLET_OCCLUSION => self.toggle_meshlet_occlusion(),
             ID_VIEW_MESHLET_FREEZE => self.toggle_meshlet_freeze(),
             ID_VIEW_MESHLET_HIGHLIGHT => self.toggle_meshlet_highlight(),
+            ID_VIEW_VG_NORMAL => self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::Normal),
+            ID_VIEW_LEAF_TRUTH => self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::LeafTruth),
+            ID_VIEW_VG_FRUSTUM => self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::FrustumOnly),
+            ID_VIEW_VG_HIER => self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::HierarchyNoOcclusion),
+            ID_VIEW_VG_OCC => self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::HierarchyWithOcclusion),
+            ID_VIEW_CUT_REASONS => self.set_visualization(jarvig_core::DiagnosticVisualization::CutReasons),
+            ID_VIEW_VG_LEVELS => self.set_visualization(jarvig_core::DiagnosticVisualization::HierarchyLevels),
+            ID_VIEW_FREEZE_DIAGNOSTIC => self.toggle_diagnostic_freeze(),
+            ID_VIEW_COMPARE_LEAF => self.compare_against_leaf_truth(),
+            ID_VIEW_RESET_DEBUG => self.reset_rendering_debug(),
+            ID_VIEW_EINSTEIN_OFF => self.set_visualization(jarvig_core::DiagnosticVisualization::None),
             ID_VIEW_CLUSTER_HIERARCHY => self.toggle_cluster_hierarchy(),
-            ID_VIEW_EINSTEIN => self.toggle_einstein_debug(),
-            ID_VIEW_MICRO => self.toggle_microgeometry(),
+            ID_VIEW_EINSTEIN => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinDetail),
+            ID_VIEW_MICRO_ACTIVE => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinActive),
+            ID_VIEW_MICRO_ELIGIBLE => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinEligible),
+            ID_VIEW_MICRO_ERROR => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinLodError),
+            ID_VIEW_MICRO_STATE => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinState),
+            ID_VIEW_MICRO_REJECT => self.set_visualization(jarvig_core::DiagnosticVisualization::EinsteinReject),
+            ID_VIEW_MICRO => self.set_micro_mode(jarvig_core::MicrogeometryMode::Auto),
+            ID_VIEW_MICRO_ON => self.set_micro_mode(jarvig_core::MicrogeometryMode::On),
+            ID_VIEW_MICRO_OFF => self.set_micro_mode(jarvig_core::MicrogeometryMode::Off),
             ID_VIEW_MICRO_COLOR => self.toggle_micro_color(),
             ID_VIEW_ERROR_HALF => self.set_hierarchy_error(0.5),
             ID_VIEW_ERROR_ONE => self.set_hierarchy_error(1.0),
@@ -11341,25 +13852,12 @@ impl Editor {
                 self.append("Reflection probes marked for recapture. The camera was not moved.");
                 self.refresh_status();
             }
-            ID_PROBE_STATIC => {
-                self.engine.world_mut().set_probe_update_policy(jarvig_core::ProbeUpdatePolicy::Static);
-                self.note_policy_edit();
-            }
-            ID_PROBE_ON_DEMAND => {
-                self.engine.world_mut().set_probe_update_policy(jarvig_core::ProbeUpdatePolicy::OnDemand);
-                self.note_policy_edit();
-            }
-            ID_PROBE_ON_TRANSFORM => {
-                self.engine.world_mut().set_probe_update_policy(jarvig_core::ProbeUpdatePolicy::OnTransformChange);
-                self.note_policy_edit();
-            }
-            ID_PROBE_ON_LIGHTING => {
-                self.engine.world_mut().set_probe_update_policy(jarvig_core::ProbeUpdatePolicy::OnLightingChange);
-                self.note_policy_edit();
-            }
+            ID_PROBE_STATIC => self.author_probe_policy(jarvig_core::ProbeUpdatePolicy::Static),
+            ID_PROBE_ON_DEMAND => self.author_probe_policy(jarvig_core::ProbeUpdatePolicy::OnDemand),
+            ID_PROBE_ON_TRANSFORM => self.author_probe_policy(jarvig_core::ProbeUpdatePolicy::OnTransformChange),
+            ID_PROBE_ON_LIGHTING => self.author_probe_policy(jarvig_core::ProbeUpdatePolicy::OnLightingChange),
             ID_PROBE_TIME_SLICED => {
-                self.engine.world_mut().set_probe_update_policy(jarvig_core::ProbeUpdatePolicy::TimeSliced);
-                self.note_policy_edit();
+                self.author_probe_policy(jarvig_core::ProbeUpdatePolicy::TimeSliced);
                 self.append("Probe updates are time sliced. One face per frame. The camera does not dirty a probe.");
                 self.refresh_status();
             }
@@ -11431,6 +13929,8 @@ impl Editor {
                     self.play_toolbar(),
                     self.ui_font,
                     self.editor_mode(),
+                    self.modeling_tools_visible(),
+                    self.modeling_toolbar_command(),
                 );
             }
             EndPaint(hwnd, &paint);
@@ -11441,11 +13941,18 @@ impl Editor {
         let Some(command) = self.toolbar_icons.command(index) else { return };
         match command {
             chrome::ToolbarCommand::Select | chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate => {
+                if matches!(command, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) && self.modeling_session.is_some() {
+                    self.cancel_modeling(false);
+                }
                 self.object_tool = command;
             }
             chrome::ToolbarCommand::Scale => {
                 self.append("Scale is unavailable. A spatial frame stores translation and a quaternion, not scale.");
             }
+            chrome::ToolbarCommand::Block => self.create_block(),
+            chrome::ToolbarCommand::Extrude => self.begin_modeling(ModelingTool::Extrude),
+            chrome::ToolbarCommand::Inset => self.begin_modeling(ModelingTool::Inset),
+            chrome::ToolbarCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
             chrome::ToolbarCommand::Level => self.enter_mode(chrome::WorkspaceMode::Level, true),
             chrome::ToolbarCommand::Land => self.enter_mode(chrome::WorkspaceMode::Land, true),
             chrome::ToolbarCommand::Character => self.enter_mode(chrome::WorkspaceMode::Character, true),
@@ -11501,6 +14008,132 @@ impl Editor {
             eprintln!("EDITOR_FRAME renderer release panicked: {}", panic_payload(&payload));
         }
     }
+}
+
+fn modeling_tool_name(tool: ModelingTool) -> &'static str {
+    match tool {
+        ModelingTool::Extrude => "Extrude",
+        ModelingTool::Inset => "Inset",
+        ModelingTool::Bevel => "Bevel",
+    }
+}
+
+fn modeling_start_amount(session: &ModelingSession) -> f64 {
+    match session.tool {
+        ModelingTool::Extrude => 0.0,
+        ModelingTool::Inset => session.baseline_inset[session.face as usize],
+        ModelingTool::Bevel => session.baseline_bevel,
+    }
+}
+
+/// Extrude reports the distance the face actually moved. Bevel and inset stay inside the solid.
+fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
+    if !amount.is_finite() {
+        return session.amount;
+    }
+    match session.tool {
+        ModelingTool::Extrude => {
+            let axis = (session.face / 2) as usize;
+            let grown = (session.baseline_size[axis] + amount).clamp(jarvig_core::BLOCK_MIN_EXTENT_M, jarvig_core::BLOCK_MAX_EXTENT_M);
+            grown - session.baseline_size[axis]
+        }
+        ModelingTool::Inset | ModelingTool::Bevel => amount.clamp(0.0, jarvig_core::feature_limit(session.baseline_size)),
+    }
+}
+
+fn modeling_view(session: ModelingSession) -> inspector::ModelingView {
+    let limit = jarvig_core::feature_limit(session.baseline_size);
+    match session.tool {
+        ModelingTool::Extrude => inspector::ModelingView {
+            title: "Extrude",
+            face: face_name(session.face),
+            amount_label: "Amount",
+            amount: session.amount,
+            minimum: -1000.0,
+            maximum: 1000.0,
+        },
+        ModelingTool::Inset => inspector::ModelingView {
+            title: "Inset",
+            face: face_name(session.face),
+            amount_label: "Amount",
+            amount: session.amount,
+            minimum: 0.0,
+            maximum: limit,
+        },
+        ModelingTool::Bevel => inspector::ModelingView {
+            title: "Bevel",
+            face: "All edges",
+            amount_label: "Amount",
+            amount: session.amount,
+            minimum: 0.0,
+            maximum: limit,
+        },
+    }
+}
+
+/// Entry point on the analytic box, in the block frame. A camera inside the box uses the exit.
+fn ray_box_local(origin: Vec3, direction: Vec3, translation: Vec3, rotation: Quat, size: [f64; 3]) -> Option<Vec3> {
+    let offset = Vec3::new(origin.x - translation.x, origin.y - translation.y, origin.z - translation.z);
+    let local_origin = rotation.conjugate().rotate(offset);
+    let local_dir = rotation.conjugate().rotate(direction);
+    let half = [size[0] * 0.5, size[1] * 0.5, size[2] * 0.5];
+    let start = [local_origin.x, local_origin.y, local_origin.z];
+    let step = [local_dir.x, local_dir.y, local_dir.z];
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+    for axis in 0..3 {
+        if step[axis].abs() < 1.0e-12 {
+            if start[axis] < -half[axis] || start[axis] > half[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inv = 1.0 / step[axis];
+        let mut near = (-half[axis] - start[axis]) * inv;
+        let mut far = (half[axis] - start[axis]) * inv;
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        tmin = tmin.max(near);
+        tmax = tmax.min(far);
+        if tmin > tmax {
+            return None;
+        }
+    }
+    let t = if tmin >= 1.0e-6 { tmin } else { tmax };
+    if t < 1.0e-6 {
+        return None;
+    }
+    Some(Vec3::new(start[0] + step[0] * t, start[1] + step[1] * t, start[2] + step[2] * t))
+}
+
+fn solid_corners(translation: Vec3, rotation: Quat, size: [f64; 3]) -> [Vec3; 8] {
+    let half = [size[0] * 0.5, size[1] * 0.5, size[2] * 0.5];
+    let mut corners = [Vec3::ZERO; 8];
+    for index in 0..8 {
+        let local = Vec3::new(
+            if index & 1 == 0 { -half[0] } else { half[0] },
+            if index & 2 == 0 { -half[1] } else { half[1] },
+            if index & 4 == 0 { -half[2] } else { half[2] },
+        );
+        corners[index] = translation + rotation.rotate(local);
+    }
+    corners
+}
+
+fn instance_corners(instance: &jarvig_core::RenderInstance) -> [Vec3; 8] {
+    let min = instance.bounds.aabb.min;
+    let max = instance.bounds.aabb.max;
+    let mut corners = [Vec3::ZERO; 8];
+    for index in 0..8 {
+        let local = Vec3::new(
+            f64::from(if index & 1 == 0 { min[0] } else { max[0] }) * instance.scale.x,
+            f64::from(if index & 2 == 0 { min[1] } else { max[1] }) * instance.scale.y,
+            f64::from(if index & 4 == 0 { min[2] } else { max[2] }) * instance.scale.z,
+        );
+        corners[index] = instance.pose.translation + instance.pose.rotation.rotate(local);
+    }
+    corners
 }
 
 fn vec_sub(left: Vec3, right: Vec3) -> Vec3 {
@@ -12550,20 +15183,26 @@ unsafe fn register_classes(instance: HINSTANCE) -> Result<(), String> {
     Ok(())
 }
 
-unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
+unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     let menu = CreateMenu();
     let file = CreatePopupMenu();
     let edit = CreatePopupMenu();
+    let create = CreatePopupMenu();
     let view = CreatePopupMenu();
     let lighting = CreatePopupMenu();
+    let virtual_geometry = CreatePopupMenu();
+    let einstein = CreatePopupMenu();
     let build = CreatePopupMenu();
     let play = CreatePopupMenu();
     let help = CreatePopupMenu();
     if menu.is_null()
         || file.is_null()
         || edit.is_null()
+        || create.is_null()
         || view.is_null()
         || lighting.is_null()
+        || virtual_geometry.is_null()
+        || einstein.is_null()
         || build.is_null()
         || play.is_null()
         || help.is_null()
@@ -12576,10 +15215,10 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     if templates.is_null() {
         return Err("project template menu was not created".into());
     }
-    append(templates, ID_FILE_TEMPLATE_EMPTY, "Empty World");
-    append(templates, ID_FILE_TEMPLATE_TERRAIN, "Terrain World");
+    append(templates, ID_FILE_TEMPLATE_EMPTY, "Blank");
+    append(templates, ID_FILE_TEMPLATE_TERRAIN, "Landscape");
     append(templates, ID_FILE_TEMPLATE_THIRD, "Third Person");
-    append(templates, ID_FILE_TEMPLATE_FPS, "FPS");
+    append(templates, ID_FILE_TEMPLATE_FPS, "First Person");
     popup(file, templates, "New Project");
     append(file, ID_FILE_OPEN_PROJECT, "Open Project...");
     append(file, ID_FILE_CLOSE_PROJECT, "Close Project");
@@ -12596,7 +15235,16 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     popup(file, recent_levels, "Recent Levels");
     separator(file);
     append(file, ID_FILE_EXIT, "Exit");
-    append(edit, ID_EDIT_UNDO, "Undo Mesh Placement\tCtrl+Z");
+    append(edit, ID_EDIT_UNDO, "Undo\tCtrl+Z");
+    append(edit, ID_EDIT_REDO, "Redo\tCtrl+Y");
+    separator(edit);
+    append(edit, ID_EDIT_DUPLICATE, "Duplicate\tCtrl+D");
+    append(edit, ID_EDIT_DELETE, "Delete\tDel");
+    separator(edit);
+    append(edit, ID_EDIT_SELECT_ALL, "Select All\tCtrl+A");
+    append(edit, ID_EDIT_DESELECT, "Deselect All\tCtrl+Shift+A");
+    append(edit, ID_EDIT_INVERT, "Invert Selection");
+    append(create, ID_CREATE_BLOCK, "Block");
     append(view, ID_VIEW_OUTLINER, "World Outliner");
     append(view, ID_VIEW_CHARACTER, "Character Editor");
     append(view, ID_VIEW_LAND, "Land Mode");
@@ -12604,6 +15252,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     append(view, ID_VIEW_JOINTS, "Show Joints");
     append(view, ID_VIEW_ALL_JOINTS, "Show All Joints");
     append(view, ID_VIEW_JOINT_LIMITS, "Show Joint Limits");
+    append(view, ID_VIEW_MESH_PARTS, "Mesh Parts");
     append(view, ID_VIEW_INSPECTOR, "Inspector");
     append(view, ID_VIEW_CONTENT, "Content Browser");
     append(view, ID_VIEW_OUTPUT, "Output Log");
@@ -12628,9 +15277,29 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     append(view, ID_VIEW_MESHLET_OCCLUSION, "Occlusion Cull Meshlets");
     append(view, ID_VIEW_MESHLET_FREEZE, "Freeze Meshlet Visibility");
     append(view, ID_VIEW_MESHLET_HIGHLIGHT, "Highlight Cluster Under Cursor");
+    append(virtual_geometry, ID_VIEW_VG_NORMAL, "Normal");
+    append(virtual_geometry, ID_VIEW_LEAF_TRUTH, "Leaf Truth");
+    append(virtual_geometry, ID_VIEW_VG_FRUSTUM, "Frustum Only");
+    append(virtual_geometry, ID_VIEW_VG_HIER, "Hierarchy (no occlusion)");
+    append(virtual_geometry, ID_VIEW_VG_OCC, "Hierarchy + Occlusion");
+    popup(view, virtual_geometry, "Pipeline");
+    append(einstein, ID_VIEW_EINSTEIN_OFF, "None");
+    append(einstein, ID_VIEW_CUT_REASONS, "Cut Reasons");
+    append(einstein, ID_VIEW_VG_LEVELS, "Hierarchy Levels");
+    append(einstein, ID_VIEW_MICRO_ACTIVE, "Einstein Active Detail");
+    append(einstein, ID_VIEW_MICRO_ELIGIBLE, "Einstein Eligible Surfaces");
+    append(einstein, ID_VIEW_MICRO_ERROR, "Einstein LOD / Error");
+    append(einstein, ID_VIEW_MICRO_STATE, "Einstein State");
+    append(einstein, ID_VIEW_MICRO_REJECT, "Einstein Reject Reason");
+    append(einstein, ID_VIEW_EINSTEIN, "Einstein Detail Debug");
+    popup(view, einstein, "Visualization");
+    append(view, ID_VIEW_FREEZE_DIAGNOSTIC, "Freeze Diagnostic Frame");
+    append(view, ID_VIEW_COMPARE_LEAF, "Compare Against Leaf Truth");
+    append(view, ID_VIEW_RESET_DEBUG, "Reset Rendering Debug");
     append(view, ID_VIEW_CLUSTER_HIERARCHY, "Cluster Hierarchy");
-    append(view, ID_VIEW_EINSTEIN, "Einstein Detail Debug");
-    append(view, ID_VIEW_MICRO, "Procedural Microgeometry");
+    append(view, ID_VIEW_MICRO, "Microgeometry Auto");
+    append(view, ID_VIEW_MICRO_ON, "Microgeometry On");
+    append(view, ID_VIEW_MICRO_OFF, "Microgeometry Off");
     append(view, ID_VIEW_MICRO_COLOR, "Microtriangle Colors");
     append(view, ID_VIEW_ERROR_HALF, "Hierarchy Error 0.5 px");
     append(view, ID_VIEW_ERROR_ONE, "Hierarchy Error 1 px");
@@ -12688,6 +15357,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     append(help, ID_HELP_ABOUT, "About JARVIGEditor");
     popup(menu, file, "File");
     popup(menu, edit, "Edit");
+    popup(menu, create, "Create");
     popup(menu, view, "View");
     popup(menu, build, "Build");
     popup(menu, play, "Play");
@@ -12696,6 +15366,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     chrome::darken_menu(file);
     chrome::darken_menu(templates);
     chrome::darken_menu(edit);
+    chrome::darken_menu(create);
     chrome::darken_menu(view);
     chrome::darken_menu(lighting);
     chrome::darken_menu(build);
@@ -12704,7 +15375,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     if recent_projects.is_null() || recent_levels.is_null() {
         return Err("recent menus were not created".into());
     }
-    Ok((menu, view, lighting, recent_projects, recent_levels))
+    Ok((menu, edit, view, lighting, recent_projects, recent_levels))
 }
 
 unsafe fn separator(menu: HMENU) {
@@ -12788,7 +15459,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, message: u32, wparam: WPARAM,
             if let Some(editor) = editor {
                 let x = (lparam & 0xffff) as u16 as i16 as i32;
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-                let hot = editor.toolbar_icons.hit(editor.dpi, x, y);
+                let hot = editor.toolbar_icons.hit(editor.dpi, x, y, editor.modeling_tools_visible());
                 if editor.toolbar_hot != hot {
                     editor.toolbar_hot = hot;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -12809,7 +15480,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: HWND, message: u32, wparam: WPARAM,
             if let Some(editor) = editor {
                 let x = (lparam & 0xffff) as u16 as i16 as i32;
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-                if let Some(index) = editor.toolbar_icons.hit(editor.dpi, x, y) {
+                if let Some(index) = editor.toolbar_icons.hit(editor.dpi, x, y, editor.modeling_tools_visible()) {
                     editor.toolbar_click(index);
                 }
             }
@@ -13572,6 +16243,8 @@ unsafe extern "system" fn content_proc(hwnd: HWND, message: u32, wparam: WPARAM,
                     if let Err(error) = editor.open_character_document(&asset) {
                         editor.append(&error);
                     }
+                } else if asset.kind == "Player" {
+                    editor.describe_player_asset(&asset);
                 } else if asset.kind == "Prefab" {
                     editor.open_character_asset(&asset);
                 }

@@ -275,6 +275,7 @@ struct CaptureObject {
     pipeline: PipelineId,
     uniform: BufferId,
     group: BindGroupId,
+    vertex_stride: u32,
 }
 
 struct OpenCapture {
@@ -816,6 +817,7 @@ impl Renderer {
                     pipeline,
                     uniform,
                     group,
+                    vertex_stride: mesh.streams().first().map(|stream| stream.stride).unwrap_or(0),
                 });
             }
         }
@@ -876,7 +878,9 @@ impl Renderer {
                     material: object.material,
                     lights: Some(lights),
                     pipeline: object.pipeline,
+                    vertex_stride: object.vertex_stride,
                 },
+                false,
             )?;
         }
         encoder.end_render_pass().map_err(RenderError::Rhi)?;

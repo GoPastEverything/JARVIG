@@ -90,7 +90,7 @@ The order in a frame is: Win32 updates the key and gesture state, the controller
 
 The status bar shows `Perspective | N.N m/s` next to the selection. That is not a viewport overlay.
 
-The toolbar draws the navigation icons. Select, Translate, Rotate, and Scale are the tool group. Scale stays disabled. Translate and Rotate drag a gizmo. Level, Land, and Character follow that group. Focus frames the selection. Play is still not a session. The shell is Editor theme v1. See [theme.md](theme.md) and [gizmos.md](gizmos.md). Do not put the light Win32 face back.
+The toolbar draws an icon and a short caption for every button. Select, Move, Rotate, and Scale are the mesh tools. Move is the Translate caption. Scale stays disabled. Select picks. Translate and Rotate drag a gizmo. Block creates a parametric solid and is not a mode. Level, Land, and Character follow that group. Focus frames the selection. Play, Pause, and Stop run the in-editor session. The shell is Editor theme v1. See [theme.md](theme.md) and [gizmos.md](gizmos.md). Do not put the light Win32 face back.
 
 Tool keys do not take W, A, S, D, Q, or E. Those stay fly and vertical movement. With Perspective focused, no text caret, and no mouse capture, `1` is Select, `2` is Translate, `3` is Rotate, and `4` reports that scale is unavailable. During RMB, MMB, or orbit capture, Q and E stay camera down and up. A gizmo drag owns the mouse until release, Escape, focus loss, deactivate, hide, or shutdown. The camera does not look, pan, or orbit during that drag.
 

@@ -324,11 +324,28 @@ fn summarize(source_triangles: u32, meshlets: &[Meshlet], build_ms: f32, derived
     }
 }
 
+/// How the leaf clusters relate to the canonical index buffer.
+/// `missing_triangles == 0` and `duplicate_triangles == 0` means each source triangle appears once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshletCoverage {
+    pub canonical_triangles: u32,
+    pub leaf_triangles: u32,
+    pub leaf_meshlets: u32,
+    pub missing_triangles: u32,
+    pub duplicate_triangles: u32,
+}
+
 /// The clusters are the same oriented triangles as the source mesh. Order may differ.
 pub fn meshlets_cover_source(mesh: &Mesh, set: &MeshletSet) -> bool {
     if set.stats.source_triangles != mesh.index_count() / 3 {
         return false;
     }
+    let coverage = meshlet_coverage(mesh, set);
+    coverage.missing_triangles == 0 && coverage.duplicate_triangles == 0
+}
+
+/// Count leaf coverage of an imported mesh. This does not draw and does not open a project file.
+pub fn meshlet_coverage(mesh: &Mesh, set: &MeshletSet) -> MeshletCoverage {
     let mut source = Vec::new();
     for submesh in mesh.submeshes() {
         let mut cursor = 0u32;
@@ -339,27 +356,72 @@ pub fn meshlets_cover_source(mesh: &Mesh, set: &MeshletSet) -> bool {
             source.push(oriented(a, b, c));
         }
     }
-    let mut covered = Vec::with_capacity(source.len());
+    let canonical = source.len() as u32;
+    let mut covered = Vec::new();
+    let mut valid = true;
     for meshlet in &set.meshlets {
-        if meshlet.vertex_count > set.max_vertices || meshlet.index_count / 3 > set.max_triangles {
-            return false;
-        }
-        if meshlet.submesh as usize >= mesh.submeshes().len() {
-            return false;
+        if meshlet.vertex_count > set.max_vertices || meshlet.index_count / 3 > set.max_triangles || meshlet.submesh as usize >= mesh.submeshes().len() {
+            valid = false;
+            break;
         }
         let verts = set.vertex_indices.get(meshlet.vertex_offset as usize..meshlet.vertex_offset as usize + meshlet.vertex_count as usize);
         let locals = set.local_indices.get(meshlet.index_offset as usize..meshlet.index_offset as usize + meshlet.index_count as usize);
-        let (Some(verts), Some(locals)) = (verts, locals) else { return false };
+        let (Some(verts), Some(locals)) = (verts, locals) else {
+            valid = false;
+            break;
+        };
         for triangle in locals.chunks_exact(3) {
-            let Some(a) = verts.get(triangle[0] as usize).copied() else { return false };
-            let Some(b) = verts.get(triangle[1] as usize).copied() else { return false };
-            let Some(c) = verts.get(triangle[2] as usize).copied() else { return false };
+            let (Some(a), Some(b), Some(c)) = (
+                verts.get(triangle[0] as usize).copied(),
+                verts.get(triangle[1] as usize).copied(),
+                verts.get(triangle[2] as usize).copied(),
+            ) else {
+                valid = false;
+                break;
+            };
             covered.push(oriented(a, b, c));
         }
+        if !valid {
+            break;
+        }
     }
+    if !valid {
+        return MeshletCoverage {
+            canonical_triangles: canonical,
+            leaf_triangles: 0,
+            leaf_meshlets: set.meshlets.len() as u32,
+            missing_triangles: canonical.max(1),
+            duplicate_triangles: 0,
+        };
+    }
+    let leaf_triangles = covered.len() as u32;
     source.sort_unstable();
     covered.sort_unstable();
-    source == covered
+    let mut missing = 0u32;
+    let mut duplicate = 0u32;
+    let mut left = 0usize;
+    let mut right = 0usize;
+    while left < source.len() && right < covered.len() {
+        if source[left] < covered[right] {
+            missing = missing.saturating_add(1);
+            left += 1;
+        } else if covered[right] < source[left] {
+            duplicate = duplicate.saturating_add(1);
+            right += 1;
+        } else {
+            left += 1;
+            right += 1;
+        }
+    }
+    missing = missing.saturating_add((source.len() - left) as u32);
+    duplicate = duplicate.saturating_add((covered.len() - right) as u32);
+    MeshletCoverage {
+        canonical_triangles: canonical,
+        leaf_triangles,
+        leaf_meshlets: set.meshlets.len() as u32,
+        missing_triangles: missing,
+        duplicate_triangles: duplicate,
+    }
 }
 
 /// Expand clusters into parent-mesh indices, grouped by source submesh.
@@ -661,6 +723,13 @@ mod tests {
         assert!(set.stats.max_triangles <= MESHLET_MAX_TRIANGLES);
         assert!(set.stats.min_triangles >= 1);
         assert!(meshlets_cover_source(&mesh, &set));
+        // Library strip. An imported project mesh is not loaded here.
+        let coverage = meshlet_coverage(&mesh, &set);
+        assert_eq!(coverage.canonical_triangles, 300);
+        assert_eq!(coverage.leaf_triangles, coverage.canonical_triangles);
+        assert_eq!(coverage.missing_triangles, 0);
+        assert_eq!(coverage.duplicate_triangles, 0);
+        assert!(coverage.leaf_meshlets > 1);
         assert!(set.meshlets.iter().all(|meshlet| meshlet.sphere_radius.is_finite() && meshlet.cone_axis.iter().all(|lane| lane.is_finite())));
         let decoded = decode_meshlets(&encode_meshlets(&set)).unwrap();
         assert_eq!(decoded.stats.meshlet_count, set.stats.meshlet_count);
@@ -731,5 +800,26 @@ mod tests {
         assert_eq!(again.vertex_indices, clusters.vertex_indices);
         assert_eq!(again.local_indices, clusters.local_indices);
         assert_eq!(again.meshlets.len(), clusters.meshlets.len());
+    }
+
+    #[test]
+    fn a_box_surface_is_covered_by_the_existing_builder() {
+        let mesh = crate::box_mesh([2.0, 2.0, 2.0]);
+        let set = build_meshlets(&mesh);
+        let coverage = meshlet_coverage(&mesh, &set);
+        assert_eq!(coverage.canonical_triangles, 12);
+        assert_eq!(coverage.missing_triangles, 0);
+        assert_eq!(coverage.duplicate_triangles, 0);
+        assert_eq!(coverage.leaf_triangles, 12);
+        // The builder's minimum 8-cell grid splits each quad. One triangle per cluster. The grid is not retuned for the cube.
+        assert_eq!(coverage.leaf_meshlets, 12);
+        assert_eq!(set.stats.source_triangles, 12);
+        assert!(set.meshlets.iter().all(|meshlet| meshlet.index_count / 3 >= 1 && meshlet.cone_axis.iter().all(|lane| lane.is_finite())));
+        let records: Vec<crate::GpuMeshletRecord> = set.meshlets.iter().map(crate::GpuMeshletRecord::from_meshlet).collect();
+        let triangles: u32 = records.iter().map(|record| record.triangles).sum();
+        assert_eq!(triangles, 12);
+        let hierarchy = crate::build_cluster_hierarchy(&records);
+        assert_eq!(hierarchy.leaf_count as usize, records.len());
+        assert!(!hierarchy.roots.is_empty());
     }
 }

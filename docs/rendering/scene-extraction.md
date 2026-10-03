@@ -52,7 +52,7 @@ Insertion order is the draw order. There is no production sorter. Reversed-Z sti
 
 ## What it is not
 
-A snapshot is not saved, not edited by gameplay, and not a second authority. Replacing it next frame is the point. Dropping it does not destroy the logical mesh or the GPU buffers from JRV-0048. Scene presence, mesh lifetime, and residency are three different facts.
+A snapshot is not saved, not edited by gameplay, and not a second authority. Replacing it next frame is the point. Dropping it does not destroy the logical mesh or the GPU buffers from JRV-0048. Scene presence, mesh lifetime, and residency are three different facts. Replacing the world does release that world's residency, because `MeshId` starts again in the next world. ADR-0063. Play's runtime copy aliases the authored ids and does not take that path.
 
 The renderer must not keep a pointer into the live world. The snapshot owns its poses. The mesh library is borrowed for the call, only to upload a mesh the residency cache does not have yet.
 

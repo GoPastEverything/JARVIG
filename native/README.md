@@ -11,6 +11,7 @@ jarvig_platform      winit window and event loop
 jarvig_rhi_wgpu      the only crate that names wgpu
 jarvig_editor_host   transitional two-view renderer test
 jarvig_editor        JARVIGEditor.exe, the native editor shell
+jarvig_hub           JARVIG.exe, the project browser before the editor
 ```
 
 `pnpm lint` fails if another crate depends on `wgpu` or `winit`, or if Rust outside `jarvig_rhi_wgpu` names `wgpu::`.

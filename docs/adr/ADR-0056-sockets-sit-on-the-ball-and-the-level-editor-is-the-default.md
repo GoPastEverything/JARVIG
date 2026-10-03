@@ -1,6 +1,6 @@
 # ADR-0056 — Sockets sit on the ball, and the level editor is the default
 
-Status: Accepted. Partially superseded by ADR-0057: a joint-debug marker is a pick target only in the Character Editor.
+Status: Accepted. Partially superseded by ADR-0057: a joint-debug marker is a pick target only in the Character Editor. Partially superseded by ADR-0059: the Character Editor is not entered because the open level is joints plus world settings.
 Date: 2026-10-01
 
 ## Context

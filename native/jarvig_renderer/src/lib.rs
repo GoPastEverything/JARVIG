@@ -405,6 +405,10 @@ struct RenderView {
     depth_view: Option<TextureViewId>,
     /// Full target size. Not the viewport size. See `docs/rendering/views.md`.
     depth_size: Option<(u32, u32)>,
+    /// Leaf and parent draw classification for this camera. Not stored on the mesh.
+    cluster_flags: Vec<u32>,
+    parent_indices: Vec<u32>,
+    parent_key: u64,
 }
 
 struct InstanceBinding {
@@ -520,6 +524,9 @@ pub struct Renderer {
     shut_down: bool,
     overlay: Option<EditorOverlay>,
     overlay_gpu: Option<OverlayGpu>,
+    /// Depth-tested editor grid and axis triad. Not a scene object. `None` draws nothing.
+    reference: Option<EditorOverlay>,
+    reference_gpu: Option<OverlayGpu>,
     /// Editor surface grid. Not a scene object. `None` draws nothing.
     terrain_grid: Option<TerrainGridDesc>,
     terrain_grid_meshes: HashSet<MeshId>,
@@ -552,6 +559,8 @@ pub struct Renderer {
     einstein_group: Option<BindGroupId>,
     micro_enabled: bool,
     micro_surface: bool,
+    /// Exact parametric solid. Classification runs. No relief is built.
+    detail_exact: bool,
     micro_color: bool,
     micro_seed: u64,
     micro_live: Vec<MicroGpuChunk>,
@@ -573,9 +582,55 @@ pub struct Renderer {
     micro_index_count: u32,
     micro_fingerprint: u64,
     micro_input_key: u64,
+    micro_debug: jarvig_core::MicroDebugMode,
+    micro_compatible: bool,
+    micro_reasons: Vec<jarvig_core::DetailReject>,
+    micro_projected: Vec<f32>,
+    micro_desired_patches: u32,
+    micro_missing: u32,
+    micro_eligible_visible: u32,
+    micro_detail_requested: u32,
+    micro_unsupported: u32,
+    micro_unclassified: u32,
+    micro_states: Vec<jarvig_core::DetailLifecycle>,
+    micro_still_frames: u32,
+    micro_coverage_prev_key: u64,
+    micro_class_shader: Option<ShaderModuleId>,
+    micro_class_pipeline: Option<PipelineId>,
+    micro_parent_pipeline: Option<PipelineId>,
+    micro_parent_solid: Option<PipelineId>,
+    diagnostic_draw_shader: Option<ShaderModuleId>,
+    diagnostic_draw_layout: Option<BindGroupLayoutId>,
+    diagnostic_draw_uniform: Option<BufferId>,
+    diagnostic_draw_group: Option<BindGroupId>,
+    diagnostic_draw_pipelines: Vec<(u64, bool, PipelineId)>,
+    diagnostic_base_capacity: usize,
+    diagnostic_run_cursor: u32,
+    /// One uniform per debug color. Queue writes are not ordered inside a pass, so colors cannot share a buffer.
+    micro_class_colors: Vec<(u64, BufferId, BindGroupId)>,
     micro_color_pipeline: Option<PipelineId>,
     micro_color_shader: Option<ShaderModuleId>,
+    diagnostic_freeze: bool,
+    diagnostic_reused: bool,
+    diagnostic_frozen: Option<FrozenDiagnostic>,
     gpu_scene: GpuSceneState,
+}
+
+#[derive(Clone)]
+struct FrozenDiagnostic {
+    pipeline: jarvig_core::GeometryDiagnostic,
+    flags: Vec<u32>,
+    parent_indices: Vec<u32>,
+    parent_key: u64,
+    coarseness: Vec<u32>,
+    submitted: u32,
+    frustum_rejected: u32,
+    occlusion_rejected: u32,
+    conservative: u32,
+    triangles: u32,
+    parents: u32,
+    leaves: u32,
+    hierarchy: bool,
 }
 
 struct GpuSceneState {
@@ -598,6 +653,13 @@ struct GpuSceneState {
     frozen_cut: bool,
     hierarchy_error_px: f32,
     debug_flags: Vec<u32>,
+    /// Parent-mesh indices for the view most recently culled. Each view keeps its own copy.
+    parent_indices: Vec<u32>,
+    parent_key: u64,
+    /// Leaf Truth is the leaf-only diagnostic. The other diagnostics live beside it.
+    leaf_truth: bool,
+    diagnostic: jarvig_core::GeometryDiagnostic,
+    visualization: jarvig_core::DiagnosticVisualization,
 }
 
 struct ParentChunk {
@@ -626,6 +688,25 @@ struct ParentGpu {
     frame_key: u64,
     shader: ShaderModuleId,
     pipeline: Option<PipelineId>,
+    /// Cull used when `pipeline` was created. `true` keeps both sides.
+    color_two_sided: bool,
+    /// Parallel to `hierarchy.nodes`. False expands that parent back to leaves.
+    draw_ok: Vec<bool>,
+    /// Object-local positions for the coverage compare. Empty when the mesh is over the keep cap.
+    positions: Vec<[f32; 3]>,
+    positions_retained: bool,
+}
+
+/// CPU parent triangles for Compare Against Leaf Truth. Not a GPU readback.
+pub struct ParentCoverageSource<'a> {
+    pub mesh: MeshId,
+    pub positions: &'a [[f32; 3]],
+    pub indices: &'a [u32],
+    pub ranges: &'a [jarvig_core::ParentRange],
+    pub hierarchy: &'a jarvig_core::ClusterHierarchy,
+    pub draw_ok: &'a [bool],
+    pub leaf_counts: &'a [u32],
+    pub positions_retained: bool,
 }
 
 /// What the last view uploaded. Meshlet bytes stay resident until the mesh set changes.
@@ -676,6 +757,9 @@ pub struct GpuSceneFrameStats {
     pub gpu_frame_measured: bool,
     pub hierarchy_root_triangles: u32,
     pub hierarchy_empty_parents: u32,
+    pub hierarchy_candidates: u32,
+    pub hz_width: u32,
+    pub hz_height: u32,
     pub einstein_debug_draws: u32,
     pub micro_patches: u32,
     pub micro_samples: u32,
@@ -696,6 +780,60 @@ pub struct GpuSceneFrameStats {
     pub micro_publish_us: u32,
     /// Increments only if a draw would have shown an incomplete patch set. Stays 0 when publication is atomic.
     pub micro_partial: u32,
+    /// Eligible clusters the current view wants built.
+    pub micro_desired_patches: u32,
+    /// Desired clusters that are not in the published set. Zero once the stopped view has converged.
+    pub micro_missing: u32,
+    /// Drawn clusters (flag 1 or 4). This is the Einstein denominator.
+    pub micro_eligible_visible: u32,
+    /// Selected for generation. Not the published patch count.
+    pub micro_detail_requested: u32,
+    /// Requested clusters whose patch is in the published set.
+    pub micro_detail_ready: u32,
+    /// Patches currently published.
+    pub micro_detail_published: u32,
+    /// Drawn clusters that cannot take detail.
+    pub micro_unsupported: u32,
+    /// Drawn clusters outside the four detail buckets. Acceptance is zero.
+    pub micro_unclassified: u32,
+    /// Visible clusters under the 1 px feature gate.
+    pub micro_below: u32,
+    /// Exact parametric clusters. They are classified and build no patch.
+    pub micro_exact: u32,
+    pub micro_occluded: u32,
+    pub micro_offscreen: u32,
+    /// Leaves replaced by a parent in this view.
+    pub micro_replaced: u32,
+    pub micro_budget_rejected: u32,
+    pub micro_no_anchor: u32,
+    pub micro_incompatible: u32,
+    /// Largest 2 cm feature among clusters this view is drawing, in thousandths of a pixel.
+    pub micro_near_px_milli: u32,
+    /// Visible clusters that clear the 1 px gate. Below-threshold and parent shells are outside this.
+    pub micro_visible_eligible: u32,
+    pub micro_coverage_requested: u32,
+    pub micro_coverage_generating: u32,
+    pub micro_coverage_ready: u32,
+    pub micro_coverage_published: u32,
+    pub micro_coverage_drawn: u32,
+    pub micro_coverage_rejected: u32,
+    pub micro_coverage_pending: u32,
+    pub micro_coverage_unclassified: u32,
+    pub micro_requested_hash: u64,
+    pub micro_ready_hash: u64,
+    pub micro_published_hash: u64,
+    pub micro_drawn_hash: u64,
+    pub micro_camera_stable: bool,
+    pub micro_pipeline_settled: bool,
+    /// Triangles submitted by the ordinary index buffer this frame.
+    pub legacy_draw_triangles: u32,
+    /// Triangles submitted by the leaf meshlet cut this frame.
+    pub meshlet_draw_triangles: u32,
+    /// Triangles submitted by selected parent meshes this frame.
+    pub parent_draw_triangles: u32,
+    /// Leaves under the cut that no drawn parent and no submitted leaf represents.
+    pub hierarchy_uncovered_leaves: u32,
+    pub leaf_truth: bool,
 }
 
 const MICRO_CHUNK_VERTEX_BYTES: usize = 256 * 1024;
@@ -738,8 +876,8 @@ struct MeshletGpu {
     color_group: BindGroupId,
     color_layout: BindGroupLayoutId,
     shader: ShaderModuleId,
-    pipelines: Vec<(u64, PipelineId)>,
-    occluded_pipelines: Vec<(u64, PipelineId)>,
+    pipelines: Vec<(u64, bool, PipelineId)>,
+    occluded_pipelines: Vec<(u64, bool, PipelineId)>,
     ranges: Vec<(u32, u32)>,
     spans: Vec<(u32, u32)>,
     span_source: Vec<u32>,
@@ -824,6 +962,13 @@ struct PreparedDraw {
     material: BindGroupId,
     lights: Option<BindGroupId>,
     pipeline: PipelineId,
+    vertex_stride: u32,
+}
+
+enum PreparedCut {
+    Material,
+    HiddenSubmesh,
+    Clustered { indices: BufferId, runs: Vec<(u32, u32)>, parent_draw: bool },
 }
 
 struct ViewLightPacket {
@@ -1186,6 +1331,13 @@ fn vs(@location(0) position: vec3<f32>) -> MeshletOut {
 fn fs(@builtin(primitive_index) triangle: u32) -> @location(0) vec4<f32> {
     let flag = visible[owners[triangle]];
     if (flag == 6u) { discard; }
+    if (flag == 7u) {
+        let packed = colors[triangle];
+        let red = f32(packed & 0xFFu) / 255.0;
+        let green = f32((packed >> 8u) & 0xFFu) / 255.0;
+        let blue = f32((packed >> 16u) & 0xFFu) / 255.0;
+        return vec4<f32>(red, green, blue, 1.0);
+    }
     if (flag >= 16u) {
         let level = flag - 16u;
         let warm = f32(min(level, 8u)) / 8.0;
@@ -1196,6 +1348,7 @@ fn fs(@builtin(primitive_index) triangle: u32) -> @location(0) vec4<f32> {
     if (flag == 4u) { return vec4<f32>(0.95, 0.78, 0.20, 1.0); }
     if (flag == 3u) { return vec4<f32>(0.20, 0.45, 0.95, 1.0); }
     if (flag == 0u) { return vec4<f32>(0.90, 0.16, 0.14, 1.0); }
+    if (flag == 2u) { return vec4<f32>(1.0, 0.15, 0.85, 1.0); }
     let packed = colors[triangle];
     let red = f32(packed & 0xFFu) / 255.0;
     let green = f32((packed >> 8u) & 0xFFu) / 255.0;
@@ -1211,6 +1364,60 @@ fn fs_occluded(@builtin(position) pixel: vec4<f32>, @builtin(primitive_index) tr
         discard;
     }
     return vec4<f32>(0.20, 0.45, 0.95, 1.0);
+}
+"#;
+
+const DIAGNOSTIC_COLOR_SHADER: &str = r#"
+struct RenderUniforms {
+    projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    model: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> render: RenderUniforms;
+@group(1) @binding(0) var<storage, read> colors: array<u32>;
+@group(1) @binding(1) var<storage, read> owners: array<u32>;
+@group(1) @binding(2) var<storage, read> visible: array<u32>;
+@group(2) @binding(0) var<storage, read> triangle_bases: array<u32>;
+struct MeshletOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) @interpolate(flat) run: u32,
+}
+@vertex
+fn vs(@location(0) position: vec3<f32>, @builtin(instance_index) run: u32) -> MeshletOut {
+    var out: MeshletOut;
+    out.clip = render.projection * render.view * render.model * vec4<f32>(position, 1.0);
+    out.run = run;
+    return out;
+}
+fn unpack(flag: u32) -> vec3<f32> {
+    let red = f32(flag & 0xFFu) / 255.0;
+    let green = f32((flag >> 8u) & 0xFFu) / 255.0;
+    let blue = f32((flag >> 16u) & 0xFFu) / 255.0;
+    return vec3<f32>(red, green, blue);
+}
+@fragment
+fn fs(in: MeshletOut, @builtin(primitive_index) local_triangle: u32) -> @location(0) vec4<f32> {
+    let triangle = triangle_bases[in.run] + local_triangle;
+    let flag = visible[owners[triangle]];
+    if (flag == 6u) { discard; }
+    if (flag >= 256u) {
+        return vec4<f32>(unpack(flag - 256u), 1.0);
+    }
+    if (flag == 7u) {
+        return vec4<f32>(unpack(colors[triangle]), 1.0);
+    }
+    if (flag >= 16u) {
+        let level = flag - 16u;
+        let warm = f32(min(level, 8u)) / 8.0;
+        return vec4<f32>(warm, 0.85 - warm * 0.45, 1.0 - warm, 1.0);
+    }
+    if (flag == 5u) { return vec4<f32>(1.0, 0.15, 0.85, 1.0); }
+    if (flag == 1u) { return vec4<f32>(0.15, 0.85, 0.25, 1.0); }
+    if (flag == 4u) { return vec4<f32>(0.95, 0.78, 0.20, 1.0); }
+    if (flag == 3u) { return vec4<f32>(0.20, 0.45, 0.95, 1.0); }
+    if (flag == 0u) { return vec4<f32>(0.90, 0.16, 0.14, 1.0); }
+    if (flag == 2u) { return vec4<f32>(1.0, 0.15, 0.85, 1.0); }
+    return vec4<f32>(unpack(colors[triangle]), 1.0);
 }
 "#;
 
@@ -1410,6 +1617,8 @@ impl Renderer {
             shut_down: false,
             overlay: None,
             overlay_gpu: None,
+            reference: None,
+            reference_gpu: None,
             terrain_grid: None,
             terrain_grid_meshes: HashSet::new(),
             entity_hidden: HashSet::new(),
@@ -1439,6 +1648,7 @@ impl Renderer {
             einstein_group: None,
             micro_enabled: false,
             micro_surface: true,
+            detail_exact: false,
             micro_color: false,
             micro_seed: 1,
             micro_live: Vec::new(),
@@ -1460,8 +1670,36 @@ impl Renderer {
             micro_index_count: 0,
             micro_fingerprint: 0,
             micro_input_key: 0,
+            micro_debug: jarvig_core::MicroDebugMode::Off,
+            micro_compatible: true,
+            micro_reasons: Vec::new(),
+            micro_projected: Vec::new(),
+            micro_desired_patches: 0,
+            micro_missing: 0,
+            micro_eligible_visible: 0,
+            micro_detail_requested: 0,
+            micro_unsupported: 0,
+            micro_unclassified: 0,
+            micro_states: Vec::new(),
+            micro_still_frames: 0,
+            micro_coverage_prev_key: 0,
+            micro_class_shader: None,
+            micro_class_pipeline: None,
+            micro_parent_pipeline: None,
+            micro_parent_solid: None,
+            diagnostic_draw_shader: None,
+            diagnostic_draw_layout: None,
+            diagnostic_draw_uniform: None,
+            diagnostic_draw_group: None,
+            diagnostic_draw_pipelines: Vec::new(),
+            diagnostic_base_capacity: 0,
+            diagnostic_run_cursor: 0,
+            micro_class_colors: Vec::new(),
             micro_color_pipeline: None,
             micro_color_shader: None,
+            diagnostic_freeze: false,
+            diagnostic_reused: false,
+            diagnostic_frozen: None,
             gpu_scene: GpuSceneState {
                 remembered: Vec::new(),
                 instances: None,
@@ -1476,12 +1714,17 @@ impl Renderer {
                 frozen_flags: Vec::new(),
                 frozen_stats: None,
                 highlight: None,
-                hierarchy: false,
+                hierarchy: true,
                 hierarchy_key: 0,
                 hierarchy_nodes: None,
                 frozen_cut: false,
                 hierarchy_error_px: 1.0,
                 debug_flags: Vec::new(),
+                parent_indices: Vec::new(),
+                parent_key: 0,
+                leaf_truth: false,
+                diagnostic: jarvig_core::GeometryDiagnostic::Normal,
+                visualization: jarvig_core::DiagnosticVisualization::None,
             },
         }
     }
@@ -1500,11 +1743,57 @@ impl Renderer {
 
     pub fn gpu_scene_stats(&self) -> GpuSceneFrameStats {
         let mut stats = self.gpu_scene.stats;
-        stats.frustum = self.gpu_scene.frustum;
-        stats.occlusion = self.gpu_scene.occlusion;
+        stats.frustum = self.visibility_frustum();
+        stats.occlusion = self.gpu_scene.diagnostic.occlusion(self.gpu_scene.occlusion);
         stats.frozen = self.gpu_scene.freeze;
-        stats.hierarchy = self.gpu_scene.hierarchy;
+        stats.hierarchy = self.visibility_parents();
+        stats.leaf_truth = self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::LeafTruth;
         stats
+    }
+
+    pub fn set_geometry_diagnostic(&mut self, mode: jarvig_core::GeometryDiagnostic) {
+        let changed = self.gpu_scene.diagnostic != mode;
+        self.gpu_scene.diagnostic = mode;
+        self.gpu_scene.leaf_truth = mode == jarvig_core::GeometryDiagnostic::LeafTruth;
+        if changed {
+            self.diagnostic_frozen = None;
+            self.diagnostic_reused = false;
+            if mode != jarvig_core::GeometryDiagnostic::LeafTruth {
+                self.gpu_scene.frozen_cut = false;
+            }
+        }
+    }
+
+    pub fn set_diagnostic_visualization(&mut self, mode: jarvig_core::DiagnosticVisualization) {
+        self.gpu_scene.visualization = mode;
+    }
+
+    pub fn set_diagnostic_freeze(&mut self, enabled: bool) {
+        self.diagnostic_freeze = enabled;
+        if !enabled {
+            self.diagnostic_frozen = None;
+            self.diagnostic_reused = false;
+        }
+    }
+
+    pub fn set_leaf_truth(&mut self, enabled: bool) {
+        if enabled {
+            self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::LeafTruth);
+        } else if self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::LeafTruth {
+            self.set_geometry_diagnostic(jarvig_core::GeometryDiagnostic::Normal);
+        }
+    }
+
+    fn visibility_frustum(&self) -> bool {
+        self.gpu_scene.diagnostic.frustum(self.gpu_scene.frustum)
+    }
+
+    fn visibility_occlusion(&self) -> bool {
+        self.visibility_frustum() && self.gpu_scene.diagnostic.occlusion(self.gpu_scene.occlusion)
+    }
+
+    fn visibility_parents(&self) -> bool {
+        self.gpu_scene.diagnostic.parents(self.gpu_scene.hierarchy)
     }
 
     pub fn set_meshlet_frustum(&mut self, enabled: bool) {
@@ -1529,6 +1818,18 @@ impl Renderer {
 
     pub fn set_micro_surface(&mut self, surface: bool) {
         self.micro_surface = surface;
+    }
+
+    pub fn set_detail_exact(&mut self, exact: bool) {
+        self.detail_exact = exact;
+    }
+
+    pub fn set_micro_debug(&mut self, mode: jarvig_core::MicroDebugMode) {
+        self.micro_debug = mode;
+    }
+
+    pub fn set_micro_compatible(&mut self, compatible: bool) {
+        self.micro_compatible = compatible;
     }
 
     pub fn set_microgeometry(&mut self, enabled: bool, seed: u64, color: bool) {
@@ -1597,6 +1898,7 @@ impl Renderer {
             self.gpu_scene.stats.hierarchy_upload_us = 0;
             self.gpu_scene.stats.hierarchy_upload_bytes = 0;
             self.gpu_scene.stats.hierarchy_covered_leaves = 0;
+            self.gpu_scene.stats.hierarchy_uncovered_leaves = 0;
         }
     }
 
@@ -1689,7 +1991,26 @@ impl Renderer {
                 frame_count: 0,
             });
         }
+        let draw_ok = jarvig_core::drawable_parent_mask(&geometry);
+        let vertex_count = geometry.vertices.len() / 60;
+        let positions_retained = vertex_count <= jarvig_core::PARENT_POSITION_KEEP;
+        let positions = if positions_retained {
+            geometry
+                .vertices
+                .chunks_exact(60)
+                .map(|chunk| {
+                    [
+                        f32::from_le_bytes(chunk[0..4].try_into().unwrap_or([0; 4])),
+                        f32::from_le_bytes(chunk[4..8].try_into().unwrap_or([0; 4])),
+                        f32::from_le_bytes(chunk[8..12].try_into().unwrap_or([0; 4])),
+                    ]
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let cpu_bytes = (geometry.hierarchy.nodes.len() * std::mem::size_of::<jarvig_core::ClusterNode>()
+            + positions.len() * std::mem::size_of::<[f32; 3]>()
             + geometry.hierarchy.roots.len() * std::mem::size_of::<u32>()
             + geometry.ranges.len() * std::mem::size_of::<jarvig_core::ParentRange>()
             + geometry.leaf_counts.len() * std::mem::size_of::<u32>()
@@ -1713,8 +2034,27 @@ impl Renderer {
             frame_key: 0,
             shader,
             pipeline: None,
+            color_two_sided: false,
+            draw_ok,
+            positions,
+            positions_retained,
         });
         Ok(())
+    }
+
+    /// Positions kept beside the upload so a coverage compare can raster parent triangles.
+    pub fn parent_coverage_source(&self) -> Option<ParentCoverageSource<'_>> {
+        let gpu = self.parent_gpu.as_ref()?;
+        Some(ParentCoverageSource {
+            mesh: gpu.mesh,
+            positions: &gpu.positions,
+            indices: &gpu.indices,
+            ranges: &gpu.ranges,
+            hierarchy: &gpu.hierarchy,
+            draw_ok: &gpu.draw_ok,
+            leaf_counts: &gpu.leaf_counts,
+            positions_retained: gpu.positions_retained,
+        })
     }
 
     fn destroy_parent_chunks(&mut self, chunks: &[ParentChunk]) -> Result<(), RenderError> {
@@ -1805,6 +2145,32 @@ impl Renderer {
         Ok(())
     }
 
+    fn store_view_cut(&mut self, id: RenderViewId) {
+        let flags = self.gpu_scene.debug_flags.clone();
+        let indices = self.gpu_scene.parent_indices.clone();
+        let key = self.gpu_scene.parent_key;
+        if let Ok(view) = self.slot_mut(id) {
+            view.cluster_flags = flags;
+            view.parent_indices = indices;
+            view.parent_key = key;
+        }
+    }
+
+    /// Put this camera's cluster cut back before its draw. Another view's cut is not reused.
+    fn apply_view_cut(&mut self, id: RenderViewId) -> Result<(), RenderError> {
+        let (flags, indices, key) = {
+            let view = self.slot(id)?;
+            (view.cluster_flags.clone(), view.parent_indices.clone(), view.parent_key)
+        };
+        if !flags.is_empty() {
+            self.gpu_scene.debug_flags = flags;
+        }
+        if self.visibility_parents() && self.parent_gpu.is_some() {
+            self.replace_parent_frame(key, &indices)?;
+        }
+        Ok(())
+    }
+
     fn cull_frame(
         &mut self,
         snapshot: &jarvig_core::RenderSceneSnapshot,
@@ -1813,6 +2179,12 @@ impl Renderer {
         near: f32,
         aspect: f32,
     ) -> Result<(), RenderError> {
+        if self.restore_frozen_diagnostic()? {
+            return Ok(());
+        }
+        self.diagnostic_reused = false;
+        self.gpu_scene.parent_indices.clear();
+        self.gpu_scene.parent_key = 0;
         let cull = {
             let lookups: Vec<jarvig_core::GpuSceneGeometry<'_>> = snapshot
                 .instances()
@@ -1822,8 +2194,11 @@ impl Renderer {
                     meshlets: self.gpu_scene.remembered.iter().find(|(id, _)| *id == instance.mesh).map(|(_, records)| records.as_slice()).unwrap_or(&[]),
                 })
                 .collect();
-            let frustum = jarvig_core::frustum_cull_meshlets(snapshot.instances(), camera, fov, near, aspect, &lookups, self.gpu_scene.frustum).map_err(RenderError::Space)?;
-            let occlusion = jarvig_core::occlusion_cull_meshlets(
+            let frustum_on = self.visibility_frustum();
+            let occlusion_on = self.visibility_occlusion();
+            let frustum = jarvig_core::frustum_cull_meshlets(snapshot.instances(), camera, fov, near, aspect, &lookups, frustum_on).map_err(RenderError::Space)?;
+            let (hz_width, hz_height) = jarvig_core::hierarchical_depth_extent(self.width, self.height);
+            let occlusion = jarvig_core::hierarchical_occlusion_cull(
                 snapshot.instances(),
                 camera,
                 fov,
@@ -1831,12 +2206,16 @@ impl Renderer {
                 aspect,
                 &lookups,
                 &frustum,
-                self.gpu_scene.frustum && self.gpu_scene.occlusion,
+                occlusion_on,
+                self.width,
+                self.height,
             )
             .map_err(RenderError::Space)?;
-            (frustum, occlusion)
+            (frustum, occlusion, hz_width, hz_height)
         };
-        let (frustum, occlusion) = cull;
+        let (frustum, occlusion, hz_width, hz_height) = cull;
+        self.gpu_scene.stats.hz_width = hz_width;
+        self.gpu_scene.stats.hz_height = hz_height;
         self.gpu_scene.stats.meshlets_submitted = occlusion.submitted;
         self.gpu_scene.stats.meshlets_rejected = occlusion.frustum_rejected;
         self.gpu_scene.stats.occlusion_rejected = occlusion.occlusion_rejected;
@@ -1845,8 +2224,8 @@ impl Renderer {
         self.gpu_scene.stats.instances_visible = frustum.instances_visible;
         self.gpu_scene.stats.cull_us = frustum.cpu_us.saturating_add(occlusion.cpu_us);
         self.gpu_scene.stats.occlusion_us = occlusion.cpu_us;
-        self.gpu_scene.stats.frustum = self.gpu_scene.frustum;
-        self.gpu_scene.stats.occlusion = self.gpu_scene.occlusion;
+        self.gpu_scene.stats.frustum = self.visibility_frustum();
+        self.gpu_scene.stats.occlusion = self.gpu_scene.diagnostic.occlusion(self.gpu_scene.occlusion);
         let debug_mesh = self.meshlet_gpu.as_ref().map(|gpu| (gpu.mesh, gpu.span_source.clone(), gpu.visible));
         let Some((mesh, span_source, visible)) = debug_mesh else {
             self.gpu_scene.debug_flags.clear();
@@ -1866,13 +2245,17 @@ impl Renderer {
             break;
         }
         let mut draw_flags = vec![2u32; span_source.len().max(1)];
-        if self.gpu_scene.frustum {
+        if self.visibility_frustum() {
             for (draw_index, source) in span_source.iter().enumerate() {
                 draw_flags[draw_index] = source_flags.get(*source as usize).copied().unwrap_or(0);
             }
         }
-        let parent_ready = self.gpu_scene.hierarchy && self.parent_gpu.as_ref().map(|gpu| gpu.mesh == mesh).unwrap_or(false);
-        let reuse_frozen_cut = parent_ready && self.gpu_scene.freeze && self.gpu_scene.frozen_cut && self.gpu_scene.frozen_flags.len() == draw_flags.len();
+        let parent_ready = self.visibility_parents() && self.parent_gpu.as_ref().map(|gpu| gpu.mesh == mesh).unwrap_or(false);
+        let reuse_frozen_cut = self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::Normal
+            && parent_ready
+            && self.gpu_scene.freeze
+            && self.gpu_scene.frozen_cut
+            && self.gpu_scene.frozen_flags.len() == draw_flags.len();
         if reuse_frozen_cut {
             draw_flags = self.gpu_scene.frozen_flags.clone();
             if let Some(stats) = self.gpu_scene.frozen_stats {
@@ -1912,8 +2295,11 @@ impl Renderer {
             self.gpu_scene.stats.hierarchy_upload_bytes = 0;
             self.gpu_scene.stats.hierarchy_draw_prepare_us = 0;
             self.gpu_scene.stats.hierarchy_covered_leaves = 0;
+            self.gpu_scene.stats.hierarchy_uncovered_leaves = 0;
         }
-        let coarseness = if reuse_frozen_cut {
+        let coarseness = if !self.visibility_parents() {
+            Vec::new()
+        } else if reuse_frozen_cut {
             Vec::new()
         } else if parent_ready {
             self.submit_parent_cut(snapshot, camera, fov, near, aspect, &span_source, &mut draw_flags)?;
@@ -1923,7 +2309,7 @@ impl Renderer {
                 self.gpu_scene.frozen_cut = true;
             }
             Vec::new()
-        } else if self.gpu_scene.hierarchy {
+        } else if self.visibility_parents() {
             let records = self.gpu_scene.remembered.iter().find(|(id, _)| *id == mesh).map(|(_, records)| records.clone()).unwrap_or_default();
             let key = mesh.0 ^ ((records.len() as u64) << 32);
             if self.gpu_scene.hierarchy_key != key || self.gpu_scene.hierarchy_nodes.is_none() {
@@ -1931,14 +2317,43 @@ impl Renderer {
                 self.gpu_scene.hierarchy_key = key;
             }
             let node_count = self.gpu_scene.hierarchy_nodes.as_ref().map(|hierarchy| hierarchy.nodes.len() as u32).unwrap_or(0);
+            let leaf_count = records.len();
+            let mut leaf_flags = vec![1u32; leaf_count];
+            if self.visibility_frustum() {
+                leaf_flags.fill(0);
+                for (draw_index, source) in span_source.iter().enumerate() {
+                    if let Some(slot) = leaf_flags.get_mut(*source as usize) {
+                        *slot = draw_flags.get(draw_index).copied().unwrap_or(0);
+                    }
+                }
+            }
+            let triangles: Vec<u32> = records.iter().map(|record| record.triangles).collect();
             let cut = self.gpu_scene.hierarchy_nodes.as_ref().and_then(|hierarchy| {
                 snapshot.instances().iter().find(|instance| instance.mesh == mesh).and_then(|instance| {
-                    jarvig_core::select_cluster_cut_for_pose(hierarchy, instance, camera, fov, near, aspect, self.height as f32, self.gpu_scene.hierarchy_error_px).ok()
+                    jarvig_core::cut_visible_hierarchy_for_pose(
+                        hierarchy,
+                        instance,
+                        camera,
+                        fov,
+                        near,
+                        aspect,
+                        self.height as f32,
+                        self.gpu_scene.hierarchy_error_px,
+                        &leaf_flags,
+                        &triangles,
+                    )
+                    .ok()
                 })
             });
             if let Some(cut) = cut {
+                self.gpu_scene.stats.hierarchy = true;
                 self.gpu_scene.stats.hierarchy_cut = cut.selected.len() as u32;
                 self.gpu_scene.stats.hierarchy_nodes = node_count;
+                self.gpu_scene.stats.hierarchy_leaves = cut.leaf_clusters;
+                self.gpu_scene.stats.hierarchy_parents = cut.parent_clusters;
+                self.gpu_scene.stats.hierarchy_candidates = cut.candidate_nodes;
+                self.gpu_scene.stats.hierarchy_select_us = cut.selection_us;
+                self.gpu_scene.stats.hierarchy_covered_leaves = cut.covered_leaves;
                 cut.coarseness
             } else {
                 Vec::new()
@@ -1947,13 +2362,90 @@ impl Renderer {
             Vec::new()
         };
         let prepare_started = std::time::Instant::now();
+        if self.gpu_scene.diagnostic.identity_colors() {
+            draw_flags = jarvig_core::stage_leaf_flags(self.gpu_scene.diagnostic, &draw_flags);
+            self.gpu_scene.parent_indices.clear();
+            self.gpu_scene.parent_key = 0;
+            self.gpu_scene.stats.hierarchy_parents = 0;
+            self.gpu_scene.stats.hierarchy_lod_triangles = 0;
+            self.gpu_scene.stats.hierarchy_uncovered_leaves = 0;
+            self.replace_parent_frame(0, &[])?;
+        }
+        self.gpu_scene.stats.leaf_truth = self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::LeafTruth;
+        if self.diagnostic_freeze {
+            self.diagnostic_frozen = Some(FrozenDiagnostic {
+                pipeline: self.gpu_scene.diagnostic,
+                flags: draw_flags.clone(),
+                parent_indices: self.gpu_scene.parent_indices.clone(),
+                parent_key: self.gpu_scene.parent_key,
+                coarseness: coarseness.clone(),
+                submitted: self.gpu_scene.stats.meshlets_submitted,
+                frustum_rejected: self.gpu_scene.stats.meshlets_rejected,
+                occlusion_rejected: self.gpu_scene.stats.occlusion_rejected,
+                conservative: self.gpu_scene.stats.conservative_visible,
+                triangles: self.gpu_scene.stats.triangles_submitted,
+                parents: self.gpu_scene.stats.hierarchy_parents,
+                leaves: self.gpu_scene.stats.hierarchy_leaves,
+                hierarchy: self.gpu_scene.stats.hierarchy,
+            });
+        }
+        self.paint_diagnostic_colors(&span_source, visible, draw_flags, &coarseness, parent_ready)?;
+        self.gpu_scene.stats.hierarchy_draw_prepare_us = prepare_started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        Ok(())
+    }
+
+    /// Reuse the captured submission. Visualization may recolor it and does not run the cull again.
+    fn restore_frozen_diagnostic(&mut self) -> Result<bool, RenderError> {
+        if !self.diagnostic_freeze {
+            return Ok(false);
+        }
+        let Some(frozen) = self.diagnostic_frozen.clone() else { return Ok(false) };
+        let Some(gpu) = self.meshlet_gpu.as_ref() else { return Ok(false) };
+        let span_len = gpu.span_source.len().max(1);
+        if !jarvig_core::diagnostic_frame_is_reusable(true, Some(frozen.pipeline), frozen.flags.len(), self.gpu_scene.diagnostic, span_len) {
+            return Ok(false);
+        }
+        let span_source = gpu.span_source.clone();
+        let visible = gpu.visible;
+        let parents = frozen.parents > 0;
+        self.gpu_scene.stats.meshlets_submitted = frozen.submitted;
+        self.gpu_scene.stats.meshlets_rejected = frozen.frustum_rejected;
+        self.gpu_scene.stats.occlusion_rejected = frozen.occlusion_rejected;
+        self.gpu_scene.stats.conservative_visible = frozen.conservative;
+        self.gpu_scene.stats.triangles_submitted = frozen.triangles;
+        self.gpu_scene.stats.hierarchy_parents = frozen.parents;
+        self.gpu_scene.stats.hierarchy_leaves = frozen.leaves;
+        self.gpu_scene.stats.hierarchy = frozen.hierarchy;
+        self.gpu_scene.stats.frustum = self.visibility_frustum();
+        self.gpu_scene.stats.occlusion = self.gpu_scene.diagnostic.occlusion(self.gpu_scene.occlusion);
+        self.gpu_scene.stats.leaf_truth = self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::LeafTruth;
+        self.gpu_scene.parent_indices = frozen.parent_indices.clone();
+        self.gpu_scene.parent_key = frozen.parent_key;
+        self.replace_parent_frame(frozen.parent_key, &frozen.parent_indices)?;
+        self.diagnostic_reused = true;
+        self.paint_diagnostic_colors(&span_source, visible, frozen.flags, &frozen.coarseness, parents)?;
+        Ok(true)
+    }
+
+    /// Colors follow the visualization. `draw_flags` stay the pipeline submission.
+    fn paint_diagnostic_colors(
+        &mut self,
+        span_source: &[u32],
+        visible: BufferId,
+        draw_flags: Vec<u32>,
+        coarseness: &[u32],
+        parent_ready: bool,
+    ) -> Result<(), RenderError> {
         let mut color_flags = draw_flags.clone();
-        if !coarseness.is_empty() {
+        let visualization = self.gpu_scene.visualization;
+        if visualization.shows_level_colors() && !coarseness.is_empty() {
             for (draw_index, source) in span_source.iter().enumerate() {
                 let level = coarseness.get(*source as usize).copied().unwrap_or(0).min(15);
-                color_flags[draw_index] = 16 + level;
+                if let Some(slot) = color_flags.get_mut(draw_index) {
+                    *slot = 16 + level;
+                }
             }
-        } else if parent_ready {
+        } else if visualization.shows_level_colors() && parent_ready {
             for flag in &mut color_flags {
                 if *flag == 1 || *flag == 4 {
                     *flag = 16;
@@ -1961,21 +2453,54 @@ impl Renderer {
             }
         }
         if let Some(cluster) = self.gpu_scene.highlight {
-            for (draw_index, source) in span_source.iter().enumerate() {
-                if *source == cluster {
-                    color_flags[draw_index] = 5;
+            if !self.gpu_scene.diagnostic.identity_colors() && !visualization.paints_einstein() {
+                for (draw_index, source) in span_source.iter().enumerate() {
+                    if *source == cluster {
+                        if let Some(slot) = color_flags.get_mut(draw_index) {
+                            *slot = 5;
+                        }
+                    }
                 }
             }
         }
         let capacity = self.meshlet_gpu.as_ref().map(|gpu| gpu.visible_capacity).unwrap_or(0);
         self.gpu_scene.debug_flags = draw_flags;
-        self.gpu_scene.stats.frozen = self.gpu_scene.freeze;
+        self.gpu_scene.stats.frozen = self.gpu_scene.freeze || self.diagnostic_freeze;
         if !color_flags.is_empty() && color_flags.len() <= capacity {
             let bytes = u32_bytes(&color_flags);
             self.device.write_buffer(visible, 0, &bytes).map_err(RenderError::Rhi)?;
         }
-        self.gpu_scene.stats.hierarchy_draw_prepare_us = prepare_started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
         Ok(())
+    }
+
+    /// Einstein colors replace the flag words in the color buffer. `debug_flags` stay the submission.
+    fn paint_einstein_colors(&mut self) -> Result<(), RenderError> {
+        let Some(mode) = self.gpu_scene.visualization.detail_mode() else { return Ok(()) };
+        let Some(gpu) = self.meshlet_gpu.as_ref() else { return Ok(()) };
+        let count = gpu.span_source.len();
+        let capacity = gpu.visible_capacity;
+        let visible = gpu.visible;
+        if count == 0 || count > capacity {
+            return Ok(());
+        }
+        let stage = self.micro_debug_stage();
+        let neutral = [0.22_f32, 0.24, 0.28];
+        let active = [0.95_f32, 0.40, 0.72];
+        let mut colors = Vec::with_capacity(count);
+        for index in 0..count {
+            let reason = self.micro_reasons.get(index).copied().unwrap_or(jarvig_core::DetailReject::Base);
+            let projected = self.micro_projected.get(index).copied().unwrap_or(0.0);
+            let color = if mode == jarvig_core::MicroDebugMode::Active {
+                if reason == jarvig_core::DetailReject::Selected { active } else { neutral }
+            } else if mode == jarvig_core::MicroDebugMode::State {
+                let state = self.micro_states.get(index).copied().unwrap_or(jarvig_core::DetailLifecycle::NotEligible);
+                jarvig_core::detail_state_color(state)
+            } else {
+                jarvig_core::micro_debug_color(mode, reason, projected, stage).unwrap_or(neutral)
+            };
+            colors.push(jarvig_core::pack_diagnostic_color(color));
+        }
+        self.device.write_buffer(visible, 0, &u32_bytes(&colors)).map_err(RenderError::Rhi)
     }
 
     fn submit_parent_cut(
@@ -1988,34 +2513,53 @@ impl Renderer {
         span_source: &[u32],
         draw_flags: &mut [u32],
     ) -> Result<(), RenderError> {
-        let frustum_on = self.gpu_scene.frustum;
+        let frustum_on = self.visibility_frustum();
         let threshold = self.gpu_scene.hierarchy_error_px;
         let Some(parent) = self.parent_gpu.as_ref() else { return Ok(()) };
         let mesh = parent.mesh;
         let instance = snapshot.instances().iter().find(|instance| instance.mesh == mesh);
         let Some(instance) = instance else { return Ok(()) };
-        let select_started = std::time::Instant::now();
-        let cut = jarvig_core::select_cluster_cut_for_pose(&parent.hierarchy, instance, camera, fov, near, aspect, self.height as f32, threshold).map_err(RenderError::Space)?;
-        let select_us = select_started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
-        let cut_started = std::time::Instant::now();
         let leaf_count = parent.leaf_counts.len();
-        let mut visible = vec![true; leaf_count];
+        let mut leaf_flags = vec![1u32; leaf_count];
         if frustum_on {
-            visible.fill(false);
+            leaf_flags.fill(0);
             for (draw_index, source) in span_source.iter().enumerate() {
-                let flag = draw_flags.get(draw_index).copied().unwrap_or(0);
-                if (flag == 1 || flag == 4) && (*source as usize) < leaf_count {
-                    visible[*source as usize] = true;
+                if let Some(slot) = leaf_flags.get_mut(*source as usize) {
+                    *slot = draw_flags.get(draw_index).copied().unwrap_or(0);
                 }
             }
         }
-        let submission = jarvig_core::submission_for_cut(
+        let view_cut = jarvig_core::cut_visible_hierarchy_for_pose(
+            &parent.hierarchy,
+            instance,
+            camera,
+            fov,
+            near,
+            aspect,
+            self.height as f32,
+            threshold,
+            &leaf_flags,
+            &parent.leaf_counts,
+        )
+        .map_err(RenderError::Space)?;
+        let select_us = view_cut.selection_us;
+        let cut = jarvig_core::ClusterCut {
+            selected: view_cut.selected,
+            coarseness: view_cut.coarseness,
+            covered_leaves: view_cut.covered_leaves,
+        };
+        let cut_started = std::time::Instant::now();
+        // The cut already omitted hidden and off-screen branches. A parent in
+        // `selected` covers only leaves this view can draw.
+        let drawable = parent.draw_ok.clone();
+        let submission = jarvig_core::submission_keeping_coverage(
             &parent.hierarchy,
             &parent.ranges,
             &parent.leaf_counts,
             parent.leaf_triangles,
             &cut,
-            Some(&visible),
+            None,
+            &drawable,
         );
         let mut replaced = vec![false; leaf_count];
         for node in &submission.parent_nodes {
@@ -2032,12 +2576,14 @@ impl Renderer {
             }
         }
         let frame_indices = jarvig_core::parent_draw_indices(&parent.indices, &parent.ranges, &submission.parent_nodes);
+        self.gpu_scene.parent_indices = frame_indices.clone();
         let mut key = 0xcbf29ce484222325u64;
         for node in &submission.parent_nodes {
             key ^= u64::from(*node);
             key = key.wrapping_mul(0x100000001b3);
         }
         key ^= u64::from(frame_indices.len() as u32);
+        self.gpu_scene.parent_key = key;
         let cut_len = cut.selected.len() as u32;
         let node_count = parent.hierarchy.nodes.len() as u32;
         let leaf_triangles = parent.leaf_triangles;
@@ -2048,6 +2594,7 @@ impl Renderer {
         let hierarchy_parents = submission.parent_nodes.len() as u32;
         let hierarchy_depth = cut.coarseness.iter().copied().max().unwrap_or(0);
         let covered_leaves = cut.covered_leaves;
+        let uncovered_leaves = submission.uncovered_leaf_descendants;
         let cut_us = cut_started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
         let upload_bytes = (frame_indices.len() * std::mem::size_of::<u32>()) as u64;
         for (draw_index, source) in span_source.iter().enumerate() {
@@ -2069,10 +2616,12 @@ impl Renderer {
         self.gpu_scene.stats.hierarchy_leaf_triangles = leaf_triangles;
         self.gpu_scene.stats.hierarchy_leaves = hierarchy_leaves;
         self.gpu_scene.stats.hierarchy_parents = hierarchy_parents;
+        self.gpu_scene.stats.hierarchy_candidates = view_cut.candidate_nodes;
         self.gpu_scene.stats.hierarchy_depth = hierarchy_depth;
         self.gpu_scene.stats.hierarchy_select_us = select_us;
         self.gpu_scene.stats.hierarchy_cut_us = cut_us;
         self.gpu_scene.stats.hierarchy_covered_leaves = covered_leaves;
+        self.gpu_scene.stats.hierarchy_uncovered_leaves = uncovered_leaves;
         self.gpu_scene.stats.hierarchy_root_triangles = parent_root;
         self.gpu_scene.stats.hierarchy_empty_parents = parent_empty;
         let reused = self.parent_gpu.as_ref().is_some_and(|parent| parent.frame_key == key && parent.frame_count as usize == frame_indices.len());
@@ -2145,8 +2694,18 @@ impl Renderer {
     }
 
     fn ensure_parent_color_pipeline(&mut self) -> Result<PipelineId, RenderError> {
-        if let Some(pipeline) = self.parent_gpu.as_ref().and_then(|gpu| gpu.pipeline) {
+        let two_sided = self.material_two_sided() == Some(true);
+        if let Some(pipeline) = self.parent_gpu.as_ref().and_then(|gpu| {
+            if gpu.color_two_sided == two_sided {
+                gpu.pipeline
+            } else {
+                None
+            }
+        }) {
             return Ok(pipeline);
+        }
+        if let Some(old) = self.parent_gpu.as_mut().and_then(|gpu| gpu.pipeline.take()) {
+            self.device.destroy(ResourceKind::Pipeline, old.raw()).map_err(RenderError::Rhi)?;
         }
         let shader = self.parent_gpu.as_ref().ok_or(RenderError::Rhi(RhiError::InvalidResource("parent geometry")))?.shader;
         let camera = self.camera_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("parent camera layout")))?;
@@ -2168,11 +2727,13 @@ impl Renderer {
                     ],
                 }],
                 depth: Some(DepthState { format: TextureFormat::Depth32Float, write_enabled: false, compare: CompareFunction::GreaterEqual }),
-                cull: CullMode::None,
+                cull: if two_sided { CullMode::None } else { CullMode::Back },
                 label: Some("JARVIG.ParentColor".into()),
             })
             .map_err(RenderError::Rhi)?;
-        self.parent_gpu.as_mut().expect("parent geometry").pipeline = Some(pipeline);
+        let parent = self.parent_gpu.as_mut().expect("parent geometry");
+        parent.pipeline = Some(pipeline);
+        parent.color_two_sided = two_sided;
         Ok(pipeline)
     }
 
@@ -2255,6 +2816,51 @@ impl Renderer {
 
     pub fn resource_stats(&self) -> ResourceStats {
         self.device.resource_stats()
+    }
+
+    /// Drop GPU objects that belonged to the world just replaced.
+    ///
+    /// `MeshId` starts again at 1 in the next world. A resident buffer kept under
+    /// the old id is drawn as the new mesh. The device, swapchain, material
+    /// pipelines, and editor overlays stay. ADR-0063.
+    pub fn release_world_scene(&mut self) -> Result<(), RenderError> {
+        let gpu_meshes = std::mem::take(&mut self.gpu_meshes);
+        for (_, residency) in gpu_meshes {
+            if let GpuResidency::Resident(gpu) = residency {
+                self.device.destroy(ResourceKind::Buffer, gpu.vertices.raw()).map_err(RenderError::Rhi)?;
+                self.device.destroy(ResourceKind::Buffer, gpu.indices.raw()).map_err(RenderError::Rhi)?;
+            }
+        }
+        self.gpu_scene.remembered.clear();
+        self.gpu_scene.hierarchy_nodes = None;
+        self.gpu_scene.hierarchy_key = 0;
+        self.gpu_scene.debug_flags.clear();
+        self.gpu_scene.parent_indices.clear();
+        self.gpu_scene.parent_key = 0;
+        self.gpu_scene.frozen_flags.clear();
+        self.gpu_scene.frozen_stats = None;
+        self.gpu_scene.frozen_cut = false;
+        self.gpu_scene.highlight = None;
+        self.gpu_scene.meshlet_key = 0;
+        self.diagnostic_frozen = None;
+        self.diagnostic_reused = false;
+        self.entity_hidden.clear();
+        self.terrain_grid = None;
+        self.terrain_grid_meshes.clear();
+        self.land_unlit = false;
+        for slot in &mut self.views {
+            if let Some(view) = slot.view.as_mut() {
+                view.cluster_flags.clear();
+                view.parent_indices.clear();
+                view.parent_key = 0;
+            }
+        }
+        self.publish_micro_absence();
+        self.clear_meshlet_debug()?;
+        self.clear_parent_geometry()?;
+        self.drop_gpu_scene()?;
+        self.gpu_scene.stats = GpuSceneFrameStats::default();
+        self.device.flush().map_err(RenderError::Rhi)
     }
 
     pub fn evict_gpu_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
@@ -2382,6 +2988,23 @@ impl Renderer {
         if let Some(shader) = self.micro_color_shader.take() {
             self.device.destroy(ResourceKind::ShaderModule, shader.raw()).map_err(RenderError::Rhi)?;
         }
+        if let Some(pipeline) = self.micro_class_pipeline.take() {
+            self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(pipeline) = self.micro_parent_pipeline.take() {
+            self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(pipeline) = self.micro_parent_solid.take() {
+            self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
+        }
+        self.drop_diagnostic_draw()?;
+        if let Some(shader) = self.micro_class_shader.take() {
+            self.device.destroy(ResourceKind::ShaderModule, shader.raw()).map_err(RenderError::Rhi)?;
+        }
+        for (_, buffer, group) in self.micro_class_colors.drain(..) {
+            self.device.destroy(ResourceKind::BindGroup, group.raw()).map_err(RenderError::Rhi)?;
+            self.device.destroy(ResourceKind::Buffer, buffer.raw()).map_err(RenderError::Rhi)?;
+        }
         self.clear_meshlet_debug()?;
         self.clear_parent_geometry()?;
         self.drop_gpu_scene()?;
@@ -2393,6 +3016,15 @@ impl Renderer {
             }
             self.device.destroy(ResourceKind::Pipeline, overlay.pipeline.raw()).map_err(RenderError::Rhi)?;
             self.device.destroy(ResourceKind::ShaderModule, overlay.shader.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(reference) = self.reference_gpu.take() {
+            self.device.destroy(ResourceKind::BindGroup, reference.group.raw()).map_err(RenderError::Rhi)?;
+            self.device.destroy(ResourceKind::Buffer, reference.uniform.raw()).map_err(RenderError::Rhi)?;
+            if let Some(vertices) = reference.vertices {
+                self.device.destroy(ResourceKind::Buffer, vertices.raw()).map_err(RenderError::Rhi)?;
+            }
+            self.device.destroy(ResourceKind::Pipeline, reference.pipeline.raw()).map_err(RenderError::Rhi)?;
+            self.device.destroy(ResourceKind::ShaderModule, reference.shader.raw()).map_err(RenderError::Rhi)?;
         }
         if let Some(layout) = self.camera_layout.take() {
             self.device.destroy(ResourceKind::BindGroupLayout, layout.raw()).map_err(RenderError::Rhi)?;
@@ -2542,6 +3174,9 @@ impl Renderer {
             depth: None,
             depth_view: None,
             depth_size: None,
+            cluster_flags: Vec::new(),
+            parent_indices: Vec::new(),
+            parent_key: 0,
         };
         if let Some(index) = self.free_views.pop() {
             let slot = &mut self.views[index as usize];
@@ -2646,6 +3281,12 @@ impl Renderer {
     /// The packet is not a scene object. Positions are camera-relative.
     pub fn set_editor_overlay(&mut self, overlay: Option<EditorOverlay>) {
         self.overlay = overlay.filter(|overlay| !overlay.vertices.is_empty());
+    }
+
+    /// Replace the depth-tested editor grid. `None` removes it. Not a scene object.
+    /// Positions are camera-relative meters. This does not change the gizmo overlay.
+    pub fn set_editor_reference(&mut self, reference: Option<EditorOverlay>) {
+        self.reference = reference.filter(|reference| !reference.vertices.is_empty());
     }
 
     /// Paint the editing grid on these terrain meshes. `None` draws no grid. Spacing is a uniform, not a mesh rebuild.
@@ -2818,8 +3459,9 @@ impl Renderer {
     }
 
     pub fn clear_meshlet_debug(&mut self) -> Result<(), RenderError> {
+        self.drop_diagnostic_pipelines()?;
         let Some(gpu) = self.meshlet_gpu.take() else { return Ok(()) };
-        for (_, pipeline) in gpu.pipelines.iter().chain(gpu.occluded_pipelines.iter()) {
+        for (_, _, pipeline) in gpu.pipelines.iter().chain(gpu.occluded_pipelines.iter()) {
             self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
         }
         self.device.destroy(ResourceKind::BindGroup, gpu.color_group.raw()).map_err(RenderError::Rhi)?;
@@ -2985,6 +3627,7 @@ impl Renderer {
                 snapshot.camera(frame).ok_or(RenderError::Space(SpaceError::MissingFrame))?.pose
             };
             self.sync_gpu_scene(snapshot, &pose, fov, near, aspect)?;
+            self.store_view_cut(*id);
             self.update_directional_cascades(*id, &pose, fov, aspect, near, snapshot, meshes)?;
         }
         self.submitted_last = snapshot.visible_count() as u32;
@@ -3030,10 +3673,23 @@ impl Renderer {
         encoder.end_render_pass().map_err(RenderError::Rhi)?;
         let mut contact_cleared = false;
         self.contact_requested = false;
+        self.gpu_scene.stats.legacy_draw_triangles = 0;
+        self.gpu_scene.stats.meshlet_draw_triangles = 0;
+        self.gpu_scene.stats.parent_draw_triangles = 0;
+        let mut staged_runs = 0u32;
         for pass in &prepared {
+            self.apply_view_cut(pass.id)?;
             if self.slot(pass.id)?.settings.contact_shadows {
                 self.contact_requested = true;
                 self.encode_contact_prepass(&mut *encoder, snapshot, meshes, pass, &mut contact_cleared)?;
+            }
+            if self.gpu_scene.visualization.paints_einstein() {
+                self.paint_einstein_colors()?;
+            }
+            let recolor = self.gpu_scene.visualization.recolors_submission();
+            let pass_runs = staged_runs;
+            if recolor {
+                staged_runs = self.append_diagnostic_bases(pass, staged_runs)?;
             }
             encoder
                 .begin_render_pass(&RenderPassDesc {
@@ -3065,13 +3721,21 @@ impl Renderer {
                 })
                 .map_err(RenderError::Rhi)?;
             self.gpu_scene.stats.einstein_debug_draws = 0;
-            for draw in &pass.draws {
-                self.draw_prepared(&mut *encoder, draw)?;
+            if recolor {
+                self.diagnostic_run_cursor = pass_runs;
             }
-            self.draw_microtriangles(&mut *encoder, pass)?;
-            self.draw_einstein_debug(&mut *encoder, pass)?;
+            for draw in &pass.draws {
+                self.draw_prepared(&mut *encoder, draw, recolor)?;
+            }
+            if !self.gpu_scene.diagnostic.suspends_detail() {
+                self.draw_microtriangles(&mut *encoder, pass)?;
+            }
+            if self.gpu_scene.visualization.overlays_detail() {
+                self.draw_einstein_debug(&mut *encoder, pass)?;
+            }
             self.draw_meshlet_ids(&mut *encoder, pass, meshes)?;
             self.draw_terrain_grid(&mut *encoder, pass, meshes, snapshot)?;
+            self.draw_editor_reference(&mut *encoder, pass, snapshot)?;
             encoder.end_render_pass().map_err(RenderError::Rhi)?;
         }
         encoder
@@ -3235,6 +3899,134 @@ impl Renderer {
             })
             .map_err(RenderError::Rhi)?;
         self.terrain_grid_gpu = Some(TerrainGridGpu { shader, layout, pipelines: Vec::new(), views: Vec::new() });
+        Ok(())
+    }
+
+    fn draw_editor_reference(
+        &mut self,
+        encoder: &mut dyn jarvig_rhi::CommandEncoder,
+        pass: &Prepared,
+        snapshot: &RenderSceneSnapshot,
+    ) -> Result<(), RenderError> {
+        let Some(reference) = self.reference.clone() else { return Ok(()) };
+        if reference.view != pass.id {
+            return Ok(());
+        }
+        let (frame, fov, near) = {
+            let camera = &self.slot(reference.view)?.camera;
+            (camera.frame, camera.vertical_fov_radians, camera.near_m)
+        };
+        let pose = if let Some(pose) = self.slot(reference.view)?.pose_override {
+            pose
+        } else {
+            snapshot.camera(frame).ok_or(RenderError::Space(SpaceError::MissingFrame))?.pose
+        };
+        let aspect = pass.rect.width as f32 / pass.rect.height.max(1) as f32;
+        let projection = Mat4::perspective_infinite_reverse_z(fov as f32, aspect, near).map_err(RenderError::Space)?;
+        let view = Mat4::from_rotation(pose.rotation.conjugate());
+        let mut uniform = [0u8; 128];
+        projection.write_column_major(&mut uniform[0..64]);
+        view.write_column_major(&mut uniform[64..128]);
+        self.ensure_reference_gpu()?;
+        let mut bytes = Vec::with_capacity(reference.vertices.len() * 32);
+        for vertex in &reference.vertices {
+            bytes.extend_from_slice(&vertex.position[0].to_le_bytes());
+            bytes.extend_from_slice(&vertex.position[1].to_le_bytes());
+            bytes.extend_from_slice(&vertex.position[2].to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            for channel in vertex.color {
+                bytes.extend_from_slice(&channel.to_le_bytes());
+            }
+        }
+        self.replace_reference_vertices(bytes)?;
+        let gpu = self.reference_gpu.as_ref().expect("reference");
+        let uniform_id = gpu.uniform;
+        let vertex_id = gpu.vertices.ok_or(RenderError::Rhi(RhiError::InvalidResource("reference vertices")))?;
+        let group = gpu.group;
+        let pipeline = gpu.pipeline;
+        self.device.write_buffer(uniform_id, 0, &uniform).map_err(RenderError::Rhi)?;
+        encoder.set_pipeline(pipeline).map_err(RenderError::Rhi)?;
+        encoder.set_bind_group(0, group).map_err(RenderError::Rhi)?;
+        encoder.set_vertex_buffer(0, vertex_id, 0).map_err(RenderError::Rhi)?;
+        encoder.draw(reference.vertices.len() as u32, 1, 0, 0).map_err(RenderError::Rhi)
+    }
+
+    fn replace_reference_vertices(&mut self, bytes: Vec<u8>) -> Result<(), RenderError> {
+        let gpu = self.reference_gpu.as_mut().ok_or(RenderError::Rhi(RhiError::InvalidResource("reference")))?;
+        if gpu.last_vertices == bytes {
+            return Ok(());
+        }
+        if let Some(previous) = gpu.vertices.take() {
+            self.device.destroy(ResourceKind::Buffer, previous.raw()).map_err(RenderError::Rhi)?;
+        }
+        let buffer = self
+            .device
+            .create_buffer(&BufferDesc {
+                size: bytes.len() as u64,
+                usage: BufferUsage::Vertex,
+                label: Some("JARVIG.EditorReference.Vertices".into()),
+                contents: Some(bytes.clone()),
+            })
+            .map_err(RenderError::Rhi)?;
+        let gpu = self.reference_gpu.as_mut().expect("reference");
+        gpu.vertices = Some(buffer);
+        gpu.last_vertices = bytes;
+        Ok(())
+    }
+
+    fn ensure_reference_gpu(&mut self) -> Result<(), RenderError> {
+        if self.reference_gpu.is_some() {
+            return Ok(());
+        }
+        self.ensure_camera_layout()?;
+        let layout = self.camera_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("reference layout")))?;
+        let shader = self
+            .device
+            .create_shader_module(&ShaderModuleDesc {
+                source: ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+                label: Some("JARVIG.EditorReference".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDesc {
+                shader,
+                vertex_entry: "vs".into(),
+                fragment_entry: "fs".into(),
+                topology: PrimitiveTopology::TriangleList,
+                color_format: HDR_SCENE_FORMAT,
+                layouts: vec![layout],
+                vertex_buffers: vec![VertexBufferLayout {
+                    stride: 32,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: vec![
+                        VertexAttribute { shader_location: 0, offset: 0, format: VertexFormat::Float32x3 },
+                        VertexAttribute { shader_location: 1, offset: 16, format: VertexFormat::Float32x4 },
+                    ],
+                }],
+                depth: Some(DepthState { format: TextureFormat::Depth32Float, write_enabled: false, compare: CompareFunction::GreaterEqual }),
+                cull: CullMode::None,
+                label: Some("JARVIG.EditorReference".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        let uniform = self
+            .device
+            .create_buffer(&BufferDesc {
+                size: 128,
+                usage: BufferUsage::Uniform,
+                label: Some("JARVIG.EditorReference.Camera".into()),
+                contents: None,
+            })
+            .map_err(RenderError::Rhi)?;
+        let group = self
+            .device
+            .create_bind_group(&BindGroupDesc {
+                layout,
+                entries: vec![BindGroupEntry { binding: 0, resource: jarvig_rhi::BindResource::Buffer(uniform) }],
+                label: Some("JARVIG.EditorReference.Camera".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.reference_gpu = Some(OverlayGpu { shader, pipeline, uniform, vertices: None, group, last_vertices: Vec::new() });
         Ok(())
     }
 
@@ -3457,6 +4249,7 @@ impl Renderer {
                     material,
                     lights,
                     pipeline,
+                    vertex_stride: mesh.streams().first().map(|stream| stream.stride).unwrap_or(0),
                 });
             }
         }
@@ -3987,7 +4780,47 @@ impl Renderer {
         Ok(pipeline)
     }
 
-    fn draw_prepared(&self, encoder: &mut dyn jarvig_rhi::CommandEncoder, draw: &PreparedDraw) -> Result<(), RenderError> {
+    fn prepared_cut(&self, draw: &PreparedDraw) -> PreparedCut {
+        let isolate = self.gpu_scene.diagnostic.identity_colors() && self.meshlet_gpu.as_ref().is_some_and(|debug| debug.mesh == draw.mesh);
+        let parent_draw = self.visibility_parents() && self.parent_gpu.as_ref().map(|parent| parent.mesh == draw.mesh).unwrap_or(false);
+        if !(isolate || self.visibility_frustum() || parent_draw) {
+            return PreparedCut::Material;
+        }
+        let Some(debug) = self.meshlet_gpu.as_ref().filter(|debug| (isolate || debug.shade_clustered) && debug.mesh == draw.mesh) else {
+            return PreparedCut::Material;
+        };
+        if draw.submesh != 0 {
+            return PreparedCut::HiddenSubmesh;
+        }
+        PreparedCut::Clustered {
+            indices: debug.indices,
+            runs: coalesce_spans(&debug.spans, &self.gpu_scene.debug_flags),
+            parent_draw,
+        }
+    }
+
+    /// One record per submitted run, written before the color pass. Queue writes are not ordered inside that pass.
+    fn append_diagnostic_bases(&mut self, pass: &Prepared, start: u32) -> Result<u32, RenderError> {
+        let mut bases = Vec::new();
+        for draw in &pass.draws {
+            let PreparedCut::Clustered { runs, .. } = self.prepared_cut(draw) else { continue };
+            for (first_index, index_count) in runs {
+                if index_count > 0 {
+                    bases.push(first_index / 3);
+                }
+            }
+        }
+        if bases.is_empty() {
+            return Ok(start);
+        }
+        let end = start.saturating_add(bases.len() as u32);
+        self.ensure_diagnostic_bases(end as usize)?;
+        let buffer = self.diagnostic_draw_uniform.ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic bases")))?;
+        self.device.write_buffer(buffer, u64::from(start) * 4, &u32_bytes(&bases)).map_err(RenderError::Rhi)?;
+        Ok(end)
+    }
+
+    fn draw_prepared(&mut self, encoder: &mut dyn jarvig_rhi::CommandEncoder, draw: &PreparedDraw, recolor: bool) -> Result<(), RenderError> {
         let (vertices, mesh_indices, index_format, first_index, index_count, base_vertex) = {
             let gpu = self
                 .gpu_meshes
@@ -4001,35 +4834,41 @@ impl Renderer {
             let range = gpu.submeshes.get(draw.submesh).ok_or(RenderError::Mesh(MeshError::BadSubmesh))?;
             (gpu.vertices, gpu.indices, gpu.index_format, range.first_index, range.index_count, range.base_vertex)
         };
+        encoder.set_vertex_buffer(0, vertices, 0).map_err(RenderError::Rhi)?;
+        let cut = self.prepared_cut(draw);
+        if matches!(cut, PreparedCut::HiddenSubmesh) {
+            return Ok(());
+        }
+        if let PreparedCut::Clustered { indices, runs, parent_draw } = cut {
+            if recolor {
+                return self.draw_recolored_submission(encoder, draw, indices, &runs, parent_draw);
+            }
+            encoder.set_pipeline(draw.pipeline).map_err(RenderError::Rhi)?;
+            encoder.set_bind_group(0, draw.transform).map_err(RenderError::Rhi)?;
+            encoder.set_bind_group(1, draw.material).map_err(RenderError::Rhi)?;
+            if let Some(lights) = draw.lights {
+                encoder.set_bind_group(2, lights).map_err(RenderError::Rhi)?;
+            }
+            encoder.set_index_buffer(indices, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
+            let mut meshlet_tris = 0u32;
+            for (first_index, index_count) in runs {
+                if index_count > 0 {
+                    encoder.draw_indexed(index_count, 1, first_index, 0, 0).map_err(RenderError::Rhi)?;
+                    meshlet_tris = meshlet_tris.saturating_add(index_count / 3);
+                }
+            }
+            self.gpu_scene.stats.meshlet_draw_triangles = self.gpu_scene.stats.meshlet_draw_triangles.saturating_add(meshlet_tris);
+            if parent_draw {
+                let parent_tris = self.draw_parent_triangles(encoder)?;
+                self.gpu_scene.stats.parent_draw_triangles = self.gpu_scene.stats.parent_draw_triangles.saturating_add(parent_tris);
+            }
+            return Ok(());
+        }
         encoder.set_pipeline(draw.pipeline).map_err(RenderError::Rhi)?;
         encoder.set_bind_group(0, draw.transform).map_err(RenderError::Rhi)?;
         encoder.set_bind_group(1, draw.material).map_err(RenderError::Rhi)?;
         if let Some(lights) = draw.lights {
             encoder.set_bind_group(2, lights).map_err(RenderError::Rhi)?;
-        }
-        encoder.set_vertex_buffer(0, vertices, 0).map_err(RenderError::Rhi)?;
-        let parent_draw = self.gpu_scene.hierarchy && self.parent_gpu.as_ref().map(|parent| parent.mesh == draw.mesh).unwrap_or(false);
-        let visible_runs = if self.gpu_scene.frustum || parent_draw {
-            self.meshlet_gpu.as_ref().filter(|debug| debug.shade_clustered && debug.mesh == draw.mesh).map(|debug| {
-                (debug.indices, draw.submesh == 0, coalesce_spans(&debug.spans, &self.gpu_scene.debug_flags))
-            })
-        } else {
-            None
-        };
-        if let Some((indices, first_submesh, runs)) = visible_runs {
-            if !first_submesh {
-                return Ok(());
-            }
-            encoder.set_index_buffer(indices, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
-            for (first_index, index_count) in runs {
-                if index_count > 0 {
-                    encoder.draw_indexed(index_count, 1, first_index, 0, 0).map_err(RenderError::Rhi)?;
-                }
-            }
-            if parent_draw {
-                self.draw_parent_triangles(encoder)?;
-            }
-            return Ok(());
         }
         let clustered = self.meshlet_gpu.as_ref().and_then(|debug| {
             if debug.shade_clustered && debug.mesh == draw.mesh {
@@ -4043,11 +4882,179 @@ impl Renderer {
                 return Ok(());
             }
             encoder.set_index_buffer(indices, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
+            self.gpu_scene.stats.meshlet_draw_triangles = self.gpu_scene.stats.meshlet_draw_triangles.saturating_add(index_count / 3);
             encoder.draw_indexed(index_count, 1, first_index, 0, 0).map_err(RenderError::Rhi)
         } else {
             encoder.set_index_buffer(mesh_indices, index_format, 0).map_err(RenderError::Rhi)?;
+            self.gpu_scene.stats.legacy_draw_triangles = self.gpu_scene.stats.legacy_draw_triangles.saturating_add(index_count / 3);
             encoder.draw_indexed(index_count, 1, first_index, base_vertex, 0).map_err(RenderError::Rhi)
         }
+    }
+
+    /// The same index ranges and the same vertex buffer as the shaded cut. Only the fragment color changes.
+    fn draw_recolored_submission(
+        &mut self,
+        encoder: &mut dyn jarvig_rhi::CommandEncoder,
+        draw: &PreparedDraw,
+        indices: BufferId,
+        runs: &[(u32, u32)],
+        parent_draw: bool,
+    ) -> Result<(), RenderError> {
+        let pipeline = self.ensure_diagnostic_color_pipeline(u64::from(draw.vertex_stride))?;
+        let params = self.ensure_diagnostic_bases(1)?;
+        let color_group = self
+            .meshlet_gpu
+            .as_ref()
+            .map(|gpu| gpu.color_group)
+            .ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic colors")))?;
+        encoder.set_pipeline(pipeline).map_err(RenderError::Rhi)?;
+        encoder.set_bind_group(0, draw.transform).map_err(RenderError::Rhi)?;
+        encoder.set_bind_group(1, color_group).map_err(RenderError::Rhi)?;
+        encoder.set_bind_group(2, params).map_err(RenderError::Rhi)?;
+        encoder.set_index_buffer(indices, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
+        let mut meshlet_tris = 0u32;
+        for (first_index, index_count) in runs {
+            if *index_count == 0 {
+                continue;
+            }
+            let run = self.diagnostic_run_cursor;
+            self.diagnostic_run_cursor = self.diagnostic_run_cursor.saturating_add(1);
+            encoder.draw_indexed(*index_count, 1, *first_index, 0, run).map_err(RenderError::Rhi)?;
+            meshlet_tris = meshlet_tris.saturating_add(index_count / 3);
+        }
+        self.gpu_scene.stats.meshlet_draw_triangles = self.gpu_scene.stats.meshlet_draw_triangles.saturating_add(meshlet_tris);
+        if parent_draw {
+            let color = self.parent_recolor();
+            let parent_tris = self.draw_recolored_parents(encoder, draw.transform, color)?;
+            self.gpu_scene.stats.parent_draw_triangles = self.gpu_scene.stats.parent_draw_triangles.saturating_add(parent_tris);
+        }
+        Ok(())
+    }
+
+    fn parent_recolor(&self) -> [f32; 3] {
+        match self.gpu_scene.visualization {
+            jarvig_core::DiagnosticVisualization::HierarchyLevels => [0.95, 0.62, 0.18],
+            jarvig_core::DiagnosticVisualization::CutReasons => [0.95, 0.55, 0.12],
+            jarvig_core::DiagnosticVisualization::EinsteinState => jarvig_core::detail_state_color(jarvig_core::DetailLifecycle::NotEligible),
+            _ => [0.22, 0.24, 0.28],
+        }
+    }
+
+    fn ensure_diagnostic_bases(&mut self, needed: usize) -> Result<BindGroupId, RenderError> {
+        let needed = needed.max(1);
+        if let Some(group) = self.diagnostic_draw_group {
+            if self.diagnostic_base_capacity >= needed {
+                return Ok(group);
+            }
+        }
+        if let Some(group) = self.diagnostic_draw_group.take() {
+            self.device.destroy(ResourceKind::BindGroup, group.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(buffer) = self.diagnostic_draw_uniform.take() {
+            self.device.destroy(ResourceKind::Buffer, buffer.raw()).map_err(RenderError::Rhi)?;
+        }
+        if self.diagnostic_draw_layout.is_none() {
+            let layout = self
+                .device
+                .create_bind_group_layout(&BindGroupLayoutDesc {
+                    entries: vec![BindGroupLayoutEntry { binding: 0, kind: BindingType::StorageBuffer, stage: ShaderStage::Fragment }],
+                    label: Some("JARVIG.DiagnosticColor.Bases".into()),
+                })
+                .map_err(RenderError::Rhi)?;
+            self.diagnostic_draw_layout = Some(layout);
+        }
+        let layout = self.diagnostic_draw_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic bases")))?;
+        let capacity = needed.max(16_384).next_power_of_two();
+        let buffer = self
+            .device
+            .create_buffer(&BufferDesc {
+                size: (capacity * 4) as u64,
+                usage: BufferUsage::Storage,
+                label: Some("JARVIG.DiagnosticColor.Bases".into()),
+                contents: Some(vec![0u8; capacity * 4]),
+            })
+            .map_err(RenderError::Rhi)?;
+        let group = self
+            .device
+            .create_bind_group(&BindGroupDesc {
+                layout,
+                entries: vec![BindGroupEntry { binding: 0, resource: jarvig_rhi::BindResource::Buffer(buffer) }],
+                label: Some("JARVIG.DiagnosticColor.Bases".into()),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.diagnostic_draw_uniform = Some(buffer);
+        self.diagnostic_draw_group = Some(group);
+        self.diagnostic_base_capacity = capacity;
+        Ok(group)
+    }
+
+    fn ensure_diagnostic_color_pipeline(&mut self, stride: u64) -> Result<PipelineId, RenderError> {
+        let two_sided = self.material_two_sided() == Some(true);
+        if let Some((_, _, pipeline)) = self.diagnostic_draw_pipelines.iter().find(|(stored, sided, _)| *stored == stride && *sided == two_sided) {
+            return Ok(*pipeline);
+        }
+        let _ = self.ensure_diagnostic_bases(1)?;
+        if self.diagnostic_draw_shader.is_none() {
+            let shader = self
+                .device
+                .create_shader_module(&ShaderModuleDesc {
+                    source: ShaderSource::Wgsl(DIAGNOSTIC_COLOR_SHADER.into()),
+                    label: Some("JARVIG.DiagnosticColor".into()),
+                })
+                .map_err(RenderError::Rhi)?;
+            self.diagnostic_draw_shader = Some(shader);
+        }
+        let shader = self.diagnostic_draw_shader.ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic shader")))?;
+        let draw_layout = self.diagnostic_draw_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic draw layout")))?;
+        let color_layout = self.meshlet_gpu.as_ref().map(|gpu| gpu.color_layout).ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic colors")))?;
+        let camera = self.camera_layout.ok_or(RenderError::Rhi(RhiError::InvalidResource("diagnostic camera")))?;
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDesc {
+                shader,
+                vertex_entry: "vs".into(),
+                fragment_entry: "fs".into(),
+                topology: PrimitiveTopology::TriangleList,
+                color_format: HDR_SCENE_FORMAT,
+                layouts: vec![camera, color_layout, draw_layout],
+                vertex_buffers: vec![VertexBufferLayout {
+                    stride,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: vec![VertexAttribute { shader_location: 0, offset: 0, format: VertexFormat::Float32x3 }],
+                }],
+                depth: Some(DepthState { format: TextureFormat::Depth32Float, write_enabled: true, compare: CompareFunction::GreaterEqual }),
+                cull: if two_sided { CullMode::None } else { CullMode::Back },
+                label: Some(format!("JARVIG.DiagnosticColor.Stride{stride}")),
+            })
+            .map_err(RenderError::Rhi)?;
+        self.diagnostic_draw_pipelines.push((stride, two_sided, pipeline));
+        Ok(pipeline)
+    }
+
+    fn drop_diagnostic_pipelines(&mut self) -> Result<(), RenderError> {
+        for (_, _, pipeline) in self.diagnostic_draw_pipelines.drain(..) {
+            self.device.destroy(ResourceKind::Pipeline, pipeline.raw()).map_err(RenderError::Rhi)?;
+        }
+        Ok(())
+    }
+
+    fn drop_diagnostic_draw(&mut self) -> Result<(), RenderError> {
+        self.drop_diagnostic_pipelines()?;
+        if let Some(group) = self.diagnostic_draw_group.take() {
+            self.device.destroy(ResourceKind::BindGroup, group.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(uniform) = self.diagnostic_draw_uniform.take() {
+            self.device.destroy(ResourceKind::Buffer, uniform.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(layout) = self.diagnostic_draw_layout.take() {
+            self.device.destroy(ResourceKind::BindGroupLayout, layout.raw()).map_err(RenderError::Rhi)?;
+        }
+        if let Some(shader) = self.diagnostic_draw_shader.take() {
+            self.device.destroy(ResourceKind::ShaderModule, shader.raw()).map_err(RenderError::Rhi)?;
+        }
+        self.diagnostic_base_capacity = 0;
+        self.diagnostic_run_cursor = 0;
+        Ok(())
     }
 
     fn draw_meshlet_ids(
@@ -4056,12 +5063,24 @@ impl Renderer {
         pass: &Prepared,
         meshes: &MeshLibrary,
     ) -> Result<(), RenderError> {
-        let (mesh_id, index_buffer, index_count, color_group) = {
+        if self.gpu_scene.visualization.recolors_submission() {
+            return Ok(());
+        }
+        let (mesh_id, index_buffer, index_count, spans, color_group, submitted_only) = {
             let Some(debug) = self.meshlet_gpu.as_ref() else { return Ok(()) };
-            if !debug.show_ids {
+            let show_colors = match self.gpu_scene.visualization {
+                jarvig_core::DiagnosticVisualization::CutReasons | jarvig_core::DiagnosticVisualization::HierarchyLevels => true,
+                jarvig_core::DiagnosticVisualization::None => debug.show_ids || self.gpu_scene.diagnostic.identity_colors(),
+                _ => false,
+            };
+            if !show_colors {
                 return Ok(());
             }
-            (debug.mesh, debug.indices, debug.index_count, debug.color_group)
+            let submitted_only = matches!(
+                self.gpu_scene.visualization,
+                jarvig_core::DiagnosticVisualization::CutReasons | jarvig_core::DiagnosticVisualization::HierarchyLevels
+            );
+            (debug.mesh, debug.indices, debug.index_count, debug.spans.clone(), debug.color_group, submitted_only)
         };
         let Some(mesh) = meshes.get(mesh_id) else { return Ok(()) };
         let Some(stream) = mesh.streams().first() else { return Ok(()) };
@@ -4087,9 +5106,17 @@ impl Renderer {
             encoder.set_bind_group(1, color_group).map_err(RenderError::Rhi)?;
             encoder.set_vertex_buffer(0, vertices, 0).map_err(RenderError::Rhi)?;
             encoder.set_index_buffer(index_buffer, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
-            encoder.draw_indexed(index_count, 1, 0, 0, 0).map_err(RenderError::Rhi)?;
+            if submitted_only {
+                for (first_index, run_count) in coalesce_spans(&spans, &self.gpu_scene.debug_flags) {
+                    if run_count > 0 {
+                        encoder.draw_indexed(run_count, 1, first_index, 0, 0).map_err(RenderError::Rhi)?;
+                    }
+                }
+            } else {
+                encoder.draw_indexed(index_count, 1, 0, 0, 0).map_err(RenderError::Rhi)?;
+            }
         }
-        if self.gpu_scene.hierarchy && self.parent_gpu.as_ref().map(|parent| parent.mesh == mesh_id && parent.frame_count > 0).unwrap_or(false) {
+        if self.visibility_parents() && self.parent_gpu.as_ref().map(|parent| parent.mesh == mesh_id && parent.frame_count > 0).unwrap_or(false) {
             let pipeline = self.ensure_parent_color_pipeline()?;
             let draws: Vec<(BufferId, BufferId, u32)> = self
                 .parent_gpu
@@ -4118,7 +5145,11 @@ impl Renderer {
                 }
             }
         }
-        if self.gpu_scene.occlusion && self.gpu_scene.frustum && self.gpu_scene.stats.occlusion_rejected > 0 {
+        let show_occluded = self.gpu_scene.visualization == jarvig_core::DiagnosticVisualization::CutReasons
+            || (self.gpu_scene.visualization == jarvig_core::DiagnosticVisualization::None
+                && self.gpu_scene.diagnostic == jarvig_core::GeometryDiagnostic::Normal
+                && self.meshlet_gpu.as_ref().is_some_and(|debug| debug.show_ids));
+        if show_occluded && self.visibility_occlusion() && self.gpu_scene.stats.occlusion_rejected > 0 {
             let occluded = self.ensure_meshlet_occluded_pipeline(stride)?;
             let mut seen = Vec::new();
             for draw in &pass.draws {
@@ -4138,8 +5169,9 @@ impl Renderer {
     }
 
 
-    fn draw_parent_triangles(&self, encoder: &mut dyn jarvig_rhi::CommandEncoder) -> Result<(), RenderError> {
-        let Some(parent) = self.parent_gpu.as_ref() else { return Ok(()) };
+    fn draw_parent_triangles(&self, encoder: &mut dyn jarvig_rhi::CommandEncoder) -> Result<u32, RenderError> {
+        let Some(parent) = self.parent_gpu.as_ref() else { return Ok(0) };
+        let mut triangles = 0u32;
         for chunk in &parent.chunks {
             let Some(frame) = chunk.frame else { continue };
             if chunk.frame_count == 0 {
@@ -4148,8 +5180,9 @@ impl Renderer {
             encoder.set_vertex_buffer(0, chunk.vertices, 0).map_err(RenderError::Rhi)?;
             encoder.set_index_buffer(frame, IndexFormat::Uint32, 0).map_err(RenderError::Rhi)?;
             encoder.draw_indexed(chunk.frame_count, 1, 0, 0, 0).map_err(RenderError::Rhi)?;
+            triangles = triangles.saturating_add(chunk.frame_count / 3);
         }
-        Ok(())
+        Ok(triangles)
     }
 
     fn ensure_meshlet_color_pipeline(&mut self, stride: u64) -> Result<PipelineId, RenderError> {
@@ -4161,9 +5194,10 @@ impl Renderer {
     }
 
     fn ensure_meshlet_pipeline(&mut self, stride: u64, occluded: bool) -> Result<PipelineId, RenderError> {
+        let two_sided = self.material_two_sided() == Some(true);
         if let Some(found) = self.meshlet_gpu.as_ref().and_then(|gpu| {
             let pipelines = if occluded { &gpu.occluded_pipelines } else { &gpu.pipelines };
-            pipelines.iter().find(|(stored, _)| *stored == stride).map(|(_, pipeline)| *pipeline)
+            pipelines.iter().find(|(stored, sided, _)| *stored == stride && *sided == two_sided).map(|(_, _, pipeline)| *pipeline)
         }) {
             return Ok(found);
         }
@@ -4189,16 +5223,16 @@ impl Renderer {
                     attributes: vec![VertexAttribute { shader_location: 0, offset: 0, format: VertexFormat::Float32x3 }],
                 }],
                 depth: Some(DepthState { format: TextureFormat::Depth32Float, write_enabled: false, compare }),
-                // The overlay classifies triangles. Townshop's material is double-sided, so a back-face cull hides the canopy from below.
-                cull: CullMode::None,
+                // Opaque materials hide the back of a coarse shell. A two-sided material, such as the townshop canopy, keeps both sides.
+                cull: if two_sided { CullMode::None } else { CullMode::Back },
                 label: Some(format!("JARVIG.MeshletIds.Stride{stride}")),
             })
             .map_err(RenderError::Rhi)?;
         let gpu = self.meshlet_gpu.as_mut().expect("meshlet debug");
         if occluded {
-            gpu.occluded_pipelines.push((stride, pipeline));
+            gpu.occluded_pipelines.push((stride, two_sided, pipeline));
         } else {
-            gpu.pipelines.push((stride, pipeline));
+            gpu.pipelines.push((stride, two_sided, pipeline));
         }
         Ok(pipeline)
     }
@@ -5058,7 +6092,7 @@ fn coalesce_spans(spans: &[(u32, u32)], flags: &[u32]) -> Vec<(u32, u32)> {
     let mut open = false;
     for (index, span) in spans.iter().enumerate() {
         let flag = flags.get(index).copied().unwrap_or(0);
-        let visible = flag == 1 || flag == 4;
+        let visible = flag == 1 || flag == 4 || flag == 7;
         if !visible {
             if open {
                 runs.push((run_first, run_end.saturating_sub(run_first)));
@@ -5537,6 +6571,137 @@ mod tests {
         assert_eq!(renderer.mesh_upload_count(), 3);
         assert_eq!(renderer.resource_stats().alive_buffers, 24);
         assert!(matches!(renderer.device.write_buffer(stale, 0, &[0; 4]), Err(RhiError::InvalidHandle(_))));
+    }
+
+    #[test]
+    fn a_recycled_mesh_id_does_not_keep_the_previous_worlds_buffers() {
+        let (world, materials, textures, mut renderer, target, front, side) = rig();
+        assert_eq!(present(&mut renderer, &world, &materials, &textures, target, 1), FrameOutcome::Presented { frame: 1 });
+        let city = world.extract(RenderFrameId(1)).unwrap().instances()[0].mesh;
+        assert_eq!(city.0, 1);
+        let (stale, city_indices) = match &renderer.gpu_meshes.iter().find(|(id, _)| *id == city).unwrap().1 {
+            GpuResidency::Resident(gpu) => (gpu.vertices, gpu.submeshes[0].index_count),
+            GpuResidency::Evicted => panic!("first mesh should be resident"),
+        };
+        assert_eq!(city_indices, 3);
+        let city_records = vec![
+            jarvig_core::GpuMeshletRecord {
+                center: [0.0; 3],
+                radius: 1.0,
+                bounds_min: [-1.0; 3],
+                bounds_max: [1.0; 3],
+                cone_axis: [0.0, 1.0, 0.0],
+                cone_cutoff: 1.0,
+                triangles: 64,
+                vertices: 64,
+                submesh: 0,
+            };
+            1044
+        ];
+        renderer.remember_meshlets(city, &city_records);
+        assert_eq!(renderer.gpu_scene.remembered.iter().find(|(id, _)| *id == city).unwrap().1.len(), 1044);
+        let pipelines = renderer.resource_stats().alive_pipelines;
+        let uploads = renderer.mesh_upload_count();
+        renderer.release_world_scene().unwrap();
+        assert!(renderer.gpu_meshes.is_empty());
+        assert!(renderer.gpu_scene.remembered.is_empty());
+        assert!(renderer.parent_gpu.is_none());
+        assert!(renderer.meshlet_gpu.is_none());
+        assert!(renderer.entity_hidden.is_empty());
+        assert!(renderer.views.iter().all(|slot| slot.view.as_ref().is_none_or(|view| view.cluster_flags.is_empty() && view.parent_indices.is_empty())));
+        assert_eq!(renderer.resource_stats().alive_pipelines, pipelines);
+        assert_eq!(renderer.gpu_scene_stats().meshlets, 0);
+        assert_eq!(renderer.gpu_scene_stats().instances, 0);
+        assert!(matches!(renderer.device.write_buffer(stale, 0, &[0; 4]), Err(RhiError::InvalidHandle(_))));
+
+        let mut fresh = SceneWorld::new_session();
+        let block = fresh
+            .create_block(Vec3::new(0.0, 1.0, -4.0), jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap())
+            .unwrap();
+        assert_eq!(fresh.block_count(), 1);
+        assert_eq!(fresh.object_count(), 1);
+        let near = world.material_instance(world.objects().next().unwrap(), 0).unwrap();
+        let block_object = fresh.objects().next().unwrap();
+        fresh.bind_material(block_object, 0, near).unwrap();
+        let snapshot = fresh.extract(RenderFrameId(2)).unwrap();
+        assert_eq!(snapshot.instances().len(), 1);
+        assert_eq!(snapshot.instances()[0].mesh, city);
+        assert_eq!(snapshot.instances()[0].entity, block);
+        let mesh = fresh.meshes().get(city).unwrap();
+        assert_eq!(mesh.vertex_count(), 24);
+        assert_eq!(mesh.index_count(), 36);
+        renderer
+            .update_view(front, RenderViewUpdate { camera: Some(fresh.front_camera()), layout: None, settings: None, pose: None })
+            .unwrap();
+        renderer
+            .update_view(side, RenderViewUpdate { camera: Some(fresh.side_camera()), layout: None, settings: None, pose: None })
+            .unwrap();
+        let derived = fresh.derived_meshlets(city).expect("the block builds clusters from its surface");
+        let records: Vec<jarvig_core::GpuMeshletRecord> = derived.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect();
+        assert!(!records.is_empty());
+        assert_ne!(records.len(), 1044);
+        assert_eq!(records.iter().map(|record| record.triangles).sum::<u32>(), 12);
+        renderer.remember_meshlets(city, &records);
+        assert_eq!(present(&mut renderer, &fresh, &materials, &textures, target, 2), FrameOutcome::Presented { frame: 2 });
+        assert!(renderer.mesh_upload_count() > uploads);
+        let resident = match &renderer.gpu_meshes.iter().find(|(id, _)| *id == city).unwrap().1 {
+            GpuResidency::Resident(gpu) => gpu,
+            GpuResidency::Evicted => panic!("block mesh should be resident"),
+        };
+        assert_ne!(resident.vertices, stale);
+        assert_eq!(resident.submeshes[0].index_count, 36);
+        assert_eq!(renderer.gpu_scene.remembered.iter().find(|(id, _)| *id == city).unwrap().1.len(), records.len());
+        let stats = renderer.gpu_scene_stats();
+        assert_eq!(stats.instances, 1);
+        assert_eq!(stats.geometries, 1);
+        assert_eq!(stats.meshlets, records.len() as u32);
+        assert_ne!(stats.meshlets, 1044);
+        assert_eq!(stats.legacy_draw_triangles, 24);
+        assert!(matches!(renderer.device.write_buffer(stale, 0, &[0; 4]), Err(RhiError::InvalidHandle(_))));
+
+        let draw = jarvig_core::meshlet_draw(fresh.derived_meshlets(city).unwrap());
+        renderer
+            .set_meshlet_debug(Some(MeshletDebugBatch {
+                mesh: city,
+                indices: draw.indices,
+                colors: draw.colors,
+                ranges: draw.ranges.into_iter().map(|range| (range.first_index, range.index_count)).collect(),
+                spans: draw.spans.into_iter().map(|range| (range.first_index, range.index_count)).collect(),
+                span_source: draw.span_source,
+                owners: draw.owners,
+                show_ids: false,
+                shade_clustered: true,
+            }))
+            .unwrap();
+        renderer.set_microgeometry(true, 1, false);
+        renderer.set_micro_compatible(true);
+        renderer.set_micro_debug(jarvig_core::MicroDebugMode::Reject);
+        assert_eq!(present(&mut renderer, &fresh, &materials, &textures, target, 3), FrameOutcome::Presented { frame: 3 });
+        let drawn = renderer.gpu_scene_stats();
+        assert_eq!(drawn.legacy_draw_triangles, 0);
+        let front_flags = renderer.slot(front).unwrap().cluster_flags.clone();
+        let side_flags = renderer.slot(side).unwrap().cluster_flags.clone();
+        assert_eq!(front_flags.len(), records.len());
+        assert_eq!(side_flags.len(), records.len());
+        // The front camera frames the whole solid, so every derived cluster is submitted.
+        // The side camera's half of the 32x18 target sees two triangles. Each cluster is one triangle.
+        assert!(front_flags.iter().all(|flag| *flag == 1 || *flag == 4));
+        let side_visible = side_flags.iter().filter(|flag| **flag == 1 || **flag == 4).count();
+        assert_eq!(side_visible, 2);
+        assert_eq!(drawn.meshlet_draw_triangles, (records.len() + side_visible) as u32);
+        assert_eq!(drawn.meshlets, records.len() as u32);
+        // The last view is the side camera. Every cluster is classified. The two on-screen
+        // triangles project the 2 cm feature under 1 px, so Einstein builds no patches.
+        assert_eq!(renderer.micro_reasons.len(), side_flags.len());
+        for (reason, flag) in renderer.micro_reasons.iter().zip(side_flags.iter()) {
+            match *flag {
+                1 | 4 => assert_eq!(*reason, jarvig_core::DetailReject::BelowThreshold),
+                3 => assert_eq!(*reason, jarvig_core::DetailReject::Occluded),
+                _ => assert_eq!(*reason, jarvig_core::DetailReject::OffScreen),
+            }
+        }
+        assert_eq!(drawn.micro_triangles, 0);
+        assert!(renderer.gpu_scene.hierarchy_nodes.as_ref().is_some_and(|hierarchy| hierarchy.leaf_count as usize == records.len()));
     }
 
     #[test]

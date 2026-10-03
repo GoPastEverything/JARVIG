@@ -30,7 +30,7 @@ An entity row is keyed by `EntityUuid`.
 
 Not by `EntityHandle`, `ObjectId`, a tree item, an array index, or `RenderInstanceId`. The handle is resolved only when a core call needs it. A recycled slot must not reparent or resurrect a row.
 
-Names are the label. They do not have to be unique. An empty name is shown as `Unnamed`. The tree paints a class suffix after the name when the entity has one: `Mesh`, `Light`, `Probe`, or `World`. An entity with no component has no suffix. The suffix is not the row identity. There are no bitmap icons.
+Names are the label. They do not have to be unique. An empty name is shown as `Unnamed`. The tree paints a class suffix after the name when the entity has one: `Mesh`, `Light`, `Probe`, `World`, `Terrain`, `Spawn`, or `Block`. An entity with no component has no suffix. The suffix is not the row identity. There are no bitmap icons. The ground grid and the axis triad are not rows.
 
 A pose edit or a play tick revises the world and does not rebuild the tree. The Win32 items stay. The tree is realized again when an entity is added, removed, renamed, reparented, or changes class, and when Play starts or stops. During play the root label is `Runtime`.
 

@@ -29,15 +29,15 @@ The menu bar, toolbar, and status bar are application chrome. They are not dock 
 
 ## Editor modes
 
-Level, Land, and Character are workspaces over the same project data. The toolbar shows those three words. View > Land Mode and View > Character Editor select the same modes. The level is not copied.
+Level and Land are workspaces over the authored world. Character opens one character asset in its own preview. The toolbar shows an icon and the word for Level, Land, and Character. View > Land Mode and View > Character Editor select the same modes. ADR-0059.
 
-Level is the authored world. Characters, props, lights, and terrain stay visible. The terrain editing grid is off. Joint helpers are off.
+Level is the authored world. Placed actors, lights, and terrain stay visible. The terrain editing grid is off. Joint helpers are off. A character asset is not an actor until a component asks for it. A Player Start is a spawn gizmo. Preview Character can show the referenced body, and that ghost is not saved.
 
 Land is the terrain workspace. The terrain is the editable object. Characters, props, and gameplay actors are hidden until Show Full Level. The conforming grid is on by default, depth-tested, and follows the surface. Minor and major spacing stay independent. Sculpt, smooth, flatten, and paint run only here.
 
-Character is the rig workspace. Terrain and props are hidden. Joints, limits, and pose tools draw here. A character asset opens here. A level with no rig stays in the current mode.
+Character is the asset editor for an articulated body. The left tree is Joints, which is the 0.02 m contact hierarchy, not an anatomical bone list. View > Mesh Parts lists the imported mesh parts. The center is that asset's preview. The inspector is the joint. Skin, animation, and physics are not in this editor. A level that already contains a rig, such as the primitive mannequin, still edits that rig in place. A level with no rig opens the last character asset and restores the authored level on the way back. Save during that preview writes nothing. Double-clicking a character opens it. Double-clicking a player definition does not place a body.
 
-The last mode and its visualization settings are `Saved/Editor/workspace.json`, schema `jarvig.editor-workspace` version 1. That file is editor state, beside `viewport.json`. It is not in the level. A Terrain World template opens in Land only when that file is absent. Land overlays and joint helpers are applied in their own mode. Level does not draw them.
+The last mode and its visualization settings are `Saved/Editor/workspace.json`, schema `jarvig.editor-workspace` version 1. That file is editor state, beside `viewport.json`. It is not in the level. A Landscape template, including the older words `terrain` and `land`, opens in Land only when that file is absent. Land overlays and joint helpers are applied in their own mode. Level does not draw them.
 
 This is not the dock layout. Named layout presets and a saved dock tree are still JRV-0069. Reset Layout does not change the mode.
 

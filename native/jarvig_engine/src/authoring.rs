@@ -12,8 +12,8 @@ use jarvig_core::{
     FIELD_METALLIC_FACTOR, FIELD_NORMAL_SCALE, FIELD_ROUGHNESS_FACTOR, FIELD_SHADOW_DISTANCE, FIELD_SHADOW_FILTER, FIELD_SHADOW_NORMAL_BIAS,
     FIELD_SHADOW_RESOLUTION, FIELD_SHADOW_SLOPE_BIAS, FIELD_UPPER_COLOR, FIELD_UV_SCALE,
     FIELD_FAR_PLANE, FIELD_NEAR_PLANE, FIELD_ORTHO_HEIGHT, FIELD_PARENT, FIELD_PROJECTION, FIELD_RESOLUTION, FIELD_UPDATE_MODE, FIELD_VERTICAL_FOV, FIELD_VIEWPORT, FIELD_VISIBLE,
-    TYPE_CAMERA, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_JOINT, TYPE_MESH_RENDERER, TYPE_POINT_LIGHT, TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME,
-    TYPE_SPOT_LIGHT, TYPE_TERRAIN,
+    TYPE_CAMERA, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_JOINT, TYPE_MESH_RENDERER, TYPE_PARAMETRIC_BLOCK, TYPE_PLAYER_START, TYPE_POINT_LIGHT,
+    TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME, TYPE_SPOT_LIGHT, TYPE_TERRAIN,
 };
 
 use crate::EngineSession;
@@ -32,6 +32,42 @@ pub enum AuthoringCommand {
     RemoveComponent { target: EntityId, type_id: TypeId, slot: u32 },
     /// Flat chunked heightfield centered at a scene-local point. One terrain actor.
     CreateTerrain { local: jarvig_core::Vec3, record: jarvig_core::TerrainRecord },
+    /// One parametric block. `local` is scene-local meters. Size stays on the solid, not entity scale.
+    CreateBlock { local: jarvig_core::Vec3 },
+    /// Absolute face push from a drag baseline. History is [`Self::CommitBlockFace`].
+    PushBlockFace {
+        target: EntityId,
+        face: u8,
+        baseline_size: [f64; 3],
+        baseline_local: jarvig_core::Vec3,
+        outward_m: f64,
+    },
+    /// One history entry when an extrude session is applied. A drag release does not call this.
+    CommitBlockFace { target: EntityId, face: u8, baseline_size: [f64; 3] },
+    /// Live bevel. History is [`Self::CommitBlockBevel`].
+    PreviewBlockBevel { target: EntityId, meters: f64 },
+    /// Live inset on one face. History is [`Self::CommitBlockInset`].
+    PreviewBlockInset { target: EntityId, face: u8, meters: f64 },
+    /// One bevel entry when the preview moved.
+    CommitBlockBevel { target: EntityId, baseline_m: f64 },
+    /// One inset entry when the preview moved.
+    CommitBlockInset { target: EntityId, face: u8, baseline_m: f64 },
+    /// Size returns to 2 m and the feature parameters clear. Translation stays.
+    ResetBlockShape { target: EntityId },
+    /// Independent copy sharing one face. Not a live instance.
+    MirrorBlock { target: EntityId, axis: u8 },
+    /// Lowest corner onto scene Y = 0.
+    AlignBlockToGround { target: EntityId },
+    /// Rounds local translation. Does not change a Move-gizmo drag.
+    SnapBlock { target: EntityId, step_m: f64 },
+    /// Puts a face drag back to its start. Does not append history.
+    RestoreBlockDrag {
+        target: EntityId,
+        size_m: [f64; 3],
+        inset_m: [f64; 6],
+        bevel_m: f64,
+        translation: jarvig_core::Vec3,
+    },
     /// Writes the heightfield. Does not generate Einstein detail.
     /// `rebuild_meshes` builds the derived chunk visuals on this thread. Land Mode passes false
     /// and publishes those meshes from the job queue.
@@ -96,6 +132,37 @@ impl EngineSession {
                     self.bind_new_chunk_materials(master).map_err(|_| AuthoringError::InvalidOperation)?;
                 }
                 Ok(AuthoringResult::Applied)
+            }
+            AuthoringCommand::PushBlockFace { target, face, baseline_size, baseline_local, outward_m } => {
+                self.world.push_block_face(target, face, baseline_size, baseline_local, outward_m)
+            }
+            AuthoringCommand::CommitBlockFace { target, face, baseline_size } => self.world.commit_block_face(target, face, baseline_size),
+            AuthoringCommand::PreviewBlockBevel { target, meters } => self.world.preview_block_bevel(target, meters),
+            AuthoringCommand::PreviewBlockInset { target, face, meters } => self.world.preview_block_inset(target, face, meters),
+            AuthoringCommand::CommitBlockBevel { target, baseline_m } => self.world.commit_block_bevel(target, baseline_m),
+            AuthoringCommand::CommitBlockInset { target, face, baseline_m } => self.world.commit_block_inset(target, face, baseline_m),
+            AuthoringCommand::ResetBlockShape { target } => self.world.reset_block_shape(target),
+            AuthoringCommand::MirrorBlock { target, axis } => {
+                let created = self.world.mirror_block(target, axis as usize)?;
+                Ok(AuthoringResult::Duplicated(created))
+            }
+            AuthoringCommand::AlignBlockToGround { target } => self.world.align_block_to_ground(target),
+            AuthoringCommand::SnapBlock { target, step_m } => self.world.snap_block_translation(target, step_m),
+            AuthoringCommand::RestoreBlockDrag { target, size_m, inset_m, bevel_m, translation } => {
+                self.world.restore_block_drag(target, size_m, inset_m, bevel_m, translation)
+            }
+            AuthoringCommand::CreateBlock { local } => {
+                let master = if self.runtime.profile().renders() {
+                    Some(self.current_material_master().map_err(|_| AuthoringError::InvalidOperation)?)
+                } else {
+                    None
+                };
+                let record = jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).map_err(|_| AuthoringError::InvalidValue)?;
+                let id = self.world.create_block(local, record)?;
+                if let Some(master) = master {
+                    self.bind_entity_material(id, master).map_err(|_| AuthoringError::InvalidOperation)?;
+                }
+                Ok(AuthoringResult::Created(id))
             }
             AuthoringCommand::StampTerrain { target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes } => {
                 self.world.stamp_terrain(target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes)?;
@@ -288,6 +355,12 @@ impl EngineSession {
                         let next = jarvig_core::apply_terrain_property(&current, field, value)?;
                         self.world.set_authored_terrain(target, next)
                     }
+                    (TYPE_PLAYER_START, _) => {
+                        let Some(current) = self.world.authored_player_start(target) else { return Err(AuthoringError::InvalidOperation) };
+                        let next = jarvig_core::apply_player_start_property(&current, field, value)?;
+                        self.world.set_authored_player_start(target, next)
+                    }
+                    (TYPE_PARAMETRIC_BLOCK, _) => self.world.set_block_field(target, field, value),
                     _ => Err(AuthoringError::ReadOnly),
                 }
             }

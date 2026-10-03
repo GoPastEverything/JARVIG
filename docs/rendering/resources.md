@@ -1,6 +1,6 @@
 # GPU resources
 
-The logical mesh has no wgpu type and no RHI type. Residency is a renderer decision. A handle is not the backend object. ADR-0024.
+The logical mesh has no wgpu type and no RHI type. Residency is a renderer decision. A handle is not the backend object. ADR-0024. That residency belongs to one world. `MeshId` starts again when the world is replaced, so the previous world's buffers and meshlet records are released with it. The device, the swapchain, and the editor overlays stay. ADR-0063.
 
 The HDR scene target is the same kind of residency. It is created with the drawable size, sampled by the output pass, and retired on resize and shutdown. It is not a mesh and not a material texture.
 

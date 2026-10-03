@@ -6,7 +6,7 @@
 use crate::{EntityId, Quat, Vec3};
 
 /// Independent of `JARVIG_API_VERSION`. Bump it when a field meaning changes.
-pub const TYPE_REGISTRY_VERSION: u32 = 6;
+pub const TYPE_REGISTRY_VERSION: u32 = 9;
 
 /// JARVIG schema id. Stable for this registry version. Not a Rust `TypeId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,8 @@ pub const TYPE_PAWN: TypeId = TypeId(11);
 pub const TYPE_FREE_FLY: TypeId = TypeId(12);
 pub const TYPE_JOINT: TypeId = TypeId(13);
 pub const TYPE_TERRAIN: TypeId = TypeId(14);
+pub const TYPE_PLAYER_START: TypeId = TypeId(15);
+pub const TYPE_PARAMETRIC_BLOCK: TypeId = TypeId(16);
 
 pub const FIELD_NAME: FieldId = FieldId(1);
 pub const FIELD_UUID: FieldId = FieldId(2);
@@ -114,6 +116,23 @@ pub const FIELD_TERRAIN_CLIFF: FieldId = FieldId(84);
 pub const FIELD_TERRAIN_DEBUG: FieldId = FieldId(85);
 pub const FIELD_TERRAIN_DEBUG_COLORS: FieldId = FieldId(86);
 pub const FIELD_TERRAIN_EINSTEIN_COLLISION: FieldId = FieldId(87);
+pub const FIELD_PLAYER_DEFINITION: FieldId = FieldId(88);
+pub const FIELD_PREVIEW_CHARACTER: FieldId = FieldId(89);
+pub const FIELD_BLOCK_SIZE_X: FieldId = FieldId(90);
+pub const FIELD_BLOCK_SIZE_Y: FieldId = FieldId(91);
+pub const FIELD_BLOCK_SIZE_Z: FieldId = FieldId(92);
+pub const FIELD_BLOCK_COLLISION: FieldId = FieldId(93);
+pub const FIELD_BLOCK_MATERIAL: FieldId = FieldId(94);
+pub const FIELD_BLOCK_ORIGIN: FieldId = FieldId(95);
+pub const FIELD_BLOCK_BEVEL: FieldId = FieldId(96);
+pub const FIELD_BLOCK_INSET_PX: FieldId = FieldId(97);
+pub const FIELD_BLOCK_INSET_NX: FieldId = FieldId(98);
+pub const FIELD_BLOCK_INSET_PY: FieldId = FieldId(99);
+pub const FIELD_BLOCK_INSET_NY: FieldId = FieldId(100);
+pub const FIELD_BLOCK_INSET_PZ: FieldId = FieldId(101);
+pub const FIELD_BLOCK_INSET_NZ: FieldId = FieldId(102);
+pub const FIELD_BLOCK_HISTORY: FieldId = FieldId(103);
+pub const FIELD_BLOCK_COLLISION_ENABLED: FieldId = FieldId(104);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueKind {
@@ -292,6 +311,14 @@ fn component_field(
     let (minimum, maximum) = match id {
         FIELD_ROUGHNESS_FACTOR | FIELD_METALLIC_FACTOR | FIELD_NORMAL_SCALE | FIELD_UV_SCALE => (Some(0.0), None),
         FIELD_RADIUS => (Some(0.01), None),
+        FIELD_BLOCK_SIZE_X | FIELD_BLOCK_SIZE_Y | FIELD_BLOCK_SIZE_Z => (Some(0.05), Some(1000.0)),
+        FIELD_BLOCK_BEVEL
+        | FIELD_BLOCK_INSET_PX
+        | FIELD_BLOCK_INSET_NX
+        | FIELD_BLOCK_INSET_PY
+        | FIELD_BLOCK_INSET_NY
+        | FIELD_BLOCK_INSET_PZ
+        | FIELD_BLOCK_INSET_NZ => (Some(0.0), Some(1000.0)),
         _ => (None, None),
     };
     let precision = match id {
@@ -512,6 +539,33 @@ fn terrain_fields() -> &'static [FieldInfo] {
     ]))
 }
 
+fn block_fields() -> &'static [FieldInfo] {
+    Box::leak(Box::new([
+        component_field(FIELD_BLOCK_SIZE_X, "size_x_m", "Size X", ValueKind::Float64, true, "Shape", "m"),
+        component_field(FIELD_BLOCK_SIZE_Y, "size_y_m", "Size Y", ValueKind::Float64, true, "Shape", "m"),
+        component_field(FIELD_BLOCK_SIZE_Z, "size_z_m", "Size Z", ValueKind::Float64, true, "Shape", "m"),
+        component_field(FIELD_BLOCK_ORIGIN, "origin", "Origin", ValueKind::String, false, "Shape", ""),
+        component_field(FIELD_BLOCK_BEVEL, "bevel_m", "Bevel", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_PX, "inset_px_m", "Inset +X", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_NX, "inset_nx_m", "Inset -X", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_PY, "inset_py_m", "Inset +Y", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_NY, "inset_ny_m", "Inset -Y", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_PZ, "inset_pz_m", "Inset +Z", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_INSET_NZ, "inset_nz_m", "Inset -Z", ValueKind::Float64, true, "Modeling", "m"),
+        component_field(FIELD_BLOCK_HISTORY, "history", "History", ValueKind::String, false, "Modeling", ""),
+        component_field(FIELD_BLOCK_COLLISION, "collision", "Collision", ValueKind::String, false, "Collision", ""),
+        component_field(FIELD_BLOCK_COLLISION_ENABLED, "collision_enabled", "Collision Enabled", ValueKind::String, false, "Collision", ""),
+        component_field(FIELD_BLOCK_MATERIAL, "material", "Material", ValueKind::String, false, "Material", ""),
+    ]))
+}
+
+fn player_start_fields() -> &'static [FieldInfo] {
+    Box::leak(Box::new([
+        component_field(FIELD_PLAYER_DEFINITION, "player", "Player Definition", ValueKind::String, true, "Player Start", ""),
+        component_field(FIELD_PREVIEW_CHARACTER, "preview", "Preview Character", ValueKind::Bool, true, "Player Start", ""),
+    ]))
+}
+
 fn described(
     id: TypeId,
     canonical_name: &'static str,
@@ -539,6 +593,8 @@ fn registry() -> &'static [TypeInfo] {
         described(TYPE_FREE_FLY, "free_fly", "Free Fly", NO_FIELDS, ComponentMultiplicity::One, REQUIRES_PAWN, NO_TYPES),
         described(TYPE_JOINT, "joint", "Joint", joint_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
         described(TYPE_TERRAIN, "terrain", "Terrain", terrain_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
+        described(TYPE_PLAYER_START, "player_start", "Player Start", player_start_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
+        described(TYPE_PARAMETRIC_BLOCK, "parametric_block", "Block", block_fields(), ComponentMultiplicity::One, REQUIRES_TRANSFORM, NO_TYPES),
         described(TYPE_COMPONENT_STACK, "component_stack", "Components", stack_fields(), ComponentMultiplicity::NotAComponent, NO_TYPES, NO_TYPES),
     ]))
 }
@@ -590,6 +646,8 @@ pub enum AuthoringResult {
     Unchanged,
     /// The new entity. Not the source, and not a subsystem id.
     Duplicated(EntityId),
+    /// An entity this command created. Not a subsystem id.
+    Created(EntityId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,7 +726,22 @@ mod tests {
 
     #[test]
     fn registry_ids_are_deterministic_and_not_rust_type_ids() {
-        assert_eq!(TYPE_REGISTRY_VERSION, 6);
+        assert_eq!(TYPE_REGISTRY_VERSION, 9);
+        let block = find_type(TYPE_PARAMETRIC_BLOCK).unwrap();
+        assert_eq!(block.canonical_name, "parametric_block");
+        assert!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_SIZE_X).unwrap().editable);
+        assert_eq!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_SIZE_X).unwrap().group, "Shape");
+        assert!(!find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_ORIGIN).unwrap().editable);
+        assert_eq!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_BEVEL).unwrap().group, "Modeling");
+        assert!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_BEVEL).unwrap().editable);
+        assert!(!find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_HISTORY).unwrap().editable);
+        assert!(!find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_COLLISION).unwrap().editable);
+        assert_eq!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_COLLISION_ENABLED).unwrap().kind, ValueKind::String);
+        assert_eq!(find_field(TYPE_PARAMETRIC_BLOCK, FIELD_BLOCK_MATERIAL).unwrap().group, "Material");
+        let player_start = find_type(TYPE_PLAYER_START).unwrap();
+        assert_eq!(player_start.canonical_name, "player_start");
+        assert!(find_field(TYPE_PLAYER_START, FIELD_PREVIEW_CHARACTER).unwrap().editable);
+        assert_eq!(find_field(TYPE_PLAYER_START, FIELD_PLAYER_DEFINITION).unwrap().kind, ValueKind::String);
         let terrain = find_type(TYPE_TERRAIN).unwrap();
         assert_eq!(terrain.canonical_name, "terrain");
         assert!(!find_field(TYPE_TERRAIN, FIELD_TERRAIN_WIDTH).unwrap().editable);

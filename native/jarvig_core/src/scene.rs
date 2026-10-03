@@ -123,6 +123,8 @@ pub struct EntityCapabilities {
     pub joint: bool,
     pub world_settings: bool,
     pub terrain: bool,
+    pub player_start: bool,
+    pub block: bool,
 }
 
 impl EntityCapabilities {
@@ -139,6 +141,8 @@ impl EntityCapabilities {
     pub fn authoring_class(self) -> crate::AuthoringClass {
         if self.world_settings {
             crate::AuthoringClass::WorldSettings
+        } else if self.block {
+            crate::AuthoringClass::Block
         } else if self.mesh_renderer {
             crate::AuthoringClass::Mesh
         } else if self.directional_light {
@@ -153,8 +157,87 @@ impl EntityCapabilities {
             crate::AuthoringClass::Camera
         } else if self.terrain {
             crate::AuthoringClass::Terrain
+        } else if self.player_start {
+            crate::AuthoringClass::PlayerStart
         } else {
             crate::AuthoringClass::Empty
+        }
+    }
+}
+
+/// What the inspector may offer. Derived from [`EntityCapabilities`]. Not a second entity store.
+///
+/// `boolean_operand` stays false until a boolean solid exists. An imported mesh is not a parametric solid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuthoringCapabilities {
+    pub transformable: bool,
+    pub parametric_solid: bool,
+    pub face_editable: bool,
+    pub boolean_operand: bool,
+    pub patternable: bool,
+    pub material_assignable: bool,
+    pub collidable: bool,
+    pub component_host: bool,
+}
+
+fn translation_matches(left: Vec3, right: Vec3) -> bool {
+    (left.x - right.x).abs() < 1.0e-9 && (left.y - right.y).abs() < 1.0e-9 && (left.z - right.z).abs() < 1.0e-9
+}
+
+fn block_size_axis(field: crate::FieldId) -> Option<usize> {
+    if field == crate::FIELD_BLOCK_SIZE_X {
+        Some(0)
+    } else if field == crate::FIELD_BLOCK_SIZE_Y {
+        Some(1)
+    } else if field == crate::FIELD_BLOCK_SIZE_Z {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn block_inset_face(field: crate::FieldId) -> Option<u8> {
+    if field == crate::FIELD_BLOCK_INSET_PX {
+        Some(0)
+    } else if field == crate::FIELD_BLOCK_INSET_NX {
+        Some(1)
+    } else if field == crate::FIELD_BLOCK_INSET_PY {
+        Some(2)
+    } else if field == crate::FIELD_BLOCK_INSET_NY {
+        Some(3)
+    } else if field == crate::FIELD_BLOCK_INSET_PZ {
+        Some(4)
+    } else if field == crate::FIELD_BLOCK_INSET_NZ {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+fn block_mesh(record: &crate::BlockRecord) -> crate::Mesh {
+    let size = [record.size_m[0] as f32, record.size_m[1] as f32, record.size_m[2] as f32];
+    let inset = [
+        record.inset_m[0] as f32,
+        record.inset_m[1] as f32,
+        record.inset_m[2] as f32,
+        record.inset_m[3] as f32,
+        record.inset_m[4] as f32,
+        record.inset_m[5] as f32,
+    ];
+    crate::block_surface_mesh(size, inset, record.bevel_m as f32)
+}
+
+impl AuthoringCapabilities {
+    pub fn from_entity(capabilities: EntityCapabilities) -> Self {
+        Self {
+            transformable: capabilities.transform,
+            parametric_solid: capabilities.block,
+            face_editable: capabilities.block,
+            boolean_operand: false,
+            patternable: capabilities.block,
+            material_assignable: capabilities.block || capabilities.mesh_renderer,
+            collidable: capabilities.block,
+            component_host: !capabilities.world_settings,
         }
     }
 }
@@ -173,6 +256,8 @@ pub enum ComponentRole {
     FreeFly,
     Joint,
     Terrain,
+    PlayerStart,
+    Block,
     WorldSettings,
 }
 
@@ -190,6 +275,8 @@ impl ComponentRole {
             Self::FreeFly => "Free Fly",
             Self::Joint => "Joint",
             Self::Terrain => "Terrain",
+            Self::PlayerStart => "Player Spawn",
+            Self::Block => "Block",
             Self::WorldSettings => "World Settings",
         }
     }
@@ -251,6 +338,12 @@ pub struct SceneWorld {
     game_cameras: Vec<WorldCamera>,
     joints: Vec<WorldJoint>,
     terrains: Vec<WorldTerrain>,
+    /// Spawn markers. The character body is not stored here.
+    player_starts: Vec<WorldPlayerStart>,
+    /// Parametric solids. The mesh on the object is derived and is not the save record.
+    blocks: Vec<WorldBlock>,
+    /// Clusters built from a derived surface, keyed by that runtime mesh. Not saved.
+    derived_meshlets: Vec<(MeshId, crate::MeshletSet)>,
     /// Chunk entities. Hidden from the outline and from the save.
     derived_visuals: HashSet<EntityHandle>,
     /// Mesh ids replaced by a sculpt. The editor evicts the GPU copy.
@@ -282,6 +375,16 @@ struct WorldJoint {
     id: JointId,
     handle: EntityHandle,
     record: crate::joint::JointRecord,
+}
+
+struct WorldPlayerStart {
+    handle: EntityHandle,
+    record: crate::PlayerStartRecord,
+}
+
+struct WorldBlock {
+    handle: EntityHandle,
+    record: crate::BlockRecord,
 }
 
 struct WorldTerrain {
@@ -422,6 +525,57 @@ pub struct ExtractedGameCamera {
     pub viewport: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadKind {
+    WorldSettings,
+    Block,
+    Terrain,
+    Mesh,
+    Light,
+    Probe,
+    Camera,
+    Joint,
+    PlayerStart,
+    Transform,
+}
+
+fn payload_kind_of(record: &crate::EntityRecord) -> PayloadKind {
+    let mut kind = PayloadKind::Transform;
+    for component in &record.components {
+        match component {
+            crate::ComponentRecord::WorldSettings => return PayloadKind::WorldSettings,
+            crate::ComponentRecord::ParametricBlock(_) => return PayloadKind::Block,
+            crate::ComponentRecord::Terrain(_) => return PayloadKind::Terrain,
+            crate::ComponentRecord::MeshRenderer { .. } => return PayloadKind::Mesh,
+            crate::ComponentRecord::DirectionalLight(_) | crate::ComponentRecord::PointLight(_) | crate::ComponentRecord::SpotLight(_) => {
+                return PayloadKind::Light
+            }
+            crate::ComponentRecord::ReflectionProbe(_) => kind = PayloadKind::Probe,
+            crate::ComponentRecord::Camera(_) => kind = PayloadKind::Camera,
+            crate::ComponentRecord::Joint(_) => {
+                if kind == PayloadKind::Transform {
+                    kind = PayloadKind::Joint;
+                }
+            }
+            crate::ComponentRecord::PlayerStart(_) => {
+                if kind == PayloadKind::Transform {
+                    kind = PayloadKind::PlayerStart;
+                }
+            }
+            crate::ComponentRecord::Transform { .. } => {}
+        }
+    }
+    kind
+}
+
+/// What applying a transaction did to drawables. Spawned entities need a material bind.
+/// An in-place mesh rebuild keeps the bind it already had.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MementoEffect {
+    pub spawned: Vec<EntityId>,
+    pub rebound: Vec<EntityId>,
+}
+
 impl SceneWorld {
     /// Two meshes, two cameras, one frame tree. Insertion order is near, then far.
     pub fn bootstrap() -> Self {
@@ -442,6 +596,9 @@ impl SceneWorld {
             game_cameras: Vec::new(),
             joints: Vec::new(),
             terrains: Vec::new(),
+            player_starts: Vec::new(),
+            blocks: Vec::new(),
+            derived_meshlets: Vec::new(),
             derived_visuals: HashSet::new(),
             retired_meshes: Vec::new(),
             terrain_dirty: Vec::new(),
@@ -595,6 +752,12 @@ impl SceneWorld {
         if type_id == crate::TYPE_TERRAIN {
             return ComponentBinding::role_only(ComponentRole::Terrain);
         }
+        if type_id == crate::TYPE_PLAYER_START {
+            return ComponentBinding::role_only(ComponentRole::PlayerStart);
+        }
+        if type_id == crate::TYPE_PARAMETRIC_BLOCK {
+            return ComponentBinding::role_only(ComponentRole::Block);
+        }
         ComponentBinding::role_only(ComponentRole::WorldSettings)
     }
 
@@ -635,7 +798,7 @@ impl SceneWorld {
         if type_id == crate::TYPE_ENVIRONMENT {
             return Err(AuthoringError::ProtectedEntity);
         }
-        if type_id == crate::TYPE_MESH_RENDERER || type_id == crate::TYPE_TERRAIN {
+        if type_id == crate::TYPE_MESH_RENDERER || type_id == crate::TYPE_TERRAIN || type_id == crate::TYPE_PARAMETRIC_BLOCK {
             return Err(AuthoringError::Unsupported);
         }
         if type_id == crate::TYPE_SPATIAL_FRAME {
@@ -682,6 +845,12 @@ impl SceneWorld {
                 enabled: true,
                 resolution: crate::REFLECTION_PROBE_RESOLUTION,
             });
+        } else if type_id == crate::TYPE_PLAYER_START {
+            let _frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+            self.player_starts.push(WorldPlayerStart {
+                handle,
+                record: crate::PlayerStartRecord { player: String::new(), preview: false },
+            });
         } else {
             return Err(AuthoringError::Unsupported);
         }
@@ -700,7 +869,7 @@ impl SceneWorld {
         if self.is_world_settings(handle) && type_id == crate::TYPE_ENVIRONMENT {
             return Err(AuthoringError::ProtectedEntity);
         }
-        if type_id == crate::TYPE_TERRAIN {
+        if type_id == crate::TYPE_TERRAIN || type_id == crate::TYPE_PARAMETRIC_BLOCK {
             return Err(AuthoringError::Unsupported);
         }
         let owned = self.entities.membership(handle).map_err(|_| AuthoringError::NotFound)?.to_vec();
@@ -722,6 +891,8 @@ impl SceneWorld {
         } else if type_id == crate::TYPE_JOINT {
             self.release_joint_to_scene(handle)?;
             self.joints.retain(|joint| joint.handle != handle);
+        } else if type_id == crate::TYPE_PLAYER_START {
+            self.player_starts.retain(|start| start.handle != handle);
         } else if type_id == crate::TYPE_SPATIAL_FRAME {
             self.anchors.retain(|(anchor, _)| *anchor != handle);
         }
@@ -777,6 +948,231 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
     }
 
+    /// Direct children that are saved with the level. Derived terrain chunks are omitted.
+    pub fn entity_children(&self, id: EntityId) -> Vec<EntityId> {
+        let Ok(handle) = self.entities.find(id) else { return Vec::new() };
+        let mut children = Vec::new();
+        for child in self.entities.handles() {
+            if self.derived_visuals.contains(&child) {
+                continue;
+            }
+            if self.entities.parent(child).ok().flatten() == Some(handle) {
+                if let Ok(uuid) = self.entities.uuid(child) {
+                    children.push(uuid);
+                }
+            }
+        }
+        children
+    }
+
+    /// The save record for one entity. Same bytes a level capture would write for it.
+    pub fn remember_entity(&self, id: EntityId) -> Result<crate::EntityRecord, crate::LevelError> {
+        crate::level::capture_entity(self, id)
+    }
+
+    /// Applies one transaction set. Present entities that are missing are spawned first,
+    /// existing Present entities are rewritten in place, then Absent entities are destroyed.
+    /// World Settings is never destroyed. A block rewrite replaces the record, including its log.
+    pub fn apply_mementos(&mut self, mementos: &[crate::EntityMemento]) -> Result<MementoEffect, AuthoringError> {
+        let mut effect = MementoEffect::default();
+        let mut pending: Vec<crate::EntityRecord> = mementos
+            .iter()
+            .filter_map(|memento| match memento {
+                crate::EntityMemento::Present(record) if self.entities.find(record.uuid).is_err() => Some(record.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut guard = pending.len() + 1;
+        while !pending.is_empty() {
+            guard -= 1;
+            if guard == 0 {
+                return Err(AuthoringError::InvalidOperation);
+            }
+            let ready = pending.iter().position(|record| match record.parent_uuid {
+                None => true,
+                Some(parent) => self.entities.find(parent).is_ok() || !pending.iter().any(|other| other.uuid == parent),
+            });
+            let Some(index) = ready else { return Err(AuthoringError::InvalidOperation) };
+            let record = pending.remove(index);
+            self.spawn_remembered(&record)?;
+            effect.spawned.push(record.uuid);
+        }
+        for memento in mementos {
+            let crate::EntityMemento::Present(record) = memento else { continue };
+            if self.entities.find(record.uuid).is_err() {
+                continue;
+            }
+            if self.conform_present(record)? {
+                effect.rebound.push(record.uuid);
+            }
+        }
+        for memento in mementos.iter().rev() {
+            let crate::EntityMemento::Absent(id) = memento else { continue };
+            if self.entities.find(*id).is_err() || self.authored_world_settings(*id).is_some() {
+                continue;
+            }
+            self.destroy_authored(*id)?;
+        }
+        Ok(effect)
+    }
+
+    fn spawn_remembered(&mut self, record: &crate::EntityRecord) -> Result<(), AuthoringError> {
+        let id = self.entities.uuid(self.environment_entity).map_err(|_| AuthoringError::InvalidOperation)?;
+        let settings = self.authored_world_settings(id).ok_or(AuthoringError::InvalidOperation)?;
+        crate::level::spawn_entity(self, record, &settings).map_err(|_| AuthoringError::InvalidOperation)
+    }
+
+    /// Rewrites an existing entity from a save record. Returns whether the material factors changed.
+    fn conform_present(&mut self, record: &crate::EntityRecord) -> Result<bool, AuthoringError> {
+        if self.remember_entity(record.uuid).ok().as_ref() == Some(record) {
+            return Ok(false);
+        }
+        let id = record.uuid;
+        if self.authored_world_settings(id).is_some() {
+            let _ = self.set_entity_name(id, &record.name);
+            return Ok(false);
+        }
+        let previous_material = self.authored_block(id).map(|block| block.material).or_else(|| self.authored_mesh(id).map(|mesh| mesh.7));
+        let live_kind = self.payload_kind(id);
+        let wanted_kind = payload_kind_of(record);
+        if live_kind != wanted_kind {
+            self.destroy_authored(id)?;
+            self.spawn_remembered(record)?;
+            return Ok(true);
+        }
+        let _ = self.set_entity_name(id, &record.name);
+        if self.entity_parent(id).ok() != Some(record.parent_uuid) {
+            self.reparent_authored(id, record.parent_uuid)?;
+        }
+        if let Some((translation, rotation, scale)) = record.components.iter().find_map(|component| match component {
+            crate::ComponentRecord::Transform { translation, rotation, scale } => Some((*translation, *rotation, *scale)),
+            _ => None,
+        }) {
+            let _ = self.set_entity_local_translation(id, translation);
+            let _ = self.set_entity_local_rotation(id, rotation);
+            if self.objects.iter().any(|object| self.entities.uuid(object.handle).ok() == Some(id)) {
+                let _ = self.set_object_scale(id, scale);
+            }
+        }
+        let mut rebound = false;
+        for component in &record.components {
+            match component {
+                crate::ComponentRecord::Transform { .. } | crate::ComponentRecord::WorldSettings => {}
+                crate::ComponentRecord::ParametricBlock(block) => {
+                    self.replace_block_record(id, block.clone())?;
+                    rebound = previous_material.as_ref() != Some(&block.material);
+                }
+                crate::ComponentRecord::Terrain(terrain) => {
+                    let _ = self.set_authored_terrain(id, terrain.clone());
+                }
+                crate::ComponentRecord::MeshRenderer { visible, cast_shadows, receive_shadows, mesh, material } => {
+                    self.write_mesh_record(id, *visible, *cast_shadows, *receive_shadows, mesh.clone(), material.clone())?;
+                    rebound = previous_material.as_ref() != Some(material);
+                }
+                crate::ComponentRecord::DirectionalLight(light) | crate::ComponentRecord::PointLight(light) | crate::ComponentRecord::SpotLight(light) => {
+                    self.write_light_record(id, light);
+                }
+                crate::ComponentRecord::ReflectionProbe(probe) => self.write_probe_record(id, probe),
+                crate::ComponentRecord::Camera(camera) => self.write_camera_record(id, camera),
+                crate::ComponentRecord::Joint(joint) => {
+                    let Ok(handle) = self.entities.find(id) else { continue };
+                    if let Some(slot) = self.joints.iter_mut().find(|slot| slot.handle == handle) {
+                        slot.record = *joint;
+                    }
+                }
+                crate::ComponentRecord::PlayerStart(start) => {
+                    let _ = self.set_authored_player_start(id, start.clone());
+                }
+            }
+        }
+        Ok(rebound)
+    }
+
+    fn payload_kind(&self, id: EntityId) -> PayloadKind {
+        if self.authored_world_settings(id).is_some() {
+            PayloadKind::WorldSettings
+        } else if self.authored_block(id).is_some() {
+            PayloadKind::Block
+        } else if self.authored_terrain(id).is_some() {
+            PayloadKind::Terrain
+        } else if self.authored_mesh(id).is_some() {
+            PayloadKind::Mesh
+        } else if self.authored_light(id).is_some() {
+            PayloadKind::Light
+        } else if self.authored_probe(id).is_some() {
+            PayloadKind::Probe
+        } else if self.authored_camera(id).is_some() {
+            PayloadKind::Camera
+        } else if self.authored_joint(id).is_some() {
+            PayloadKind::Joint
+        } else if self.authored_player_start(id).is_some() {
+            PayloadKind::PlayerStart
+        } else {
+            PayloadKind::Transform
+        }
+    }
+
+    fn write_mesh_record(
+        &mut self,
+        id: EntityId,
+        visible: bool,
+        cast_shadows: bool,
+        receive_shadows: bool,
+        mesh: crate::MeshAssetRef,
+        material: crate::MaterialAssetRef,
+    ) -> Result<(), AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let object = self.objects.iter_mut().find(|object| object.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
+        object.visible = visible;
+        object.cast_shadows = cast_shadows;
+        object.receive_shadows = receive_shadows;
+        object.authored_mesh = Some(mesh);
+        object.authored_material = Some(material);
+        self.revise();
+        Ok(())
+    }
+
+    fn write_light_record(&mut self, id: EntityId, light: &crate::LightRecord) {
+        let Ok(handle) = self.entities.find(id) else { return };
+        if let Some(slot) = self.lights.iter_mut().find(|slot| slot.handle == handle) {
+            slot.enabled = light.enabled;
+            slot.color_linear = light.color;
+            slot.intensity = light.intensity;
+            slot.range_m = light.range_m;
+            slot.inner_radians = light.inner_radians;
+            slot.outer_radians = light.outer_radians;
+            slot.shadow = light.shadow;
+        }
+        self.revise_lighting();
+    }
+
+    fn write_probe_record(&mut self, id: EntityId, probe: &crate::ProbeRecord) {
+        let Ok(handle) = self.entities.find(id) else { return };
+        if let Some(slot) = self.probes.iter_mut().find(|slot| slot.handle == handle) {
+            slot.enabled = probe.enabled;
+            slot.radius_m = probe.radius_m;
+            slot.intensity = probe.intensity;
+            slot.priority = probe.priority;
+            slot.resolution = probe.resolution;
+        }
+        self.revise_lighting();
+    }
+
+    fn write_camera_record(&mut self, id: EntityId, camera: &crate::CameraRecord) {
+        let Ok(handle) = self.entities.find(id) else { return };
+        if let Some(slot) = self.game_cameras.iter_mut().find(|slot| slot.handle == handle) {
+            slot.enabled = camera.enabled;
+            slot.orthographic = camera.orthographic;
+            slot.vertical_fov_deg = camera.vertical_fov_deg;
+            slot.ortho_height_m = camera.ortho_height_m;
+            slot.near_m = camera.near_m;
+            slot.far_m = camera.far_m;
+            slot.priority = camera.priority;
+            slot.viewport = camera.viewport;
+        }
+        self.revise();
+    }
+
     fn ownership_of_handle(&self, handle: EntityHandle) -> EntityOwnership {
         let object = self.objects.iter().find(|object| object.handle == handle);
         let light = self.lights.iter().find(|light| light.handle == handle);
@@ -797,6 +1193,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         capabilities.camera = camera.is_some();
         capabilities.joint = joint.is_some();
         capabilities.terrain = self.terrains.iter().any(|terrain| terrain.handle == handle);
+        capabilities.player_start = self.player_starts.iter().any(|start| start.handle == handle);
+        capabilities.block = self.blocks.iter().any(|block| block.handle == handle);
+        capabilities.mesh_renderer = object.is_some() && !capabilities.block;
         capabilities.world_settings = handle == self.environment_entity;
         EntityOwnership {
             capabilities,
@@ -889,6 +1288,12 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             sections.push(section);
         }
         if let Some(section) = self.terrain_section(handle) {
+            sections.push(section);
+        }
+        if let Some(section) = self.player_start_section(handle) {
+            sections.push(section);
+        }
+        if let Some(section) = self.block_section(handle) {
             sections.push(section);
         }
         let stack = self.stack_of_handle(handle);
@@ -1118,6 +1523,49 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         })
     }
 
+    fn player_start_section(&self, handle: EntityHandle) -> Option<InspectedSection> {
+        let start = self.player_starts.iter().find(|start| start.handle == handle)?;
+        let info = crate::find_type(crate::TYPE_PLAYER_START).expect("player start type");
+        let player = start.record.player.clone();
+        Some(InspectedSection {
+            type_info: *info,
+            fields: vec![
+                inspected(info, crate::FIELD_PLAYER_DEFINITION, PropertyValue::String(player.clone()), if player.is_empty() { "None".into() } else { player }),
+                inspected(info, crate::FIELD_PREVIEW_CHARACTER, PropertyValue::Bool(start.record.preview), bool_text(start.record.preview)),
+            ],
+        })
+    }
+
+    fn block_section(&self, handle: EntityHandle) -> Option<InspectedSection> {
+        let block = self.blocks.iter().find(|block| block.handle == handle)?;
+        let info = crate::find_type(crate::TYPE_PARAMETRIC_BLOCK).expect("block type");
+        let size = block.record.size_m;
+        let inset = block.record.inset_m;
+        let material = block.record.material.name.clone();
+        let history = block.record.history_text();
+        let number = |field, value: f64| inspected(info, field, PropertyValue::F64(value), crate::format_f64(value));
+        Some(InspectedSection {
+            type_info: *info,
+            fields: vec![
+                number(crate::FIELD_BLOCK_SIZE_X, size[0]),
+                number(crate::FIELD_BLOCK_SIZE_Y, size[1]),
+                number(crate::FIELD_BLOCK_SIZE_Z, size[2]),
+                inspected(info, crate::FIELD_BLOCK_ORIGIN, PropertyValue::String("Center".into()), "Center".into()),
+                number(crate::FIELD_BLOCK_BEVEL, block.record.bevel_m),
+                number(crate::FIELD_BLOCK_INSET_PX, inset[0]),
+                number(crate::FIELD_BLOCK_INSET_NX, inset[1]),
+                number(crate::FIELD_BLOCK_INSET_PY, inset[2]),
+                number(crate::FIELD_BLOCK_INSET_NY, inset[3]),
+                number(crate::FIELD_BLOCK_INSET_PZ, inset[4]),
+                number(crate::FIELD_BLOCK_INSET_NZ, inset[5]),
+                inspected(info, crate::FIELD_BLOCK_HISTORY, PropertyValue::String(history.clone()), history),
+                inspected(info, crate::FIELD_BLOCK_COLLISION, PropertyValue::String("Analytic box".into()), "Analytic box".into()),
+                inspected(info, crate::FIELD_BLOCK_COLLISION_ENABLED, PropertyValue::String("Yes".into()), "Yes".into()),
+                inspected(info, crate::FIELD_BLOCK_MATERIAL, PropertyValue::String(material.clone()), material),
+            ],
+        })
+    }
+
     pub fn set_entity_name(&mut self, id: EntityId, name: &str) -> Result<AuthoringResult, AuthoringError> {
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         if self.entities.name(handle).map_err(|_| AuthoringError::NotFound)? == name {
@@ -1177,6 +1625,13 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         self.revise();
         Ok(AuthoringResult::Applied)
+    }
+
+    /// Parent-relative pose. Read-only. A block under the scene uses this as scene-local meters.
+    pub fn entity_local_pose(&self, id: EntityId) -> Result<HighPrecisionPose, AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)
     }
 
     /// Resolved root pose. Read-only. Does not revise the world.
@@ -1369,11 +1824,19 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         for child in children {
             self.entities.set_parent(child, None).map_err(|_| AuthoringError::InvalidOperation)?;
         }
+        let block_mesh = self.blocks.iter().find(|block| block.handle == handle).and_then(|_| {
+            self.objects.iter().find(|object| object.handle == handle).map(|object| object.mesh)
+        });
+        self.blocks.retain(|block| block.handle != handle);
         self.objects.retain(|object| object.handle != handle);
+        if let Some(mesh) = block_mesh {
+            self.retire_unused_mesh(mesh);
+        }
         self.lights.retain(|light| light.handle != handle);
         self.probes.retain(|probe| probe.handle != handle);
         self.game_cameras.retain(|camera| camera.handle != handle);
         self.joints.retain(|joint| joint.handle != handle);
+        self.player_starts.retain(|start| start.handle != handle);
         self.anchors.retain(|(anchor, _)| *anchor != handle);
         let uuid = self.entities.retire(handle).map_err(|_| AuthoringError::NotFound)?;
         self.revise();
@@ -1438,6 +1901,8 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }));
         let game_camera = ownership.camera.and_then(|id| self.game_cameras.iter().find(|camera| camera.id == id).cloned());
         let joint_record = self.joints.iter().find(|joint| joint.handle == handle).map(|joint| joint.record);
+        let player_start = self.player_starts.iter().find(|start| start.handle == handle).map(|start| start.record.clone());
+        let block_record = self.blocks.iter().find(|block| block.handle == handle).map(|block| block.record.clone());
         let anchor = if ownership.capabilities.transform && ownership.capabilities.payload_count() == 0 {
             self.anchors.iter().find(|(anchor, _)| *anchor == handle).map(|(_, frame)| *frame)
         } else {
@@ -1505,6 +1970,14 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if let Some(record) = joint_record {
             self.next_joint += 1;
             self.joints.push(WorldJoint { id: JointId(self.next_joint), handle: copy, record });
+        }
+        if let Some(record) = player_start {
+            self.player_starts.push(WorldPlayerStart { handle: copy, record });
+        }
+        if let Some(record) = block_record {
+            let _ = self.entities.remove_membership(copy, crate::TYPE_MESH_RENDERER, 0);
+            self.grant(copy, crate::TYPE_PARAMETRIC_BLOCK);
+            self.blocks.push(WorldBlock { handle: copy, record });
         }
         self.revise();
         self.entities.uuid(copy).map_err(|_| AuthoringError::NotFound)
@@ -2345,6 +2818,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             game_cameras: Vec::new(),
             joints: Vec::new(),
             terrains: Vec::new(),
+            player_starts: Vec::new(),
+            blocks: Vec::new(),
+            derived_meshlets: Vec::new(),
             derived_visuals: HashSet::new(),
             retired_meshes: Vec::new(),
             terrain_dirty: Vec::new(),
@@ -2385,6 +2861,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
                 }
                 if let Some(mesh) = mesh {
                     self.meshes.insert_exact(source_object.mesh, mesh);
+                }
+                if let Some(set) = source.derived_meshlets(source_object.mesh).cloned() {
+                    self.store_derived_meshlets(source_object.mesh, set);
                 }
             }
             if let Some(source_light) = source.lights.iter().find(|light| light.handle == source_handle) {
@@ -2534,6 +3013,16 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         std::mem::take(&mut self.retired_meshes)
     }
 
+    fn retire_unused_mesh(&mut self, mesh: MeshId) {
+        if self.objects.iter().any(|object| object.mesh == mesh) {
+            return;
+        }
+        if self.terrains.iter().any(|terrain| terrain.chunks.iter().any(|chunk| chunk.mesh == mesh)) {
+            return;
+        }
+        self.retired_meshes.push(mesh);
+    }
+
     pub fn authored_terrain(&self, id: EntityId) -> Option<crate::TerrainRecord> {
         let index = self.terrain_index(id).ok()?;
         Some(self.terrains[index].record.clone())
@@ -2559,6 +3048,430 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         self.revise();
         Ok(AuthoringResult::Applied)
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Runtime mesh of one entity. A block's mesh is derived from its size.
+    pub fn object_mesh(&self, id: EntityId) -> Option<MeshId> {
+        let handle = self.entities.find(id).ok()?;
+        self.objects.iter().find(|object| object.handle == handle).map(|object| object.mesh)
+    }
+
+    /// Clusters for one derived mesh. Empty when the mesh is not a procedural surface.
+    pub fn derived_meshlets(&self, id: MeshId) -> Option<&crate::MeshletSet> {
+        self.derived_meshlets.iter().find(|(stored, _)| *stored == id).map(|(_, set)| set)
+    }
+
+    fn store_derived_meshlets(&mut self, id: MeshId, set: crate::MeshletSet) {
+        if let Some(slot) = self.derived_meshlets.iter_mut().find(|(stored, _)| *stored == id) {
+            slot.1 = set;
+        } else {
+            self.derived_meshlets.push((id, set));
+        }
+    }
+
+    fn attach_derived_meshlets(&mut self, id: MeshId) {
+        let Some(set) = self.meshes.get(id).map(crate::build_meshlets) else { return };
+        self.store_derived_meshlets(id, set);
+    }
+
+    fn forget_derived_meshlets(&mut self, id: MeshId) {
+        self.derived_meshlets.retain(|(stored, _)| *stored != id);
+    }
+
+    pub fn authored_block(&self, id: EntityId) -> Option<crate::BlockRecord> {
+        let handle = self.entities.find(id).ok()?;
+        self.blocks.iter().find(|block| block.handle == handle).map(|block| block.record.clone())
+    }
+
+    /// Replaces the saved solid, including its log. Does not append an operation.
+    pub fn replace_block_record(&mut self, id: EntityId, record: crate::BlockRecord) -> Result<AuthoringResult, AuthoringError> {
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let index = self.block_index(id)?;
+        let current = &self.blocks[index].record;
+        if current == &record {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let mesh_changed = current.size_m != record.size_m || current.inset_m != record.inset_m || current.bevel_m != record.bevel_m;
+        self.blocks[index].record = record;
+        if mesh_changed {
+            self.rebuild_block_mesh(index)?;
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Scene-local analytic boxes. The derived triangle mesh is not the solid.
+    pub fn block_solids(&self) -> Vec<crate::BlockSolid> {
+        let Ok(scene_pose) = self.frames.resolve(self.scene) else { return Vec::new() };
+        let mut solids = Vec::new();
+        for block in &self.blocks {
+            let Ok(frame) = self.frame_of(block.handle) else { continue };
+            let Ok(resolved) = self.frames.resolve(frame) else { continue };
+            let delta = Vec3::new(
+                resolved.translation.x - scene_pose.translation.x,
+                resolved.translation.y - scene_pose.translation.y,
+                resolved.translation.z - scene_pose.translation.z,
+            );
+            solids.push(crate::BlockSolid {
+                translation: scene_pose.rotation.conjugate().rotate(delta),
+                rotation: scene_pose.rotation.conjugate().mul(resolved.rotation),
+                size_m: block.record.size_m,
+            });
+        }
+        solids
+    }
+
+    pub fn separate_from_blocks(&self, point: Vec3) -> Vec3 {
+        crate::keep_outside_blocks(point, &self.block_solids(), crate::FLY_COLLISION_RADIUS_M)
+    }
+
+    /// One parametric block. `local` is scene-local meters. Size is the solid, not entity scale.
+    pub fn create_block(&mut self, local: Vec3, record: crate::BlockRecord) -> Result<EntityId, AuthoringError> {
+        if !local.x.is_finite() || !local.y.is_finite() || !local.z.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let handle = self.entities.create();
+        let name = if self.blocks.is_empty() { "Block".to_string() } else { format!("Block {}", self.blocks.len() + 1) };
+        self.entities.set_name(handle, &name).map_err(|_| AuthoringError::InvalidOperation)?;
+        let frame = self.frames.add(Some(self.scene), HighPrecisionPose::at(local.x, local.y, local.z)).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.install_block(handle, frame, record)?;
+        self.revise();
+        self.entities.uuid(handle).map_err(|_| AuthoringError::NotFound)
+    }
+
+    pub fn spawn_saved_block(
+        &mut self,
+        id: EntityId,
+        name: &str,
+        parent: Option<EntityId>,
+        local: HighPrecisionPose,
+        record: crate::BlockRecord,
+    ) -> Result<(), AuthoringError> {
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let parent_handle = self.parent_handle(parent)?;
+        let handle = self.entities.insert(id, parent_handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.entities.set_name(handle, name).map_err(|_| AuthoringError::InvalidOperation)?;
+        let frame = self.frames.add(Some(self.scene), local).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.install_block(handle, frame, record)?;
+        self.revise();
+        Ok(())
+    }
+
+    pub fn set_block_field(&mut self, id: EntityId, field: crate::FieldId, value: PropertyValue) -> Result<AuthoringResult, AuthoringError> {
+        if let Some(axis) = block_size_axis(field) {
+            let PropertyValue::F64(meters) = value else { return Err(AuthoringError::WrongType) };
+            return self.set_block_extent(id, axis, meters);
+        }
+        if field == crate::FIELD_BLOCK_BEVEL {
+            let PropertyValue::F64(meters) = value else { return Err(AuthoringError::WrongType) };
+            return self.set_block_bevel(id, meters);
+        }
+        if let Some(face) = block_inset_face(field) {
+            let PropertyValue::F64(meters) = value else { return Err(AuthoringError::WrongType) };
+            return self.set_block_inset(id, face, meters);
+        }
+        Err(AuthoringError::ReadOnly)
+    }
+
+    pub fn set_block_extent(&mut self, id: EntityId, axis: usize, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        if axis > 2 || !meters.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let meters = meters.clamp(crate::BLOCK_MIN_EXTENT_M, crate::BLOCK_MAX_EXTENT_M);
+        let index = self.block_index(id)?;
+        if (self.blocks[index].record.size_m[axis] - meters).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.size_m[axis] = meters;
+        self.blocks[index].record.clamp_features();
+        let size = self.blocks[index].record.size_m;
+        self.blocks[index].record.push_op(crate::BlockOp::Size { size_m: size });
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Absolute face push from a drag baseline. The opposite face stays. History is written by [`Self::commit_block_face`].
+    pub fn push_block_face(
+        &mut self,
+        id: EntityId,
+        face: u8,
+        baseline_size: [f64; 3],
+        baseline_local: Vec3,
+        outward_m: f64,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let pushed = crate::push_face(baseline_size, baseline_local, local.rotation, face, outward_m).ok_or(AuthoringError::InvalidValue)?;
+        let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - pushed.size_m[axis]).abs() < 1.0e-9);
+        let same_place = translation_matches(local.translation, pushed.translation);
+        if same_size && same_place {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.size_m = pushed.size_m;
+        self.blocks[index].record.clamp_features();
+        self.rebuild_block_mesh(index)?;
+        self.write_block_translation(id, pushed.translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Records one face push after the drag releases. The mesh is already at the new size.
+    pub fn commit_block_face(&mut self, id: EntityId, face: u8, baseline_size: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let axis = (face / 2) as usize;
+        if face > 5 || axis > 2 {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let distance = self.blocks[index].record.size_m[axis] - baseline_size[axis];
+        if distance.abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.push_op(crate::BlockOp::ExtrudeFace { face, distance_m: distance });
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    pub fn set_block_inset(&mut self, id: EntityId, face: u8, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        if face > 5 || !meters.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let limit = crate::feature_limit(self.blocks[index].record.size_m);
+        let meters = meters.clamp(0.0, limit);
+        if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.inset_m[face as usize] = meters;
+        self.blocks[index].record.push_op(crate::BlockOp::InsetFace { face, distance_m: meters });
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    pub fn set_block_bevel(&mut self, id: EntityId, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        if !meters.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let limit = crate::feature_limit(self.blocks[index].record.size_m);
+        let meters = meters.clamp(0.0, limit);
+        if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.bevel_m = meters;
+        self.blocks[index].record.push_op(crate::BlockOp::Bevel { distance_m: meters });
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Live bevel. The mesh updates. History waits for [`Self::commit_block_bevel`].
+    pub fn preview_block_bevel(&mut self, id: EntityId, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        if !meters.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let limit = crate::feature_limit(self.blocks[index].record.size_m);
+        let meters = meters.clamp(0.0, limit);
+        if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.bevel_m = meters;
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Live inset on one face. History waits for [`Self::commit_block_inset`].
+    pub fn preview_block_inset(&mut self, id: EntityId, face: u8, meters: f64) -> Result<AuthoringResult, AuthoringError> {
+        if face > 5 || !meters.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let limit = crate::feature_limit(self.blocks[index].record.size_m);
+        let meters = meters.clamp(0.0, limit);
+        if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.inset_m[face as usize] = meters;
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// One bevel entry when the preview differs from the value the session started with.
+    pub fn commit_block_bevel(&mut self, id: EntityId, baseline_m: f64) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let current = self.blocks[index].record.bevel_m;
+        if (current - baseline_m).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.push_op(crate::BlockOp::Bevel { distance_m: current });
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// One inset entry when the preview differs from the value the session started with.
+    pub fn commit_block_inset(&mut self, id: EntityId, face: u8, baseline_m: f64) -> Result<AuthoringResult, AuthoringError> {
+        if face > 5 {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let current = self.blocks[index].record.inset_m[face as usize];
+        if (current - baseline_m).abs() < 1.0e-9 {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.blocks[index].record.push_op(crate::BlockOp::InsetFace { face, distance_m: current });
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Size returns to 2 m and the feature parameters clear. The entity stays where it is.
+    pub fn reset_block_shape(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let material = self.blocks[index].record.material.clone();
+        let plain = self.blocks[index].record.size_m == [2.0, 2.0, 2.0] && self.blocks[index].record.is_plain();
+        if plain {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let mut record = crate::BlockRecord::standard([2.0, 2.0, 2.0]).map_err(|_| AuthoringError::InvalidValue)?;
+        record.material = material;
+        self.blocks[index].record = record;
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Independent copy sharing the positive face. Insets on that axis are exchanged on the copy only.
+    pub fn mirror_block(&mut self, id: EntityId, axis: usize) -> Result<EntityId, AuthoringError> {
+        if axis > 2 {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let source = self.authored_block(id).ok_or(AuthoringError::InvalidOperation)?;
+        let local = self.entity_local_pose(id)?;
+        let created = self.duplicate_authored(id)?;
+        let index = self.block_index(created)?;
+        let insets = crate::swap_insets(source.inset_m, axis).ok_or(AuthoringError::InvalidValue)?;
+        self.blocks[index].record.inset_m = insets;
+        self.blocks[index].record.push_op(crate::BlockOp::Mirror { axis: axis as u8 });
+        let translation = crate::mirrored_translation(local.translation, local.rotation, source.size_m, axis).ok_or(AuthoringError::InvalidValue)?;
+        self.rebuild_block_mesh(index)?;
+        self.write_block_translation(created, translation)?;
+        self.revise();
+        Ok(created)
+    }
+
+    /// Lowest corner onto scene Y = 0. The rotation stays.
+    pub fn align_block_to_ground(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let translation = crate::align_translation_to_ground(local.translation, local.rotation, self.blocks[index].record.size_m);
+        if translation_matches(local.translation, translation) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Puts the drag baseline back. Does not append a history entry.
+    pub fn restore_block_drag(
+        &mut self,
+        id: EntityId,
+        size_m: [f64; 3],
+        inset_m: [f64; 6],
+        bevel_m: f64,
+        translation: Vec3,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        if size_m.iter().any(|axis| !axis.is_finite()) || inset_m.iter().any(|value| !value.is_finite()) || !bevel_m.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let record = &self.blocks[index].record;
+        let same_size = (0..3).all(|axis| (record.size_m[axis] - size_m[axis]).abs() < 1.0e-9);
+        let same_inset = (0..6).all(|face| (record.inset_m[face] - inset_m[face]).abs() < 1.0e-9);
+        let same_bevel = (record.bevel_m - bevel_m).abs() < 1.0e-9;
+        if same_size && same_inset && same_bevel && translation_matches(local.translation, translation) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let size = [
+            size_m[0].clamp(crate::BLOCK_MIN_EXTENT_M, crate::BLOCK_MAX_EXTENT_M),
+            size_m[1].clamp(crate::BLOCK_MIN_EXTENT_M, crate::BLOCK_MAX_EXTENT_M),
+            size_m[2].clamp(crate::BLOCK_MIN_EXTENT_M, crate::BLOCK_MAX_EXTENT_M),
+        ];
+        self.blocks[index].record.size_m = size;
+        self.blocks[index].record.inset_m = inset_m;
+        self.blocks[index].record.bevel_m = bevel_m;
+        self.blocks[index].record.clamp_features();
+        self.rebuild_block_mesh(index)?;
+        self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Rounds the local translation. Does not change a gizmo drag.
+    pub fn snap_block_translation(&mut self, id: EntityId, step_m: f64) -> Result<AuthoringResult, AuthoringError> {
+        let _ = self.block_index(id)?;
+        let local = self.entity_local_pose(id)?;
+        let translation = crate::snap_translation(local.translation, step_m);
+        if translation_matches(local.translation, translation) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.write_block_translation(id, translation)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    fn block_index(&self, id: EntityId) -> Result<usize, AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        self.blocks.iter().position(|block| block.handle == handle).ok_or(AuthoringError::InvalidOperation)
+    }
+
+    fn write_block_translation(&mut self, id: EntityId, translation: Vec3) -> Result<(), AuthoringError> {
+        if !translation.x.is_finite() || !translation.y.is_finite() || !translation.z.is_finite() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.frames.set_local_translation(frame, translation).map_err(|_| AuthoringError::InvalidOperation)
+    }
+
+    fn install_block(&mut self, handle: EntityHandle, frame: FrameId, record: crate::BlockRecord) -> Result<(), AuthoringError> {
+        let mesh = self.meshes.insert(block_mesh(&record));
+        self.attach_derived_meshlets(mesh);
+        let object = self.insert_object_with_handle(mesh, frame, Vec3::new(1.0, 1.0, 1.0), handle);
+        if let Some(slot) = self.objects.iter_mut().find(|slot| slot.id == object) {
+            slot.authored_mesh = None;
+            slot.authored_material = Some(record.material.clone());
+            slot.scale = Vec3::new(1.0, 1.0, 1.0);
+        }
+        let _ = self.entities.remove_membership(handle, crate::TYPE_MESH_RENDERER, 0);
+        self.grant(handle, crate::TYPE_SPATIAL_FRAME);
+        self.grant(handle, crate::TYPE_PARAMETRIC_BLOCK);
+        self.blocks.push(WorldBlock { handle, record });
+        Ok(())
+    }
+
+    fn rebuild_block_mesh(&mut self, index: usize) -> Result<(), AuthoringError> {
+        let handle = self.blocks[index].handle;
+        let mesh = self.meshes.insert(block_mesh(&self.blocks[index].record));
+        self.attach_derived_meshlets(mesh);
+        let object = self.objects.iter_mut().find(|object| object.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
+        let previous = object.mesh;
+        object.mesh = mesh;
+        object.scale = Vec3::new(1.0, 1.0, 1.0);
+        if !self.objects.iter().any(|object| object.mesh == previous) {
+            self.retired_meshes.push(previous);
+            self.forget_derived_meshlets(previous);
+        }
+        Ok(())
     }
 
     /// One terrain actor in this foundation. The origin is scene-local meters, Y up.
@@ -2887,6 +3800,111 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     /// Parents a joint frame to the parent entity's frame and keeps the stored local pose.
+    pub fn authored_player_start(&self, id: EntityId) -> Option<crate::PlayerStartRecord> {
+        let handle = self.entities.find(id).ok()?;
+        self.player_starts.iter().find(|start| start.handle == handle).map(|start| start.record.clone())
+    }
+
+    pub fn set_authored_player_start(&mut self, id: EntityId, record: crate::PlayerStartRecord) -> Result<AuthoringResult, AuthoringError> {
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let slot = self.player_starts.iter_mut().find(|start| start.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
+        if slot.record == record {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        slot.record = record;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    pub fn attach_player_start(&mut self, id: EntityId, record: crate::PlayerStartRecord) -> Result<(), AuthoringError> {
+        record.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        if self.player_starts.iter().any(|start| start.handle == handle) {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let _frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
+        self.player_starts.push(WorldPlayerStart { handle, record });
+        self.grant(handle, crate::TYPE_PLAYER_START);
+        self.revise();
+        Ok(())
+    }
+
+    /// Hides an entity from the outline and from level capture. The caller revises once after a batch.
+    pub fn mark_derived(&mut self, id: EntityId) -> Result<(), AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        self.derived_visuals.insert(handle);
+        Ok(())
+    }
+
+    pub fn is_derived(&self, id: EntityId) -> bool {
+        self.entities.find(id).ok().is_some_and(|handle| self.derived_visuals.contains(&handle))
+    }
+
+    /// Drops a derived visual and its derived children. Children go before the parent.
+    pub fn retire_derived(&mut self, id: EntityId) -> Result<(), AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        self.destroy_derived_tree(handle)
+    }
+
+    fn destroy_derived_tree(&mut self, handle: EntityHandle) -> Result<(), AuthoringError> {
+        let children: Vec<EntityHandle> = self
+            .entities
+            .handles()
+            .filter(|child| self.entities.parent(*child).ok().flatten() == Some(handle))
+            .collect();
+        for child in children {
+            self.destroy_derived_tree(child)?;
+        }
+        self.derived_visuals.remove(&handle);
+        self.destroy_authored_handle(handle)?;
+        Ok(())
+    }
+
+    /// Preview meshes must not enter the shadow pass. Does not revise.
+    pub fn mute_cast_shadows(&mut self, id: EntityId) -> Result<(), AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        if let Some(object) = self.objects.iter_mut().find(|object| object.handle == handle) {
+            object.cast_shadows = false;
+        }
+        Ok(())
+    }
+
+    pub fn finish_visual_edit(&mut self) {
+        self.revise();
+    }
+
+    /// Parents an authored entity. Used to hang a preview character on a Player Start.
+    pub fn reparent_authored(&mut self, id: EntityId, parent: Option<EntityId>) -> Result<(), AuthoringError> {
+        let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
+        let parent_handle = match parent {
+            Some(parent) => Some(self.entities.find(parent).map_err(|_| AuthoringError::NotFound)?),
+            None => None,
+        };
+        self.reparent_entity(handle, parent_handle)
+    }
+
+    /// Spawn gizmo in world space. Forward is local -Z. Not a mesh.
+    pub fn player_start_segments(&self) -> Vec<JointDebugSegment> {
+        let mut segments = Vec::new();
+        let color = [0.95, 0.92, 0.82, 1.0];
+        for start in &self.player_starts {
+            let Ok(frame) = self.frame_of(start.handle) else { continue };
+            let Ok(pose) = self.frames.resolve(frame) else { continue };
+            let Ok(entity) = self.entities.uuid(start.handle) else { continue };
+            for (from, to) in crate::player_start_lines() {
+                segments.push(JointDebugSegment {
+                    entity,
+                    start: pose.translation + pose.rotation.rotate(from),
+                    end: pose.translation + pose.rotation.rotate(to),
+                    color,
+                    limits: false,
+                });
+            }
+        }
+        segments
+    }
+
     pub fn attach_joint(&mut self, id: EntityId, record: crate::joint::JointRecord) -> Result<(), AuthoringError> {
         let record = record.validate()?;
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
@@ -4478,5 +5496,24 @@ mod tests {
 
     fn same3(a: [f32; 3], b: [f32; 3]) -> bool {
         (a[0] - b[0]).abs() < 1.0e-4 && (a[1] - b[1]).abs() < 1.0e-4 && (a[2] - b[2]).abs() < 1.0e-4
+    }
+
+    #[test]
+    fn block_memento_restores_the_log_instead_of_appending() {
+        let mut world = SceneWorld::bootstrap();
+        let id = world.create_block(crate::Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let before = world.remember_entity(id).unwrap();
+        assert!(world.set_block_bevel(id, 0.2).is_ok());
+        assert_eq!(world.authored_block(id).unwrap().history.len(), 1);
+        world.apply_mementos(&[crate::EntityMemento::Present(before)]).unwrap();
+        let restored = world.authored_block(id).unwrap();
+        assert!(restored.bevel_m.abs() < 1.0e-9);
+        assert!(restored.history.is_empty());
+        let present = world.remember_entity(id).unwrap();
+        world.apply_mementos(&[crate::EntityMemento::Absent(id)]).unwrap();
+        assert!(world.authored_block(id).is_none());
+        world.apply_mementos(&[crate::EntityMemento::Present(present)]).unwrap();
+        assert_eq!(world.remember_entity(id).unwrap().uuid, id);
+        assert!(world.authored_block(id).unwrap().history.is_empty());
     }
 }

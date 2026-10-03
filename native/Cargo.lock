@@ -636,6 +636,7 @@ version = "0.0.1"
 dependencies = [
  "jarvig_core",
  "jarvig_engine",
+ "jarvig_hub",
  "jarvig_renderer",
  "jarvig_rhi",
  "jarvig_rhi_wgpu",
@@ -674,6 +675,14 @@ dependencies = [
  "jarvig_rhi",
  "jarvig_rhi_wgpu",
  "png",
+]
+
+[[package]]
+name = "jarvig_hub"
+version = "0.0.1"
+dependencies = [
+ "jarvig_core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

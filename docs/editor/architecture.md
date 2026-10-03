@@ -3,6 +3,11 @@
 The editor hosts the engine. The engine does not know about panels.
 
 ```text
+                      JARVIG.exe
+                     project hub
+                           |
+                           | a chosen .jarvigproject
+                           v
                     JARVIGEditor.exe
                            |
           +----------------+----------------+
@@ -23,7 +28,9 @@ The editor hosts the engine. The engine does not know about panels.
                           RHI
 ```
 
-`native/jarvig_editor` is the executable. It links `jarvig_engine`, `jarvig_renderer`, `jarvig_rhi`, and `jarvig_rhi_wgpu`. It does not name wgpu. It does not depend on winit. The window is Win32. The viewport HWND is the only handle passed to `attach_window`.
+`native/jarvig_editor` is the editor executable. It links `jarvig_engine`, `jarvig_renderer`, `jarvig_rhi`, and `jarvig_rhi_wgpu`. It does not name wgpu. It does not depend on winit. The window is Win32. The viewport HWND is the only handle passed to `attach_window`.
+
+`native/jarvig_hub` is the project browser. A launch with no `--project` and no harness flag shows that window before `EngineSession` is constructed. See [hub.md](hub.md) and [ADR-0060](../adr/ADR-0060-the-hub-chooses-a-project-before-the-editor.md).
 
 The dock tree lives in this crate (`DockWorkspace`, `PanelId`). No engine crate names it. `pnpm lint` checks that. See [workspaces.md](workspaces.md) and [ADR-0032](../adr/ADR-0032-editor-dock-workspace.md).
 
@@ -43,8 +50,8 @@ Later, Play-In-Editor is a second world. See [../architecture/play-in-editor.md]
 
 - Not `JARVIGPlayer.exe`. The player ships the game without these panels. It does not exist yet. It will link the same engine.
 - Not `JARVIGServer.exe`. The server stays headless. Smoke still reports `graphics=none`. It does not enumerate adapters.
-- Not the Hub. Create Project, Open Project, and engine versions are a later product, after this executable. Do not treat `pnpm dev:hub` as that product.
-- Not a project format. A future `*.jarvigproject` can hold project config and content. Directory names are not copied from Unreal. They are not designed in this shell.
+- Not the project hub. `JARVIG.exe` chooses the project. This shell opens the one it was given. Do not treat `pnpm dev:hub` as that product.
+- Not a second project format. `*.jarvigproject` is `jarvig.project` version 1. The hub does not invent another one.
 
 ## Identity
 

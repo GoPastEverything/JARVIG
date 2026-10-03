@@ -2,7 +2,7 @@
 
 use jarvig_core::{AssetId, RegistryAsset};
 
-pub const FILTERS: [&str; 8] = ["All", "Textures", "Models", "Materials", "Levels", "Source", "Config", "Other"];
+pub const FILTERS: [&str; 10] = ["All", "Character", "Player", "Textures", "Models", "Materials", "Levels", "Source", "Config", "Other"];
 
 #[derive(Clone)]
 pub struct Thumb {
@@ -100,13 +100,15 @@ impl BrowserModel {
 pub fn kind_matches(filter: usize, kind: &str) -> bool {
     match FILTERS.get(filter).copied().unwrap_or("All") {
         "All" => true,
+        "Character" => kind == "Character",
+        "Player" => kind == "Player",
         "Textures" => kind == "Texture",
         "Models" => kind == "Model",
         "Materials" => kind == "Material",
         "Levels" => kind == "Level",
         "Source" => kind == "Source" || kind == "Shader",
         "Config" => kind == "Config",
-        "Other" => !matches!(kind, "Texture" | "Model" | "Material" | "Level" | "Source" | "Shader" | "Config"),
+        "Other" => !matches!(kind, "Texture" | "Model" | "Material" | "Level" | "Source" | "Shader" | "Config" | "Character" | "Player"),
         _ => true,
     }
 }
@@ -119,6 +121,7 @@ pub fn drop_caption(asset: &RegistryAsset, over_viewport: bool) -> String {
         "Model" => format!("{}  + Create Mesh Actor", asset.name),
         "Prefab" => format!("{}  + Place Prefab", asset.name),
         "Character" => format!("{}  open in Character Editor, not spawned", asset.name),
+        "Player" => format!("{}  player definition, not spawned", asset.name),
         "Level" => format!("{}  open level, not spawned", asset.name),
         "Source" | "Config" | "Shader" => format!("{}  does not enter the world", asset.name),
         "Material" => format!("{}  assign is not wired in this slice", asset.name),

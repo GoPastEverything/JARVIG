@@ -5,10 +5,10 @@
 //! each component with its own form. Multi-selection does not edit one entity silently.
 
 use jarvig_core::{
-    find_type, type_registry, AuthoringClass, ComponentMultiplicity, ComponentRole, EntityInspection, EntityUuid, FieldId, PropertyValue, Quat, TypeId,
+    find_type, type_registry, AuthoringCapabilities, AuthoringClass, ComponentMultiplicity, ComponentRole, EntityInspection, EntityUuid, FieldId, PropertyValue, Quat, TypeId,
     ValueKind, FIELD_CAPTURE_STATE, FIELD_MATERIAL_SLOT, FIELD_NAME, FIELD_OBJECT_SCALE, FIELD_PARENT, FIELD_SURFACE, FIELD_UUID,
-    TYPE_COMPONENT_STACK, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_FREE_FLY, TYPE_MESH_RENDERER, TYPE_PAWN, TYPE_POINT_LIGHT, TYPE_TERRAIN,
-    TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME, TYPE_SPOT_LIGHT,
+    TYPE_COMPONENT_STACK, TYPE_DIRECTIONAL_LIGHT, TYPE_ENTITY, TYPE_ENVIRONMENT, TYPE_FREE_FLY, TYPE_MESH_RENDERER, TYPE_PAWN, TYPE_PARAMETRIC_BLOCK, TYPE_POINT_LIGHT,
+    TYPE_TERRAIN, TYPE_REFLECTION_PROBE, TYPE_SPATIAL_FRAME, TYPE_SPOT_LIGHT,
 };
 use jarvig_engine::EngineSession;
 
@@ -37,6 +37,32 @@ pub enum InspectorCommand {
     ResetPose,
     /// Creates one flat heightfield from the Land Mode draft. Not a component command.
     CreateTerrain,
+    /// Size returns to 2 m. Position and material stay.
+    ResetShape,
+    /// Opens an extrude session on the selected face. A missing face uses +X.
+    ExtrudeFace,
+    /// Opens an inset session on the selected face. A missing face uses +X.
+    InsetFace,
+    /// Opens a bevel session. The chamfer is one amount for every edge.
+    Bevel,
+    /// Drops the open modeling preview and restores the solid.
+    CancelModeling,
+    /// Writes one history entry for the open modeling preview.
+    ApplyModeling,
+    MirrorX,
+    MirrorY,
+    MirrorZ,
+    /// The existing duplicate command. Not a second copy path.
+    Duplicate,
+    AlignToGround,
+    SnapTranslation,
+    /// Reopens the bevel session at the solid's current amount.
+    EditBevel,
+    /// Reopens the inset session for one face at that face's current distance.
+    EditInset(u8),
+    SelectionAuto,
+    SelectionObject,
+    SelectionFace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +155,8 @@ pub struct InspectorSection {
     pub type_id: TypeId,
     pub fields: Vec<InspectorField>,
     pub commands: Vec<InspectorCommand>,
+    /// Buttons whose label is not the static command name. Feature rows use this.
+    pub feature_edits: Vec<(InspectorCommand, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,12 +215,24 @@ pub fn build(selection: &SelectionService, world: &jarvig_core::SceneWorld) -> I
 
 /// `staged` is the loaded material catalog. Empty keeps a builtin material as read-only text.
 pub fn build_with(selection: &SelectionService, world: &jarvig_core::SceneWorld, staged: &[String], mesh_assets: &[String]) -> InspectorModel {
+    build_solid(selection, world, staged, mesh_assets, SolidElement::Object, "Auto")
+}
+
+/// Object tools or face tools, plus the active selection mode name drawn on the mode buttons.
+pub fn build_solid(
+    selection: &SelectionService,
+    world: &jarvig_core::SceneWorld,
+    staged: &[String],
+    mesh_assets: &[String],
+    element: SolidElement,
+    mode_name: &str,
+) -> InspectorModel {
     let selection_revision = selection.revision();
     let world_revision = world.revision();
     let body = match selection.items() {
         [] => InspectorBody::Empty,
         [SelectionItem::Entity(id)] => match world.inspect_entity(*id) {
-            Ok(inspection) => InspectorBody::Entity { sections: sections_from(inspection, world, staged, mesh_assets) },
+            Ok(inspection) => InspectorBody::Entity { sections: sections_from(inspection, world, staged, mesh_assets, element, mode_name) },
             Err(_) => InspectorBody::Empty,
         },
         items => {
@@ -227,12 +267,21 @@ fn headers(world: &jarvig_core::SceneWorld, id: EntityUuid) -> (String, String) 
         AuthoringClass::Camera => "Camera",
         AuthoringClass::WorldSettings => "World Settings",
         AuthoringClass::Terrain => "Terrain",
+        AuthoringClass::PlayerStart => "Player Start",
+        AuthoringClass::Block => "Block",
         AuthoringClass::Empty => "Actor",
     };
     (name, kind.into())
 }
 
-fn sections_from(inspection: EntityInspection, world: &jarvig_core::SceneWorld, staged: &[String], mesh_assets: &[String]) -> Vec<InspectorSection> {
+fn sections_from(
+    inspection: EntityInspection,
+    world: &jarvig_core::SceneWorld,
+    staged: &[String],
+    mesh_assets: &[String],
+    element: SolidElement,
+    mode_name: &str,
+) -> Vec<InspectorSection> {
     let entity = inspection.entity;
     let present: Vec<TypeId> = inspection.sections.iter().map(|section| section.type_info.id).collect();
     let settings = world.entity_outline().iter().any(|row| row.uuid == entity && row.class == AuthoringClass::WorldSettings);
@@ -245,12 +294,224 @@ fn sections_from(inspection: EntityInspection, world: &jarvig_core::SceneWorld, 
             if let Some(existing) = sections.iter_mut().find(|panel: &&mut InspectorSection| panel.title == title) {
                 existing.fields.push(view);
             } else {
-                sections.push(InspectorSection { title, type_id: section.type_info.id, fields: vec![view], commands: Vec::new() });
+                sections.push(InspectorSection { title, type_id: section.type_info.id, fields: vec![view], commands: Vec::new(), feature_edits: Vec::new() });
             }
         }
     }
     attach_commands(&mut sections, &present);
+    hide_permanent_feature_fields(&mut sections);
+    if let Ok(ownership) = world.entity_ownership(entity) {
+        let record = world.authored_block(entity);
+        attach_solid_tools(&mut sections, record.as_ref(), AuthoringCapabilities::from_entity(ownership.capabilities), element, mode_name);
+    }
     sections
+}
+
+/// Bevel, the six insets, and the raw history log stay on the record. The panel shows current parameters instead.
+fn hide_permanent_feature_fields(sections: &mut Vec<InspectorSection>) {
+    for section in sections.iter_mut() {
+        section.fields.retain(|field| {
+            !matches!(
+                field.field,
+                jarvig_core::FIELD_BLOCK_BEVEL
+                    | jarvig_core::FIELD_BLOCK_INSET_PX
+                    | jarvig_core::FIELD_BLOCK_INSET_NX
+                    | jarvig_core::FIELD_BLOCK_INSET_PY
+                    | jarvig_core::FIELD_BLOCK_INSET_NY
+                    | jarvig_core::FIELD_BLOCK_INSET_PZ
+                    | jarvig_core::FIELD_BLOCK_INSET_NZ
+                    | jarvig_core::FIELD_BLOCK_HISTORY
+            )
+        });
+    }
+    sections.retain(|section| !(section.title == "Modeling" && section.fields.is_empty() && section.commands.is_empty() && section.feature_edits.is_empty()));
+}
+
+/// Which part of a parametric solid the inspector is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SolidElement {
+    Object,
+    Face(u8),
+}
+
+fn attach_solid_tools(
+    sections: &mut Vec<InspectorSection>,
+    record: Option<&jarvig_core::BlockRecord>,
+    capabilities: AuthoringCapabilities,
+    element: SolidElement,
+    mode_name: &str,
+) {
+    if !capabilities.parametric_solid {
+        return;
+    }
+    let Some(record) = record else { return };
+    let face_label = match element {
+        SolidElement::Face(face) => jarvig_core::face_name(face).to_string(),
+        SolidElement::Object => "None".into(),
+    };
+    let mode_edits = ["Auto", "Object", "Face"]
+        .into_iter()
+        .zip([InspectorCommand::SelectionAuto, InspectorCommand::SelectionObject, InspectorCommand::SelectionFace])
+        .map(|(name, command)| {
+            let label = if name == mode_name { format!("{name}  ·") } else { name.to_string() };
+            (command, label)
+        })
+        .collect();
+    insert_section_after(
+        sections,
+        "Actor",
+        InspectorSection {
+            title: "Selection".into(),
+            type_id: TYPE_PARAMETRIC_BLOCK,
+            fields: vec![solid_note(SOLID_UI_FACE, "Face", face_label)],
+            commands: Vec::new(),
+            feature_edits: mode_edits,
+        },
+    );
+    let mut feature_edits = Vec::new();
+    if record.bevel_m > 1.0e-9 {
+        feature_edits.push((InspectorCommand::EditBevel, format!("Bevel  {:.3} m", record.bevel_m)));
+    }
+    for face in 0..6u8 {
+        let inset = record.inset_m[face as usize];
+        if inset > 1.0e-9 {
+            feature_edits.push((
+                InspectorCommand::EditInset(face),
+                format!("Inset {}  {inset:.3} m", jarvig_core::face_name(face)),
+            ));
+        }
+    }
+    insert_section_after(
+        sections,
+        "Dimensions",
+        InspectorSection {
+            title: "Features".into(),
+            type_id: TYPE_PARAMETRIC_BLOCK,
+            fields: vec![solid_note(
+                SOLID_UI_BLOCK,
+                "Block",
+                format!("{:.3} × {:.3} × {:.3} m", record.size_m[0], record.size_m[1], record.size_m[2]),
+            )],
+            commands: Vec::new(),
+            feature_edits,
+        },
+    );
+    let (title, commands) = match element {
+        SolidElement::Face(_) => (
+            "Face Tools",
+            vec![InspectorCommand::ExtrudeFace, InspectorCommand::InsetFace, InspectorCommand::Bevel],
+        ),
+        SolidElement::Object => {
+            let mut commands = vec![InspectorCommand::Bevel, InspectorCommand::ResetShape];
+            if capabilities.patternable {
+                commands.extend([
+                    InspectorCommand::Duplicate,
+                    InspectorCommand::MirrorX,
+                    InspectorCommand::MirrorY,
+                    InspectorCommand::MirrorZ,
+                    InspectorCommand::AlignToGround,
+                    InspectorCommand::SnapTranslation,
+                ]);
+            }
+            ("Object Tools", commands)
+        }
+    };
+    insert_section_after(
+        sections,
+        "Features",
+        InspectorSection {
+            title: title.into(),
+            type_id: TYPE_PARAMETRIC_BLOCK,
+            fields: Vec::new(),
+            commands,
+            feature_edits: Vec::new(),
+        },
+    );
+}
+
+/// The open Extrude, Inset, or Bevel operation. One amount drives the viewport and this panel.
+pub struct ModelingView {
+    pub title: &'static str,
+    pub face: &'static str,
+    pub amount_label: &'static str,
+    pub amount: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+}
+
+/// Replaces the start buttons with the operation's amount, Cancel, and Apply.
+pub fn attach_modeling_session(model: &mut InspectorModel, view: &ModelingView) {
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    for section in sections.iter_mut() {
+        section.commands.retain(|command| {
+            !matches!(
+                command,
+                InspectorCommand::ExtrudeFace | InspectorCommand::InsetFace | InspectorCommand::Bevel | InspectorCommand::ResetShape
+            )
+        });
+        section.feature_edits.clear();
+        section.fields.retain(|field| field.field != SOLID_UI_FACE);
+    }
+    let section = InspectorSection {
+        title: view.title.into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields: vec![solid_note(SOLID_UI_FACE, "Face", view.face.into()), solid_amount(view)],
+        commands: vec![InspectorCommand::CancelModeling, InspectorCommand::ApplyModeling],
+        feature_edits: Vec::new(),
+    };
+    let index = sections.iter().position(|existing| existing.title == "Features").unwrap_or(sections.len());
+    sections.insert(index, section);
+}
+
+fn solid_amount(view: &ModelingView) -> InspectorField {
+    let mut field = solid_note(SOLID_UI_AMOUNT, view.amount_label, format_fixed(view.amount, 3));
+    field.kind = ValueKind::Float64;
+    field.widget = WidgetKind::Number;
+    field.editable = true;
+    field.units = "m".into();
+    field.minimum = Some(view.minimum);
+    field.maximum = Some(view.maximum);
+    field.precision = 3;
+    field.step = 0.001;
+    field
+}
+
+fn insert_section_after(sections: &mut Vec<InspectorSection>, after: &str, section: InspectorSection) {
+    if sections.iter().any(|existing| existing.title == section.title) {
+        return;
+    }
+    let index = sections.iter().position(|existing| existing.title == after).map(|index| index + 1).unwrap_or(sections.len());
+    sections.insert(index, section);
+}
+
+fn solid_note(field: FieldId, label: &str, display: String) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        field,
+        label: label.into(),
+        units: String::new(),
+        display,
+        components: Vec::new(),
+        editable: false,
+        kind: ValueKind::String,
+        widget: WidgetKind::Readonly,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices: Vec::new(),
+        asset_type: String::new(),
+    }
+}
+
+/// The viewport's selected face. Display only. It is not a saved field.
+pub fn set_selected_face_label(model: &mut InspectorModel, label: &str) {
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    for section in sections.iter_mut() {
+        if let Some(field) = section.fields.iter_mut().find(|field| field.field == SOLID_UI_FACE) {
+            field.display = label.to_string();
+        }
+    }
 }
 
 fn panel_title(info: &jarvig_core::FieldInfo) -> String {
@@ -258,6 +519,8 @@ fn panel_title(info: &jarvig_core::FieldInfo) -> String {
         "Advanced".into()
     } else if info.id == FIELD_NAME || info.id == FIELD_PARENT {
         "Actor".into()
+    } else if info.group == "Shape" {
+        "Dimensions".into()
     } else {
         info.group.to_string()
     }
@@ -386,7 +649,7 @@ fn attach_commands(sections: &mut [InspectorSection], present: &[TypeId]) {
 
 fn can_remove(type_id: TypeId, present: &[TypeId]) -> bool {
     let Some(info) = find_type(type_id) else { return false };
-    if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) || type_id == TYPE_ENVIRONMENT || type_id == TYPE_TERRAIN {
+    if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) || type_id == TYPE_ENVIRONMENT || type_id == TYPE_TERRAIN || type_id == TYPE_PARAMETRIC_BLOCK {
         return false;
     }
     !present.iter().any(|other| *other != type_id && find_type(*other).is_some_and(|existing| existing.requires.contains(&type_id)))
@@ -448,7 +711,7 @@ pub fn add_component_choices(owned: &[TypeId]) -> Vec<(TypeId, &'static str)> {
         if matches!(info.multiplicity, ComponentMultiplicity::NotAComponent) {
             continue;
         }
-        if matches!(info.id, TYPE_ENVIRONMENT | TYPE_MESH_RENDERER | TYPE_TERRAIN | TYPE_PAWN | TYPE_FREE_FLY | TYPE_ENTITY | TYPE_COMPONENT_STACK) {
+        if matches!(info.id, TYPE_ENVIRONMENT | TYPE_MESH_RENDERER | TYPE_TERRAIN | TYPE_PARAMETRIC_BLOCK | TYPE_PAWN | TYPE_FREE_FLY | TYPE_ENTITY | TYPE_COMPONENT_STACK) {
             continue;
         }
         if matches!(info.multiplicity, ComponentMultiplicity::One) && owned.contains(&info.id) {
@@ -483,6 +746,8 @@ fn type_for_role(role: ComponentRole) -> Option<TypeId> {
         ComponentRole::FreeFly => TYPE_FREE_FLY,
         ComponentRole::Joint => jarvig_core::TYPE_JOINT,
         ComponentRole::Terrain => jarvig_core::TYPE_TERRAIN,
+        ComponentRole::PlayerStart => jarvig_core::TYPE_PLAYER_START,
+        ComponentRole::Block => TYPE_PARAMETRIC_BLOCK,
         ComponentRole::WorldSettings => TYPE_ENVIRONMENT,
     })
 }
@@ -593,6 +858,16 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
                         ));
                         y += 24;
                     }
+                    for (command, label) in &section.feature_edits {
+                        items.push(control(
+                            ControlClass::Button,
+                            InspectorBinding::Command { command: *command, type_id: section.type_id },
+                            label.clone(),
+                            12,
+                            y,
+                        ));
+                        y += 24;
+                    }
                 }
                 y += 8;
             }
@@ -621,7 +896,38 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::Recapture => "Recapture",
         InspectorCommand::ResetPose => "Reset Pose",
         InspectorCommand::CreateTerrain => "Create Terrain",
+        InspectorCommand::ResetShape => "Reset Shape",
+        InspectorCommand::ExtrudeFace => "Extrude",
+        InspectorCommand::InsetFace => "Inset",
+        InspectorCommand::Bevel => "Bevel",
+        InspectorCommand::CancelModeling => "Cancel",
+        InspectorCommand::ApplyModeling => "Apply",
+        InspectorCommand::MirrorX => "Mirror X",
+        InspectorCommand::MirrorY => "Mirror Y",
+        InspectorCommand::MirrorZ => "Mirror Z",
+        InspectorCommand::Duplicate => "Duplicate",
+        InspectorCommand::AlignToGround => "Align",
+        InspectorCommand::SnapTranslation => "Snap",
+        InspectorCommand::EditBevel => "Bevel",
+        InspectorCommand::EditInset(_) => "Inset",
+        InspectorCommand::SelectionAuto => "Auto",
+        InspectorCommand::SelectionObject => "Object",
+        InspectorCommand::SelectionFace => "Face",
     }
+}
+
+/// Editor-only face label. Not a registry field and not saved.
+pub const SOLID_UI_FACE: FieldId = FieldId(240);
+/// Editor-only amount for the open modeling operation. Not a registry field.
+pub const SOLID_UI_AMOUNT: FieldId = FieldId(241);
+/// Current block size readout. Not submitted through SetProperty.
+pub const SOLID_UI_BLOCK: FieldId = FieldId(242);
+/// Current bevel readout. Not submitted through SetProperty.
+pub const SOLID_UI_BEVEL: FieldId = FieldId(243);
+
+/// Current inset readout for one face. Not submitted through SetProperty.
+pub fn solid_ui_inset(face: u8) -> FieldId {
+    FieldId(245 + u32::from(face))
 }
 
 /// Terrain actor inspection when Land Mode is showing that actor instead of the tool row.
@@ -636,7 +942,7 @@ pub fn build_entity(world: &jarvig_core::SceneWorld, id: EntityUuid, staged: &[S
                 world_revision,
                 header_name,
                 header_kind,
-                body: InspectorBody::Entity { sections: sections_from(inspection, world, staged, mesh_assets) },
+                body: InspectorBody::Entity { sections: sections_from(inspection, world, staged, mesh_assets, SolidElement::Object, "Auto") },
             }
         }
         Err(_) => InspectorModel::empty(),
@@ -663,6 +969,7 @@ pub fn terrain_draft(width: f64, depth: f64, spacing: f64, chunk: f64, height: f
                     draft_number(jarvig_core::FIELD_TERRAIN_HEIGHT, "Height", height, None),
                 ],
                 commands: vec![InspectorCommand::CreateTerrain],
+                feature_edits: Vec::new(),
             }],
         },
     }
@@ -687,6 +994,8 @@ pub const LAND_UI_SHOW_CHARACTERS: FieldId = FieldId(235);
 pub const LAND_UI_SHOW_PROPS: FieldId = FieldId(236);
 pub const LAND_UI_SHOW_GAMEPLAY: FieldId = FieldId(237);
 pub const LAND_UI_SHOW_FULL: FieldId = FieldId(238);
+/// Writes the player definition file. It is not a level field.
+pub const PLAYER_UI_CHARACTER: FieldId = FieldId(239);
 
 pub fn is_land_ui(field: FieldId) -> bool {
     (220..=238).contains(&field.0)
@@ -728,6 +1037,7 @@ pub fn attach_land_workspace(model: &mut InspectorModel, land: LandInspector) {
             land_check(LAND_UI_SNAP, "Snap", land.snap),
         ],
         commands: Vec::new(),
+        feature_edits: Vec::new(),
     });
     sections.push(InspectorSection {
         title: "Brush".into(),
@@ -738,6 +1048,7 @@ pub fn attach_land_workspace(model: &mut InspectorModel, land: LandInspector) {
             land_choice(LAND_UI_FALLOFF, "Falloff", land.falloff, &["Smooth", "Linear"]),
         ],
         commands: Vec::new(),
+        feature_edits: Vec::new(),
     });
     sections.push(InspectorSection {
         title: "Debug Overlay".into(),
@@ -748,6 +1059,7 @@ pub fn attach_land_workspace(model: &mut InspectorModel, land: LandInspector) {
             land_check(LAND_UI_LOD, "LOD Boundaries", land.lod),
         ],
         commands: Vec::new(),
+        feature_edits: Vec::new(),
     });
     sections.push(InspectorSection {
         title: "Visibility".into(),
@@ -762,6 +1074,7 @@ pub fn attach_land_workspace(model: &mut InspectorModel, land: LandInspector) {
             land_check(LAND_UI_SHOW_FULL, "Show Full Level", land.show_full),
         ],
         commands: Vec::new(),
+        feature_edits: Vec::new(),
     });
 }
 
@@ -888,6 +1201,44 @@ pub fn attach_joint_context(model: &mut InspectorModel, world: &jarvig_core::Sce
         _ => 5,
     };
     sections.sort_by_key(|section| rank(&section.title));
+}
+
+/// Player Start choices. The character choice writes the player file, not the level.
+pub fn attach_player_start(model: &mut InspectorModel, world: &jarvig_core::SceneWorld, entity: EntityUuid, players: &[String], characters: &[String], character: &str) {
+    let Some(start) = world.authored_player_start(entity) else { return };
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    let Some(section) = sections.iter_mut().find(|section| section.title == "Player Start") else { return };
+    if let Some(field) = section.fields.iter_mut().find(|field| field.field == jarvig_core::FIELD_PLAYER_DEFINITION) {
+        field.widget = WidgetKind::Choice;
+        field.editable = true;
+        field.kind = ValueKind::String;
+        field.choices = players.to_vec();
+        if !start.player.is_empty() && !field.choices.iter().any(|choice| choice == &start.player) {
+            field.choices.insert(0, start.player.clone());
+        }
+        field.display = start.player.clone();
+    }
+    let mut choices = characters.to_vec();
+    if !character.is_empty() && !choices.iter().any(|choice| choice == character) {
+        choices.insert(0, character.to_string());
+    }
+    section.fields.push(InspectorField {
+        type_id: jarvig_core::TYPE_PLAYER_START,
+        field: PLAYER_UI_CHARACTER,
+        label: "Character".into(),
+        units: String::new(),
+        display: character.to_string(),
+        components: Vec::new(),
+        editable: !start.player.is_empty(),
+        kind: ValueKind::String,
+        widget: WidgetKind::Choice,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices,
+        asset_type: String::new(),
+    });
 }
 
 fn limit_applies(kind: jarvig_core::JointKind, label: &str) -> bool {
@@ -1353,5 +1704,68 @@ mod tests {
         assert_eq!(engine.material_compile_count(), compiles);
         assert_eq!(engine.world().light_count(), 2);
         assert_eq!(engine.world().object_count(), 1);
+    }
+
+    #[test]
+    fn a_block_shows_modeling_tools_and_a_light_does_not() {
+        let mut world = SceneWorld::bootstrap();
+        let light = world.entity_outline().iter().find(|row| row.name == "Blue Point Light").unwrap().uuid;
+        let block = world.create_block(jarvig_core::Vec3::new(0.0, 1.0, -4.0), jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let mut selection = SelectionService::default();
+        selection.replace(SelectionItem::entity(light).unwrap()).unwrap();
+        let light_model = build(&selection, &world);
+        assert_eq!(light_model.section_titles(), ["Actor", "Advanced", "Transform", "Point Light", "Components"]);
+        let light_plan = plan(&light_model, &PlanOptions::editing());
+        assert!(!light_plan.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Mirror X" | "Bevel")));
+        selection.replace(SelectionItem::entity(block).unwrap()).unwrap();
+        let mut model = build(&selection, &world);
+        let titles = model.section_titles();
+        for title in ["Dimensions", "Features", "Selection", "Object Tools", "Collision", "Material"] {
+            assert!(titles.iter().any(|existing| *existing == title), "missing {title} in {titles:?}");
+        }
+        assert!(!titles.iter().any(|existing| {
+            matches!(*existing, "Shape" | "Modeling" | "Pattern" | "Placement" | "Face Tools")
+        }));
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_ORIGIN).unwrap().display, "Center");
+        assert!(!model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_ORIGIN).unwrap().editable);
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_SIZE_X).unwrap().editable);
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_BEVEL).is_none());
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_INSET_PX).is_none());
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_HISTORY).is_none());
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_BLOCK).unwrap().display, "2.000 × 2.000 × 2.000 m");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_COLLISION).unwrap().display, "Analytic box");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "None");
+        let planned = plan(&model, &PlanOptions::editing());
+        for label in ["Reset Shape", "Bevel", "Duplicate", "Mirror X", "Mirror Y", "Mirror Z", "Align", "Snap", "Auto  ·", "Object", "Face"] {
+            assert!(planned.iter().any(|control| control.text == label), "missing {label}");
+        }
+        assert!(!planned.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Union" | "Subtract" | "Sketch" | "Edit Edges" | "Shell" | "Cancel" | "Apply")));
+        let face_model = build_solid(&selection, &world, &[], &[], SolidElement::Face(1), "Auto");
+        assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "-X");
+        assert!(face_model.section_titles().iter().any(|title| *title == "Face Tools"));
+        let face_plan = plan(&face_model, &PlanOptions::editing());
+        for label in ["Extrude", "Inset", "Bevel"] {
+            assert!(face_plan.iter().any(|control| control.text == label), "missing {label}");
+        }
+        assert!(!face_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Duplicate" | "Mirror X")));
+        world.set_block_bevel(block, 0.9).unwrap();
+        let featured = build(&selection, &world);
+        assert!(plan(&featured, &PlanOptions::editing()).iter().any(|control| control.text == "Bevel  0.900 m"));
+        set_selected_face_label(&mut model, "+X");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "+X");
+        assert!(plan(&model, &PlanOptions::editing()).iter().any(|control| control.text == "Reset Shape"));
+        attach_modeling_session(
+            &mut model,
+            &ModelingView { title: "Bevel", face: "All edges", amount_label: "Amount", amount: 0.6, minimum: 0.0, maximum: 0.9 },
+        );
+        assert!(model.section_titles().iter().any(|title| *title == "Bevel"));
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "All edges");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().display, "0.600");
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().editable);
+        let session_plan = plan(&model, &PlanOptions::editing());
+        for label in ["Amount", "0.600", "Cancel", "Apply", "Duplicate", "Align"] {
+            assert!(session_plan.iter().any(|control| control.text == label), "missing {label}");
+        }
+        assert!(!session_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel")));
     }
 }

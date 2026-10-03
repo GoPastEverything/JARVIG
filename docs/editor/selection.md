@@ -19,7 +19,9 @@ Not an `EntityHandle`, not an `ObjectId`, not a `RenderInstanceId`, and not a tr
 
 Only the entity variant exists. An asset, a component, a material, or a subobject can be added later without pretending those ids exist today. The content browser stays a placeholder.
 
-Selection does not mutate the world, does not bump the world revision, does not compile a material, and is not an authoring command. It is not saved in the scene. JRV-0069 may remember it with the workspace. It is not an undo step.
+Selection does not mutate the world, does not bump the world revision, does not compile a material, and is not an authoring command. It is not saved in the scene. JRV-0069 may remember it with the workspace. It is not an undo step. Editor undo exists for world edits. Changing which entities are selected stays off that stack. ADR-0068.
+
+The face of a parametric solid is editor state beside this service. The service item is still the entity. Object selection clears that face.
 
 ## Several items, one primary
 
@@ -63,7 +65,7 @@ mouse hit
     -> outliner highlight and inspector summary
 ```
 
-A plain click replaces. Ctrl toggles. An empty click clears. Ctrl on empty space does not. RMB, MMB, and orbit do not. A click does not bump the world revision. See [picking.md](picking.md).
+A plain click on a parametric solid selects the hit face in Auto and in Face. Object mode selects the entity and clears the face. A double-click promotes to the owning entity and does not change the mode. Shift-click adds. Ctrl-click toggles. If both are held, Ctrl wins. An empty click clears unless Shift or Ctrl is held. A Select-mode drag on empty space is a marquee: left to right takes objects fully inside, and right to left takes objects the rectangle touches. The marquee selects whole objects. Outliner Shift-range is still not implemented. RMB, MMB, and orbit do not select. A click does not bump the world revision. See [picking.md](picking.md). ADR-0068.
 
 ## Inspector
 

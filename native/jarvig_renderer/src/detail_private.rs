@@ -97,4 +97,24 @@ impl super::Renderer {
     pub fn accept_micro_build(&mut self, _epoch: u64, _key: u64, _mesh: jarvig_core::MicroMesh, _queue_wait_us: u32, _skipped: u32) -> bool {
         false
     }
+
+    pub(super) fn micro_debug_stage(&self) -> jarvig_core::MicroDebugStage {
+        match self.micro_stage {
+            "Queued" | "Sampling" => jarvig_core::MicroDebugStage::Queued,
+            "Building" | "Running" => jarvig_core::MicroDebugStage::Building,
+            "Uploading" => jarvig_core::MicroDebugStage::Uploading,
+            "Stale" => jarvig_core::MicroDebugStage::Stale,
+            _ => jarvig_core::MicroDebugStage::Ready,
+        }
+    }
+
+    /// Parent recolor uses the private debug pipeline. This candidate draws none of those triangles.
+    pub(super) fn draw_recolored_parents(
+        &mut self,
+        _encoder: &mut dyn jarvig_rhi::CommandEncoder,
+        _transform: jarvig_rhi::BindGroupId,
+        _color: [f32; 3],
+    ) -> Result<u32, RenderError> {
+        Ok(0)
+    }
 }

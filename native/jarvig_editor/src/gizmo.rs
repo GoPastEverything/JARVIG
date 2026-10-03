@@ -4,7 +4,7 @@
 //! Scale is not represented. The spatial frame has no scale property.
 //! Geometry is camera-relative float32. The billion-meter origin stays on the CPU.
 
-use jarvig_core::{camera_relative_f32, Quat, Vec3};
+use jarvig_core::{camera_relative_f32, face_center, face_normal, face_tangent, Quat, Vec3};
 use jarvig_renderer::OverlayVertex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +111,13 @@ pub fn translation_delta(drag: &GizmoDrag, hit: Vec3) -> Vec3 {
     drag.axis.scale(now - start)
 }
 
+/// The visible modeling arrow, from the face center through the tip.
+pub fn hit_operation_handle(ray_origin: Vec3, ray_direction: Vec3, center: Vec3, direction: Vec3, length: f64) -> bool {
+    let Some(direction) = normalize(direction) else { return false };
+    let tip = center + direction.scale(length * 0.92);
+    ray_segment(ray_origin, ray_direction, center, tip, length * 0.14).is_some()
+}
+
 pub fn axis_drag_plane(axis: Vec3, view_direction: Vec3) -> Vec3 {
     let projected = sub(view_direction, axis.scale(dot(view_direction, axis)));
     normalize(projected).unwrap_or(Vec3::new(0.0, 1.0, 0.0))
@@ -199,6 +206,130 @@ pub fn build_gizmo(
         }
     }
     vertices
+}
+
+fn face_half_spans(face: u8, size: [f64; 3]) -> (f64, f64) {
+    match face {
+        0 | 1 => (size[2] * 0.5, size[1] * 0.5),
+        2 | 3 => (size[0] * 0.5, size[2] * 0.5),
+        _ => (size[0] * 0.5, size[1] * 0.5),
+    }
+}
+
+fn face_corners(translation: Vec3, rotation: Quat, size: [f64; 3], face: u8) -> Option<[Vec3; 4]> {
+    let center = face_center(translation, rotation, size, face)?;
+    let normal = rotation.rotate(face_normal(face)?);
+    let tangent = rotation.rotate(face_tangent(face)?);
+    let bitangent = normal.cross(tangent);
+    let (along, across) = face_half_spans(face, size);
+    let u = tangent.scale(along);
+    let v = bitangent.scale(across);
+    Some([
+        center + u + v,
+        sub(center + u, v),
+        sub(sub(center, u), v),
+        sub(center, u) + v,
+    ])
+}
+
+/// All twelve edges of the solid. One color, so a whole-object selection is not a face.
+pub fn box_outline_vertices(
+    translation: Vec3,
+    rotation: Quat,
+    size: [f64; 3],
+    camera: Vec3,
+    length: f64,
+) -> Vec<OverlayVertex> {
+    let mut vertices = Vec::new();
+    let color = [0.75, 0.88, 1.0, 1.0];
+    let radius = length * 0.012;
+    let half = [size[0] * 0.5, size[1] * 0.5, size[2] * 0.5];
+    let mut corners = [Vec3::ZERO; 8];
+    for index in 0..8 {
+        let local = Vec3::new(
+            if index & 1 == 0 { -half[0] } else { half[0] },
+            if index & 2 == 0 { -half[1] } else { half[1] },
+            if index & 4 == 0 { -half[2] } else { half[2] },
+        );
+        corners[index] = translation + rotation.rotate(local);
+    }
+    for (start, end) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+        push_segment(&mut vertices, camera, corners[start], corners[end], radius, color);
+    }
+    vertices
+}
+
+/// One overlay line. The marquee is four of these, placed along viewport rays.
+pub fn push_segment(vertices: &mut Vec<OverlayVertex>, camera: Vec3, start: Vec3, end: Vec3, radius: f64, color: [f32; 4]) {
+    push_box(vertices, start, camera, end, radius, color);
+}
+
+/// The edges of the faces under the cursor or already chosen. Not a scene entity.
+pub fn face_outline_vertices(
+    translation: Vec3,
+    rotation: Quat,
+    size: [f64; 3],
+    camera: Vec3,
+    length: f64,
+    faces: &[u8],
+    hot: Option<u8>,
+) -> Vec<OverlayVertex> {
+    let mut vertices = Vec::new();
+    let radius = length * 0.012;
+    for face in faces {
+        let Some(corners) = face_corners(translation, rotation, size, *face) else { continue };
+        let color = face_color(*face, hot, None);
+        for index in 0..4 {
+            push_box(&mut vertices, corners[index], camera, corners[(index + 1) % 4], radius, color);
+        }
+    }
+    vertices
+}
+
+/// One arrow for the open modeling operation. `inward` points the arrow into the face.
+pub fn operation_handle_vertices(
+    translation: Vec3,
+    rotation: Quat,
+    size: [f64; 3],
+    camera: Vec3,
+    length: f64,
+    face: u8,
+    inward: bool,
+    active: bool,
+) -> Vec<OverlayVertex> {
+    let mut vertices = Vec::new();
+    let Some(center) = face_center(translation, rotation, size, face) else { return vertices };
+    let Some(normal) = face_normal(face) else { return vertices };
+    let mut direction = rotation.rotate(normal);
+    if inward {
+        direction = direction.scale(-1.0);
+    }
+    let color = if active { [1.0, 0.95, 0.55, 1.0] } else { face_color(face, None, None) };
+    let end = center + direction.scale(length * 0.62);
+    let tip = center + direction.scale(length * 0.92);
+    push_box(&mut vertices, center, camera, end, length * 0.02, color);
+    push_cone(&mut vertices, center, camera, end, tip, length * 0.07, color);
+    vertices
+}
+
+pub fn scalar_along(delta: Vec3, axis: Vec3) -> f64 {
+    dot(delta, axis)
+}
+
+fn face_color(face: u8, hover: Option<u8>, active: Option<u8>) -> [f32; 4] {
+    if active == Some(face) {
+        return [1.0, 0.95, 0.55, 1.0];
+    }
+    let base = match face / 2 {
+        0 => [0.90, 0.16, 0.14, 1.0],
+        1 => [0.20, 0.78, 0.28, 1.0],
+        _ => [0.20, 0.45, 0.95, 1.0],
+    };
+    if hover == Some(face) {
+        [(base[0] + 1.0) * 0.5, (base[1] + 1.0) * 0.5, (base[2] + 1.0) * 0.5, 1.0]
+    } else {
+        base
+    }
 }
 
 /// Joint pivots, axes, and the selected joint's limit marks. Not a scene entity.
@@ -451,6 +582,37 @@ mod tests {
         let toward = normalize_test(Vec3::new(ring_point.x - eye.x, ring_point.y - eye.y, ring_point.z - eye.z));
         let ring = hit_gizmo(Vec3::ZERO, eye, toward, 1.0, TransformSpace::World, Quat::IDENTITY, true);
         assert_eq!(ring, Some(GizmoHandle::RingY));
+    }
+
+    #[test]
+    fn an_operation_arrow_drag_moves_along_the_arrow() {
+        let center = Vec3::new(0.0, 1.0, -4.0);
+        let arrow = Vec3::new(0.0, 0.0, -1.0);
+        let eye = Vec3::new(1.5, 2.4, 0.5);
+        let view = normalize(sub(center, eye)).unwrap();
+        let plane = axis_drag_plane(arrow, view);
+        let start = ray_plane(eye, view, center, plane).unwrap();
+        let target = center + arrow.scale(0.35);
+        let later = normalize(sub(target, eye)).unwrap();
+        let end = ray_plane(eye, later, center, plane).unwrap();
+        let along = scalar_along(sub(end, start), arrow);
+        assert!(along > 0.2, "along {along}");
+        let face_start = ray_plane(eye, view, center, arrow).unwrap();
+        let face_end = ray_plane(eye, later, center, arrow).unwrap();
+        let face_along = scalar_along(sub(face_end, face_start), arrow);
+        assert!(face_along.abs() < 1.0e-6, "face {face_along}");
+    }
+
+    #[test]
+    fn the_operation_arrow_tip_is_a_hit() {
+        let center = Vec3::new(0.0, 1.0, -4.0);
+        let arrow = Vec3::new(0.0, 1.0, 0.0);
+        let length = 1.0;
+        let tip = center + arrow.scale(length * 0.9);
+        let eye = Vec3::new(2.0, tip.y, -2.0);
+        let direction = normalize(sub(tip, eye)).unwrap();
+        assert!(hit_operation_handle(eye, direction, center, arrow, length));
+        assert!(!hit_operation_handle(eye, Vec3::new(0.0, 1.0, 0.0), center, arrow, length));
     }
 
     fn normalize_test(value: Vec3) -> Vec3 {

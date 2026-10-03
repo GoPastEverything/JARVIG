@@ -153,6 +153,8 @@ pub enum AuthoringClass {
     Camera,
     WorldSettings,
     Terrain,
+    PlayerStart,
+    Block,
     Empty,
 }
 
@@ -165,6 +167,8 @@ impl AuthoringClass {
             Self::Camera => "Camera",
             Self::WorldSettings => "World",
             Self::Terrain => "Terrain",
+            Self::PlayerStart => "Spawn",
+            Self::Block => "Block",
             Self::Empty => "",
         }
     }

@@ -4,7 +4,7 @@
     "primary": "#D8E5F2",
     "accent": "#4AB4FF",
     "muted": "#7F93A8",
-    "svg_viewbox": "96x96",
+    "svg_viewbox": "128x128",
     "png_size": "128x128"
   },
   "assets": [
@@ -12,6 +12,10 @@
     "translate",
     "rotate",
     "scale",
+    "block",
+    "level",
+    "land",
+    "character",
     "play",
     "pause",
     "stop",

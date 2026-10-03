@@ -2,20 +2,22 @@
 
 `JARVIGEditor.exe` is the native editor. It hosts the engine. It is not a second engine, not the player, and not the dedicated server.
 
-The TypeScript dock is still available for the old command-bus tests. It is transitional. Do not wrap it in a WebView and call that the editor. `pnpm dev:hub` is not the product Hub.
+The TypeScript dock is still available for the old command-bus tests. It is transitional. Do not wrap it in a WebView and call that the editor. `pnpm dev:hub` is not the product hub. The product hub is `JARVIG.exe`. See [hub.md](hub.md).
 
 ```powershell
-cargo run --manifest-path native/Cargo.toml -p jarvig_editor
-cargo run --manifest-path native/Cargo.toml -p jarvig_editor -- --self-test
+cargo run --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor
+cargo run --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor -- --self-test
+cargo run --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor -- --project samples/lighting-lab/LightingLab.jarvigproject
 ```
 
-`--self-test` opens the window, exercises the dock, flies the Perspective camera, presents, and exits. Leave the flag off to keep the window open. RMB looks. WASD flies.
+A launch with no project shows the hub and does not open Lighting Lab. `--self-test` opens the editor, exercises the dock, flies the Perspective camera, presents, and exits. It does not open a project. `--project` skips the hub. RMB looks. WASD flies.
 
 The two-view renderer test is still `jarvig_editor_host`. It is not this product.
 
 | Doc | What it is |
 | --- | --- |
 | [architecture.md](architecture.md) | Who owns the window, the world, and the viewport |
+| [hub.md](hub.md) | The project browser before the editor |
 | [workspaces.md](workspaces.md) | The dock tree. JRV-0059 is accepted |
 | [viewport.md](viewport.md) | The center child is one engine `RenderView` |
 | [camera.md](camera.md) | Perspective fly camera. Not a scene entity. Accepted |

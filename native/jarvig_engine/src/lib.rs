@@ -110,14 +110,26 @@ impl EngineSession {
         &self.mesh_assets
     }
 
-    /// Cluster bounds for one authored entity. Empty for a builtin mesh. Does not copy vertices.
+    /// Cluster bounds for one entity. An imported asset uses its sidecar. A parametric solid uses the clusters built from its derived surface. Does not copy vertices.
     pub fn meshlet_records(&self, entity: jarvig_core::EntityId) -> Vec<jarvig_core::GpuMeshletRecord> {
-        let Some((_, _, _, _, _, _, mesh, _)) = self.world.authored_mesh(entity) else { return Vec::new() };
-        let jarvig_core::MeshAssetRef::Asset { id, .. } = mesh else { return Vec::new() };
-        self.mesh_assets
-            .meshlets(id)
+        if let Some((_, _, _, _, _, _, mesh, _)) = self.world.authored_mesh(entity) {
+            if let jarvig_core::MeshAssetRef::Asset { id, .. } = mesh {
+                return self
+                    .mesh_assets
+                    .meshlets(id)
+                    .map(|set| set.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect())
+                    .unwrap_or_default();
+            }
+        }
+        self.runtime_meshlets(entity)
             .map(|set| set.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect())
             .unwrap_or_default()
+    }
+
+    /// Clusters built with the derived surface. Not a sidecar and not part of the level.
+    pub fn runtime_meshlets(&self, entity: jarvig_core::EntityId) -> Option<&jarvig_core::MeshletSet> {
+        let mesh = self.world.object_mesh(entity)?;
+        self.world.derived_meshlets(mesh)
     }
 
     pub fn mesh_asset_names(&self) -> Vec<String> {
@@ -322,10 +334,41 @@ impl EngineSession {
         let objects: Vec<_> = world.objects().collect();
         for object in objects {
             let entity = world.entity(object).map_err(|error| error.to_string())?;
-            let Some((_, _, _, _, _, _, _, material)) = world.authored_mesh(entity) else { continue };
+            let material = if let Some((_, _, _, _, _, _, _, material)) = world.authored_mesh(entity) {
+                material
+            } else if let Some(block) = world.authored_block(entity) {
+                block.material
+            } else {
+                continue;
+            };
             let asset = object_asset_id(world, object);
             let (base, orm_tex, normal_tex) = self.textures_for(asset, &material, white, orm, normal, near_color, far_color)?;
             self.bind_resolved(world, object, master, base, orm_tex, normal_tex, white, sampler, &material)?;
+        }
+        Ok(())
+    }
+
+    /// Binds the entity's saved material again. Used when a transaction spawns a drawable
+    /// or changes its material factors. An in-place block mesh rebuild does not need this.
+    pub fn rebind_entity_material(&mut self, entity: jarvig_core::EntityId) -> Result<(), String> {
+        let master = self.current_material_master()?;
+        self.bind_entity_material(entity, master)
+    }
+
+    fn bind_entity_material(&mut self, entity: jarvig_core::EntityId, master: jarvig_material::MasterMaterialId) -> Result<(), String> {
+        let material = if let Some(block) = self.world.authored_block(entity) {
+            block.material
+        } else if let Some((_, _, _, _, _, _, _, material)) = self.world.authored_mesh(entity) {
+            material
+        } else {
+            return Err("entity has no material".into());
+        };
+        let objects: Vec<_> = self.world.objects().filter(|object| self.world.entity(*object).ok() == Some(entity)).collect();
+        if objects.is_empty() {
+            return Err("entity has no drawable".into());
+        }
+        for object in objects {
+            self.bind_object(object, &material, master)?;
         }
         Ok(())
     }
@@ -762,6 +805,44 @@ mod tests {
         assert!((material.roughness - 0.78).abs() < 1.0e-5);
         assert_eq!(restored.world().entity_count(), 12);
         assert_eq!(restored.world().environment().intensity, 0.20);
+    }
+
+    #[test]
+    fn an_empty_level_then_a_block_drops_the_previous_worlds_instances() {
+        let mut editor = EngineSession::editor().unwrap();
+        let lab = jarvig_core::lighting_lab_level();
+        editor.load_level(&lab).unwrap();
+        let cube = jarvig_core::EntityId::parse("99999999-9999-4999-8999-999999999999").unwrap();
+        assert!(editor.world().authored_mesh(cube).is_some());
+        assert!(editor.world().object_count() > 1);
+        editor.load_level(&jarvig_core::empty_world_level()).unwrap();
+        assert_eq!(editor.world().object_count(), 0);
+        assert_eq!(editor.world().block_count(), 0);
+        assert!(editor.world().entity_outline().iter().all(|row| row.uuid != cube));
+        let created = editor
+            .execute_authoring(AuthoringCommand::CreateBlock { local: jarvig_core::Vec3::new(0.0, 1.0, -4.0) })
+            .unwrap();
+        let jarvig_core::AuthoringResult::Created(id) = created else { panic!("block was not created") };
+        assert_eq!(editor.world().block_count(), 1);
+        assert_eq!(editor.world().object_count(), 1);
+        assert!(editor.world().authored_mesh(id).is_none());
+        assert!(editor.world().entity_outline().iter().all(|row| row.uuid != cube));
+        let record = editor.world().authored_block(id).unwrap();
+        assert_eq!(record.size_m, [2.0, 2.0, 2.0]);
+        let records = editor.meshlet_records(id);
+        assert!(!records.is_empty());
+        assert_eq!(records.iter().map(|record| record.triangles).sum::<u32>(), 12);
+        assert!(editor.runtime_meshlets(id).is_some());
+        let snapshot = editor.world().extract(jarvig_core::RenderFrameId(1)).unwrap();
+        assert_eq!(snapshot.instances().len(), 1);
+        assert_eq!(snapshot.instances()[0].entity, id);
+        let mesh = editor.world().meshes().get(snapshot.instances()[0].mesh).unwrap();
+        assert_eq!(mesh.vertex_count(), 24);
+        assert_eq!(mesh.index_count(), 36);
+        assert!(matches!(
+            editor.world().entity_outline().iter().find(|row| row.uuid == id).map(|row| row.class),
+            Some(jarvig_core::AuthoringClass::Block)
+        ));
     }
 
     #[test]

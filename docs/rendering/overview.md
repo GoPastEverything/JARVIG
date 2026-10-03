@@ -49,4 +49,4 @@ Each experimental step needs benchmarks: frame time, GPU time, CPU time, memory,
 
 ## Research flags
 
-`virtualGeometry`, `proceduralMicrogeometry`, `representationVirtualization`, and `advancedGi` default off. Pages: [webgpu.md](webgpu.md), [gpu-scene.md](gpu-scene.md), [visibility.md](visibility.md), [meshlets.md](meshlets.md), [virtual-geometry.md](virtual-geometry.md), [microgeometry.md](microgeometry.md), [representation-virtualization.md](representation-virtualization.md), [lighting.md](lighting.md).
+`virtualGeometry`, `proceduralMicrogeometry`, `representationVirtualization`, and `advancedGi` default off in the TypeScript prototype. ADR-0061 is the native editor runtime: meshlet drawing, the cluster hierarchy, frustum culling, and hierarchical-Z start on, and microgeometry mode defaults to Auto. Pages: [webgpu.md](webgpu.md), [gpu-scene.md](gpu-scene.md), [visibility.md](visibility.md), [meshlets.md](meshlets.md), [virtual-geometry.md](virtual-geometry.md), [microgeometry.md](microgeometry.md), [representation-virtualization.md](representation-virtualization.md), [lighting.md](lighting.md).

@@ -5,6 +5,7 @@
 //! Plugins and game modules use the C ABI in `include/jarvig_core.h`, not the Rust ABI.
 
 mod application;
+mod hub;
 mod character;
 mod bvh;
 mod asset;
@@ -12,6 +13,7 @@ mod gltf;
 mod gpu_scene;
 mod clock;
 mod input;
+mod parametric;
 mod play;
 mod settings;
 mod entity;
@@ -27,10 +29,12 @@ mod mesh;
 mod meshlet;
 mod meshlet_hierarchy;
 mod meshlet_parents;
+mod leaf_coverage;
 mod detail_provider;
 mod microgeometry;
 mod pick;
 mod registry;
+mod player;
 mod prefab;
 mod probe;
 mod project;
@@ -53,17 +57,26 @@ pub use character::{
 };
 pub use gltf::{assemble_rigid_bind_pose, curved_prop_glb, import_gltf, rigid_part_glb, BindPart, BindPoseAssembly, ImportError, RigidTransform, BIND_POSE_CONNECT_M};
 pub use gpu_scene::{
-    closest_meshlet_on_ray, frustum_cull_meshlets, occlusion_cull_meshlets, pack_gpu_scene, FrustumCull, GpuMeshletRecord, GpuSceneGeometry, GpuScenePack, GpuSceneStats,
-    OcclusionCull,
+    closest_meshlet_on_ray, compare_pipeline_coverage, detail_overlay_keeps_base, diagnostic_frame_is_reusable, diagnostic_geometry_matches, frustum_cull_meshlets,
+    hash_diagnostic_frame, hierarchical_depth_extent, hierarchical_occlusion_cull, meshlet_slot_is_local, occlusion_cull_meshlets, pack_diagnostic_color, pack_gpu_scene,
+    packet_index_in_range, packet_uses_its_own_buffers, recolor_packets, stage_leaf_flags, DiagnosticFrameHashes, DiagnosticPacket, DiagnosticVisualization, FrustumCull,
+    GeometryDiagnostic, GpuMeshletRecord, GpuSceneGeometry, GpuScenePack, GpuSceneStats, OcclusionCull, PipelineCoverage, StageCoverage, DIAGNOSTIC_COLOR_BASE,
+    DIAGNOSTIC_NO_PARENT, DIAGNOSTIC_PARENT_STRIDE,
 };
 pub use mesh::{mesh_from_surfaces, CanonicalSurface};
 pub use meshlet_hierarchy::{
-    build_cluster_hierarchy, leaves_under, select_cluster_cut, select_cluster_cut_for_pose, visit_leaves, ClusterCut, ClusterHierarchy, ClusterNode,
+    build_cluster_hierarchy, cut_visible_hierarchy, cut_visible_hierarchy_for_pose, leaves_under, select_cluster_cut, select_cluster_cut_for_pose, visit_leaves,
+    ClusterCut, ClusterHierarchy, ClusterNode, ViewVisibility,
 };
 pub use jobs::{JobContext, JobDesc, JobId, JobManager, JobSnapshot, JobState};
 pub use meshlet_parents::{
-    build_parent_geometry, build_parent_geometry_with, load_parent_cache, parent_draw_indices, save_parent_cache, submission_for_cut, HierarchySubmission, ParentGeometry,
+    build_parent_geometry, build_parent_geometry_with, drawable_parent_mask, load_parent_cache, parent_draw_indices, save_parent_cache, submission_for_cut,
+    submission_keeping_coverage, HierarchySubmission, ParentGeometry,
     ParentLevelStats, ParentRange, PARENT_BUILDER_VERSION,
+};
+pub use leaf_coverage::{
+    assemble_leaf_truth_stages, compare_stage_triangles, coverage_bmp, coverage_stage_line, CoverageStageReport, LeafTruthComparison, ParentCoverageInput,
+    StageTriangles, PARENT_POSITION_KEEP,
 };
 pub use detail_provider::{public_detail, DisabledDetail, ProceduralMicrogeometry, ReferenceDetail};
 pub use microgeometry::{
@@ -72,10 +85,15 @@ pub use microgeometry::{
     evaluate_procedural_microgeometry, probe_detail, projected_detail_px, surface_level, DetailDecision, DetailProbe, DetailProvider, DetailQuery, DetailRule, DetailSample,
     LocalPatch,
     MicroBudget, MicroMesh, MicroSpan, SurfaceAnchor, DETAIL_ERROR_THRESHOLD_PX,
-    DETAIL_FEATURE_SIZE_M, EINSTEIN_DEBUG_UV_SCALE, PROCEDURAL_MICROGEOMETRY_DEFAULT,
+    DETAIL_FEATURE_SIZE_M, EINSTEIN_DEBUG_UV_SCALE, PROCEDURAL_MICROGEOMETRY_DEFAULT, MicrogeometryMode, SurfaceDetailFacts,
+    microgeometry_active, DetailReject, DetailCluster, DetailReasonCounts, DetailVisibilityAccount, account_visible_detail, detail_reason_counts, select_detail_clusters, MicroLifecycle, MicroLifecycleStep,
+    micro_note_desired, micro_note_finished, micro_note_failed, MicroDebugMode, MicroDebugStage, micro_debug_color,
+    DetailLifecycle, DetailPhase, DetailCandidateId, DetailCandidate, DetailPipe, DetailCoverageAccount, DetailSetHashes, DetailCoverage,
+    cluster_requires_detail, detail_state_color, classify_detail_coverage, surface_with_detail,
 };
 pub use meshlet::{
-    build_meshlets, decode_meshlets, encode_meshlets, meshlet_color, meshlet_draw, meshlets_cover_source, Meshlet, MeshletDraw, MeshletDrawRange, MeshletSet,
+    build_meshlets, decode_meshlets, encode_meshlets, meshlet_color, meshlet_coverage, meshlet_draw, meshlets_cover_source, Meshlet, MeshletCoverage, MeshletDraw,
+    MeshletDrawRange, MeshletSet,
     MeshletStats, MESHLET_BUILDER_VERSION, MESHLET_MAX_TRIANGLES, MESHLET_MAX_VERTICES,
 };
 pub use input::{ActionState, ActionValue, InputDeviceState, InputMappingContext, PhysicalControl};
@@ -99,7 +117,7 @@ pub use material_set::{
     select_normal, MaterialMapRole, NormalConvention,
 };
 pub use mesh::{
-    capsule_mesh, create_mesh, cube_mesh, emissive_panel_mesh, far_triangle_mesh, flat_sphere_mesh, floor_mesh, near_triangle_mesh, sphere_mesh,
+    block_surface_mesh, box_mesh, capsule_mesh, create_mesh, cube_mesh, emissive_panel_mesh, far_triangle_mesh, flat_sphere_mesh, floor_mesh, near_triangle_mesh, sphere_mesh,
     Aabb,
     BoundingSphere, LocalBounds, Mesh, MeshDesc,
     MeshError, MeshId, MeshIndexFormat, MeshLibrary, MeshTopology, MeshVertexAttribute, MeshVertexFormat, Submesh,
@@ -136,8 +154,8 @@ pub use shadow::{
     SHADOW_PASS_BUDGET, SHADOW_PCF_RADIUS, SHADOW_SLOPE_BIAS, SHADOW_SLOPE_BIAS_M, SUN_ANGULAR_TAN, casts_into_shadow_map,
 };
 pub use level::{
-    empty_world_level, parse_level, lighting_lab_level, CameraRecord, ComponentRecord, EntityRecord, LevelDocument, LevelError, LightRecord, MaterialAssetRef, MaterialScheme, MeshAssetRef,
-    ProbeRecord, WorldSettingsRecord, LEVEL_CAMERA_VERSION, LEVEL_FORMAT_VERSION, LEVEL_JOINT_VERSION, LEVEL_SCHEMA, LEVEL_TERRAIN_VERSION, LIGHTING_LAB_LEVEL_UUID,
+    empty_world_level, parse_level, lighting_lab_level, CameraRecord, ComponentRecord, EntityMemento, EntityRecord, LevelDocument, LevelError, LightRecord, MaterialAssetRef, MaterialScheme, MeshAssetRef,
+    ProbeRecord, WorldSettingsRecord, LEVEL_BLOCK_VERSION, LEVEL_CAMERA_VERSION, LEVEL_FORMAT_VERSION, LEVEL_JOINT_VERSION, LEVEL_PLAYER_START_VERSION, LEVEL_SCHEMA, LEVEL_TERRAIN_VERSION, LIGHTING_LAB_LEVEL_UUID,
 };
 pub use terrain::{
     apply_terrain_property, brush_ring, build_dirty_chunks, decode_f32_base64, decode_u8_base64, encode_f32_base64, encode_u8_base64, snap_terrain_xz, terrain_overlay_lines, world_grid_coord, world_grid_phase, BuiltTerrainChunk,
@@ -148,19 +166,34 @@ pub use terrain::{
 pub use reflect::{
     FIELD_TERRAIN_CHUNK, FIELD_TERRAIN_CLASS, FIELD_TERRAIN_CLIFF, FIELD_TERRAIN_COLLISION, FIELD_TERRAIN_DEBUG, FIELD_TERRAIN_DEBUG_COLORS, FIELD_TERRAIN_DENSITY,
     FIELD_TERRAIN_DEPTH, FIELD_TERRAIN_DISPLACEMENT, FIELD_TERRAIN_DISTANCE, FIELD_TERRAIN_EINSTEIN, FIELD_TERRAIN_EINSTEIN_COLLISION, FIELD_TERRAIN_ERROR, FIELD_TERRAIN_HEIGHT,
-    FIELD_TERRAIN_HEIGHT_MAX, FIELD_TERRAIN_HEIGHT_MIN, FIELD_TERRAIN_LOD, FIELD_TERRAIN_MATERIAL, FIELD_TERRAIN_SEED, FIELD_TERRAIN_SPACING, FIELD_TERRAIN_WIDTH, TYPE_TERRAIN,
+    FIELD_BLOCK_BEVEL, FIELD_BLOCK_COLLISION, FIELD_BLOCK_COLLISION_ENABLED, FIELD_BLOCK_HISTORY, FIELD_BLOCK_INSET_NX, FIELD_BLOCK_INSET_NY, FIELD_BLOCK_INSET_NZ, FIELD_BLOCK_INSET_PX, FIELD_BLOCK_INSET_PY, FIELD_BLOCK_INSET_PZ, FIELD_BLOCK_MATERIAL, FIELD_BLOCK_ORIGIN, FIELD_BLOCK_SIZE_X, FIELD_BLOCK_SIZE_Y, FIELD_BLOCK_SIZE_Z, FIELD_PLAYER_DEFINITION, FIELD_PREVIEW_CHARACTER, FIELD_TERRAIN_HEIGHT_MAX, FIELD_TERRAIN_HEIGHT_MIN, FIELD_TERRAIN_LOD, FIELD_TERRAIN_MATERIAL, FIELD_TERRAIN_SEED, FIELD_TERRAIN_SPACING, FIELD_TERRAIN_WIDTH, TYPE_PARAMETRIC_BLOCK, TYPE_PLAYER_START, TYPE_TERRAIN,
 };
 pub use joint::{apply_joint_property, clamp_joint_pose, joint_debug_lines, JointDebugLine, JointKind, JointLimits, JointRecord};
+pub use parametric::{
+    align_translation_to_ground, default_block_material, editor_reference_segments, face_center, face_from_local_point, face_name, face_normal, face_tangent,
+    feature_limit, finite_size, keep_outside_blocks, keep_outside_box, mirrored_translation, nearest_face_handle, push_face, scene_origin_world_x, snap_dimension,
+    snap_translation, swap_insets, BlockOp, BlockRecord, BlockSolid, FacePush, ReferenceSegment, BLOCK_DIMENSION_SNAP_M, BLOCK_EXTRUDE_STEP_M, BLOCK_HISTORY_LIMIT,
+    BLOCK_INSET_STEP_M, BLOCK_MAX_EXTENT_M, BLOCK_MIN_EXTENT_M, BLOCK_POSITION_SNAP_M, FLY_COLLISION_RADIUS_M, REFERENCE_GRID_Y_M,
+};
+pub use player::{
+    apply_player_start_property, compose_spawn_rotation, parse_player, parse_player_start_fields, player_start_lines, validate_relative_asset, PlayerDocument, PlayerStartRecord,
+    PLAYER_FORMAT_VERSION, PLAYER_SCHEMA,
+};
 pub use prefab::{parse_prefab, primitive_mannequin_level, primitive_mannequin_prefab, PrefabDocument, PREFAB_FORMAT_VERSION, PREFAB_SCHEMA};
 pub use registry::{
     model_subtype, reconcile_asset_registry, texture_subtype, thumbnail_rgba, AssetRegistry, RegistryAsset, RegistryRoots, REGISTRY_SCHEMA,
+};
+pub use hub::{
+    create_project_at, hub_recent_file, load_recent_at, locate_recent_at, project_file_missing, remember_recent_at, remove_recent_at,
+    same_project_path, save_recent_at, ProjectTemplate, RecentList, RecentProject, HUB_RECENT_SCHEMA, HUB_RECENT_VERSION, PLAYER_TEMPLATE_NOTE,
+    TEMPLATE_PLAYER_FILE, TEMPLATE_STARTUP_LEVEL,
 };
 pub use project::{
     autosave_path, create_project_directories, load_level_file, load_project_file, parse_project, save_atomic, save_level_atomic,
     save_project_atomic, ProjectDocument, ProjectError, LIGHTING_LAB_PROJECT_UUID, PROJECT_FORMAT_VERSION, PROJECT_SCHEMA,
 };
 pub use scene::{
-    instance_gpu_transforms, CameraId, ComponentBinding, ComponentQueryHit, ComponentRole, EntityCapabilities, EntityFocus, EntityOwnership, ExtractedCamera, ExtractedGameCamera, FocusError, JointDebugSegment, JointId, LandDrawClass, MaterialSlotBinding, ObjectId,
+    instance_gpu_transforms, AuthoringCapabilities, CameraId, ComponentBinding, ComponentQueryHit, ComponentRole, EntityCapabilities, EntityFocus, EntityOwnership, ExtractedCamera, ExtractedGameCamera, FocusError, JointDebugSegment, JointId, LandDrawClass, MaterialSlotBinding, MementoEffect, ObjectId,
     RenderFrameId, RenderInstance, RenderInstanceId, RenderSceneSnapshot, SceneWorld, TerrainSurfaceMetrics,
 };
 pub use jarvig_material::{ColorSpace, MaterialInstanceId};

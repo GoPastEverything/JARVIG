@@ -8,6 +8,6 @@ Visible roots are the project's content directory, its config directory, and `So
 
 The panel has type filters, a search box, and a metadata line. A texture or an already-resident model base color is reduced to a 128-pixel thumbnail with `thumbnail_rgba`. The full image is not kept as a browser copy and is not uploaded for the sake of the panel. Lighting Lab's loose `Content/Textures` folder is empty; the shop row uses the base color that the mesh library already holds after project open.
 
-Dragging a model into the viewport places one mesh actor through `place_existing_mesh` and records that actor for Ctrl+Z or Edit > Undo Mesh Placement. Levels, source files, and config files do not spawn. Material and texture assignment onto a slot is not in this slice.
+Dragging a model into the viewport places one mesh actor through `place_existing_mesh`. That placement is one Place Mesh transaction on the editor undo stack. Ctrl+Z undoes it with the other edits. Levels, source files, and config files do not spawn. Material and texture assignment onto a slot is not in this slice.
 
 The scan runs on the existing background job queue as `Scan Project Content`. `--content-check` opens Lighting Lab, checks the list, places the townshop mesh, undoes that placement, and prints `CONTENT_BROWSER_PASS`.

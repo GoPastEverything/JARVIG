@@ -1,4 +1,5 @@
-//! Editor chrome. Dark shell colors and the navigation icon toolbar.
+//! Editor chrome. Dark shell colors and the navigation toolbar.
+//! Each button is an icon with a short caption under it.
 //!
 //! Icons are source PNGs under `assets/editor/ui/navigation`. Windows Imaging
 //! decodes them. They are not scene assets and not an entity.
@@ -200,6 +201,10 @@ pub enum ToolbarCommand {
     Translate,
     Rotate,
     Scale,
+    Block,
+    Extrude,
+    Inset,
+    Bevel,
     Level,
     Land,
     Character,
@@ -233,12 +238,22 @@ impl ToolbarCommand {
         matches!(self, Self::Level | Self::Land | Self::Character)
     }
 
+    /// Shown only while a parametric solid is selected.
+    pub fn is_modeling(self) -> bool {
+        matches!(self, Self::Extrude | Self::Inset | Self::Bevel)
+    }
+
+    /// Log and menu name. Longer than the toolbar caption.
     pub fn label(self) -> &'static str {
         match self {
             Self::Select => "Select",
             Self::Translate => "Translate",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
+            Self::Block => "Block",
+            Self::Extrude => "Extrude",
+            Self::Inset => "Inset",
+            Self::Bevel => "Bevel",
             Self::Level => "Level",
             Self::Land => "Land",
             Self::Character => "Character",
@@ -254,6 +269,38 @@ impl ToolbarCommand {
             Self::Speed => "Camera speed",
             Self::Maximize => "Maximize viewport",
         }
+    }
+
+    /// Short word drawn under the icon. Translate says Move. Local says World until toggled.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Select => "Select",
+            Self::Translate => "Move",
+            Self::Rotate => "Rotate",
+            Self::Scale => "Scale",
+            Self::Block => "Block",
+            Self::Extrude => "Extrude",
+            Self::Inset => "Inset",
+            Self::Bevel => "Bevel",
+            Self::Level => "Level",
+            Self::Land => "Land",
+            Self::Character => "Character",
+            Self::Play => "Play",
+            Self::Pause => "Pause",
+            Self::Stop => "Stop",
+            Self::Fly => "Fly",
+            Self::Pan => "Pan",
+            Self::Orbit => "Orbit",
+            Self::Focus => "Focus",
+            Self::Snap => "Snap",
+            Self::Local => "World",
+            Self::Speed => "Speed",
+            Self::Maximize => "Max",
+        }
+    }
+
+    pub fn caption_for(self, local_space: bool) -> &'static str {
+        if self == Self::Local && local_space { "Local" } else { self.caption() }
     }
 }
 
@@ -311,8 +358,11 @@ impl Toolbar {
         self.buttons.get(index).map(|button| button.command)
     }
 
-    pub fn hit(&self, dpi: u32, x: i32, y: i32) -> Option<usize> {
-        self.slots(dpi).into_iter().find(|slot| x >= slot.x && y >= slot.y && x < slot.x + slot.width && y < slot.y + slot.size).map(|slot| slot.index)
+    pub fn hit(&self, dpi: u32, x: i32, y: i32, show_modeling: bool) -> Option<usize> {
+        self.slots(dpi, show_modeling)
+            .into_iter()
+            .find(|slot| x >= slot.x && y >= slot.y && x < slot.x + slot.width && y < slot.y + slot.height)
+            .map(|slot| slot.index)
     }
 
     pub fn paint(
@@ -327,6 +377,8 @@ impl Toolbar {
         session: Option<ToolbarCommand>,
         font: HFONT,
         mode: WorkspaceMode,
+        show_modeling: bool,
+        modeling: Option<ToolbarCommand>,
     ) {
         unsafe {
             let rect = RECT { left: 0, top: 0, right: width, bottom: height };
@@ -338,7 +390,7 @@ impl Toolbar {
             }
             SetBkMode(hdc, 1);
         }
-        for slot in self.slots(dpi) {
+        for slot in self.slots(dpi, show_modeling) {
             let button = &self.buttons[slot.index];
             let disabled = button.command == ToolbarCommand::Scale;
             let on = !disabled
@@ -347,7 +399,8 @@ impl Toolbar {
                     || (button.command == ToolbarCommand::Level && mode == WorkspaceMode::Level)
                     || (button.command == ToolbarCommand::Land && mode == WorkspaceMode::Land)
                     || (button.command == ToolbarCommand::Character && mode == WorkspaceMode::Character)
-                    || session == Some(button.command));
+                    || session == Some(button.command)
+                    || modeling == Some(button.command));
             let hot = hot == Some(slot.index);
             let fill = if disabled {
                 brush(brushes().button)
@@ -371,65 +424,80 @@ impl Toolbar {
             } else {
                 IconTone::Full
             };
-            let rect = RECT { left: slot.x, top: slot.y, right: slot.x + slot.width, bottom: slot.y + slot.size };
+            let background = if on { BUTTON_ON } else if hot { BUTTON_HOT } else { BUTTON };
+            let rect = RECT { left: slot.x, top: slot.y, right: slot.x + slot.width, bottom: slot.y + slot.height };
             unsafe { FillRect(hdc, &rect, fill); }
             if on {
-                let accent = RECT { left: slot.x, top: slot.y + slot.size - 2, right: slot.x + slot.width, bottom: slot.y + slot.size };
+                let accent = RECT {
+                    left: slot.x,
+                    top: slot.y + slot.height - 2,
+                    right: slot.x + slot.width,
+                    bottom: slot.y + slot.height,
+                };
                 unsafe { FillRect(hdc, &accent, brush(brushes().accent)); }
             }
-            let pad = (slot.size / 6).max(2);
-            let icon_size = (slot.size - pad * 2).max(8);
-            let icon_x = slot.x + (slot.width - icon_size) / 2;
-            let icon_y = slot.y + (slot.size - icon_size) / 2;
-            if button.command.is_workspace() {
-                let label = wide(button.command.label());
-                let mut extent = SIZE { cx: 0, cy: 0 };
-                unsafe {
-                    GetTextExtentPoint32W(hdc, label.as_ptr(), (label.len() - 1) as i32, &mut extent);
-                    let text_x = slot.x + (slot.width - extent.cx).max(0) / 2;
-                    let text_y = slot.y + (slot.size - extent.cy).max(0) / 2;
-                    SetTextColor(hdc, if on { TEXT } else { TEXT_DIM });
-                    TextOutW(hdc, text_x, text_y, label.as_ptr(), (label.len() - 1) as i32);
-                }
-            } else if let Some(icon) = &button.icon {
-                blit_icon(hdc, icon, icon_x, icon_y, icon_size, if on { BUTTON_ON } else if hot { BUTTON_HOT } else { BUTTON }, tone);
+            let icon_x = slot.x + (slot.width - slot.icon).max(0) / 2;
+            let icon_y = slot.y + slot.pad_top;
+            if let Some(icon) = &button.icon {
+                blit_icon(hdc, icon, icon_x, icon_y, slot.icon, background, tone);
+            }
+            let caption = wide(button.command.caption_for(local_space));
+            let mut extent = SIZE { cx: 0, cy: 0 };
+            let caption_color = if disabled {
+                rgb(96, 96, 96)
+            } else if on {
+                TEXT
+            } else if button.command.is_object_tool() || button.command.is_workspace() {
+                TEXT_DIM
             } else {
-                let letter = wide(&button.command.label()[..1]);
-                unsafe {
-                    SetTextColor(hdc, TEXT);
-                    TextOutW(hdc, icon_x, icon_y, letter.as_ptr(), 1);
-                }
+                TEXT
+            };
+            unsafe {
+                GetTextExtentPoint32W(hdc, caption.as_ptr(), (caption.len() - 1) as i32, &mut extent);
+                let text_x = slot.x + (slot.width - extent.cx).max(0) / 2;
+                let text_y = slot.y + slot.height - slot.pad_bottom - extent.cy;
+                SetTextColor(hdc, caption_color);
+                TextOutW(hdc, text_x, text_y, caption.as_ptr(), (caption.len() - 1) as i32);
             }
             if slot.gap {
                 let separator = RECT {
                     left: slot.x - slot.gap_width / 2,
-                    top: slot.y + 4,
+                    top: slot.y + 6,
                     right: slot.x - slot.gap_width / 2 + 1,
-                    bottom: slot.y + slot.size - 4,
+                    bottom: slot.y + slot.height - 6,
                 };
                 unsafe { FillRect(hdc, &separator, brush(brushes().line)); }
             }
         }
     }
 
-    fn slots(&self, dpi: u32) -> Vec<Slot> {
-        let size = dip(30.0, dpi).max(22);
-        let gap = dip(4.0, dpi).max(2);
-        let group = dip(14.0, dpi).max(8);
-        let mut x = dip(8.0, dpi);
-        let y = dip(5.0, dpi);
+    fn slots(&self, dpi: u32, show_modeling: bool) -> Vec<Slot> {
+        let metrics = toolbar_metrics(dpi);
+        let mut x = dip(6.0, dpi);
         let mut slots = Vec::with_capacity(self.buttons.len());
         for (index, button) in self.buttons.iter().enumerate() {
-            let gap_width = if button.gap_before { group } else { gap };
+            if button.command.is_modeling() && !show_modeling {
+                continue;
+            }
+            let gap_width = if button.gap_before { metrics.group_gap } else { metrics.item_gap };
             if index > 0 {
                 x += gap_width;
             }
-            let width = if button.command.is_workspace() {
-                dip(18.0 + button.command.label().len() as f32 * 7.4, dpi).max(size)
-            } else {
-                size
-            };
-            slots.push(Slot { index, x, y, size, width, gap: button.gap_before && index > 0, gap_width });
+            // "World" is wider than "Local" because of W. The tile stays that wide either way.
+            let text = if button.command == ToolbarCommand::Local { "World" } else { button.command.caption() };
+            let width = dip(14.0 + text.chars().count() as f32 * 6.6, dpi).max(metrics.min_width);
+            slots.push(Slot {
+                index,
+                x,
+                y: metrics.y,
+                height: metrics.height,
+                width,
+                icon: metrics.icon,
+                pad_top: metrics.pad_top,
+                pad_bottom: metrics.pad_bottom,
+                gap: button.gap_before && index > 0,
+                gap_width,
+            });
             x += width;
         }
         slots
@@ -440,10 +508,37 @@ struct Slot {
     index: usize,
     x: i32,
     y: i32,
-    size: i32,
+    height: i32,
     width: i32,
+    icon: i32,
+    pad_top: i32,
+    pad_bottom: i32,
     gap: bool,
     gap_width: i32,
+}
+
+struct ToolbarMetrics {
+    y: i32,
+    height: i32,
+    icon: i32,
+    pad_top: i32,
+    pad_bottom: i32,
+    item_gap: i32,
+    group_gap: i32,
+    min_width: i32,
+}
+
+fn toolbar_metrics(dpi: u32) -> ToolbarMetrics {
+    ToolbarMetrics {
+        y: dip(3.0, dpi),
+        height: dip(50.0, dpi).max(40),
+        icon: dip(26.0, dpi).max(18),
+        pad_top: dip(3.0, dpi).max(2),
+        pad_bottom: dip(4.0, dpi).max(3),
+        item_gap: dip(3.0, dpi).max(2),
+        group_gap: dip(10.0, dpi).max(6),
+        min_width: dip(40.0, dpi).max(32),
+    }
 }
 
 const BUTTONS: &[(ToolbarCommand, &str, bool)] = &[
@@ -451,9 +546,13 @@ const BUTTONS: &[(ToolbarCommand, &str, bool)] = &[
     (ToolbarCommand::Translate, "translate.png", false),
     (ToolbarCommand::Rotate, "rotate.png", false),
     (ToolbarCommand::Scale, "scale.png", false),
-    (ToolbarCommand::Level, "", true),
-    (ToolbarCommand::Land, "", false),
-    (ToolbarCommand::Character, "", false),
+    (ToolbarCommand::Block, "block.png", false),
+    (ToolbarCommand::Extrude, "extrude.png", true),
+    (ToolbarCommand::Inset, "inset.png", false),
+    (ToolbarCommand::Bevel, "bevel.png", false),
+    (ToolbarCommand::Level, "level.png", true),
+    (ToolbarCommand::Land, "land.png", false),
+    (ToolbarCommand::Character, "character.png", false),
     (ToolbarCommand::Play, "play.png", true),
     (ToolbarCommand::Pause, "pause.png", false),
     (ToolbarCommand::Stop, "stop.png", false),
@@ -822,12 +921,33 @@ mod tests {
         let toolbar = Toolbar::load();
         assert!(toolbar.load_note.is_empty(), "{}", toolbar.load_note);
         assert_eq!(toolbar.buttons.len(), BUTTONS.len());
-        let play = toolbar.buttons.iter().find(|button| button.command == ToolbarCommand::Play).expect("play");
-        let icon = play.icon.as_ref().unwrap();
-        assert_eq!((icon.width, icon.height), (128, 128));
-        let corner = &icon.pixels[0..4];
-        assert_eq!(corner[3], 0, "icon corner should be transparent, got {corner:?}");
-        assert!(icon.pixels.chunks(4).any(|pixel| pixel[3] > 200));
+        assert!(ToolbarCommand::Extrude.is_modeling());
+        assert!(!ToolbarCommand::Block.is_modeling());
+        assert!(!ToolbarCommand::Block.is_object_tool());
+        assert!(ToolbarCommand::Translate.is_object_tool());
+        assert!(ToolbarCommand::Level.is_workspace());
+        assert_eq!(ToolbarCommand::Translate.caption(), "Move");
+        assert_eq!(ToolbarCommand::Translate.label(), "Translate");
+        assert_eq!(ToolbarCommand::Local.caption_for(true), "Local");
+        assert_eq!(ToolbarCommand::Local.caption_for(false), "World");
+        for button in &toolbar.buttons {
+            assert!(!button.command.caption().is_empty(), "{:?}", button.command);
+            let icon = button.icon.as_ref().unwrap_or_else(|| panic!("missing icon for {:?}", button.command));
+            assert_eq!((icon.width, icon.height), (128, 128), "{:?}", button.command);
+            assert_eq!(icon.pixels[3], 0, "corner alpha {:?}", button.command);
+            assert!(icon.pixels.chunks(4).any(|pixel| pixel[3] > 200), "{:?}", button.command);
+        }
+        let slots = toolbar.slots(96, true);
+        assert_eq!(slots.len(), BUTTONS.len());
+        assert_eq!(toolbar.slots(96, false).len(), BUTTONS.len() - 3);
+        for slot in &slots {
+            assert!(slot.height > slot.icon, "caption band");
+            assert!(slot.width >= slot.icon);
+        }
+        let hit = toolbar.hit(96, slots[0].x + 2, slots[0].y + slots[0].height - 3, true);
+        assert_eq!(hit, Some(0));
+        let above = toolbar.hit(96, slots[0].x + 2, slots[0].y - 2, true);
+        assert_eq!(above, None);
     }
 }
 

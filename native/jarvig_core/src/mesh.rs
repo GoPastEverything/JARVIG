@@ -630,11 +630,16 @@ pub fn floor_mesh(width_m: f32, depth_m: f32) -> Mesh {
     .expect("floor")
 }
 
-/// Closed cube centered on the origin. Each face is one 0..1 quad with an outward normal.
-/// Tangent follows +U and handedness is +1. Texture +V is opposite `cross(normal, tangent)`,
-/// the same DirectX frame as [`floor_mesh`].
-pub fn cube_mesh(size_m: f32) -> Mesh {
-    let h = size_m * 0.5;
+/// Closed box centered on the origin. `size_m` is the full extent on X, Y, and Z.
+/// Each face is one 0..1 quad with an outward normal. Tangent follows +U and
+/// handedness is +1. Texture +V is opposite `cross(normal, tangent)`.
+pub fn box_mesh(size_m: [f32; 3]) -> Mesh {
+    let half = [
+        if size_m[0].is_finite() && size_m[0] > 1.0e-4 { size_m[0] * 0.5 } else { 0.025 },
+        if size_m[1].is_finite() && size_m[1] > 1.0e-4 { size_m[1] * 0.5 } else { 0.025 },
+        if size_m[2].is_finite() && size_m[2] > 1.0e-4 { size_m[2] * 0.5 } else { 0.025 },
+    ];
+    let extent = |axis: [f32; 3]| axis[0].abs() * half[0] + axis[1].abs() * half[1] + axis[2].abs() * half[2];
     // Outward normal, tangent along +U.
     let faces = [
         ([1.0_f32, 0.0, 0.0], [0.0, 0.0, 1.0]),
@@ -650,14 +655,16 @@ pub fn cube_mesh(size_m: f32) -> Mesh {
     for (normal, tangent) in faces {
         let bitangent = cross3(normal, tangent);
         let v_axis = [-bitangent[0], -bitangent[1], -bitangent[2]];
-        let center = [normal[0] * h, normal[1] * h, normal[2] * h];
+        let center = [normal[0] * half[0], normal[1] * half[1], normal[2] * half[2]];
+        let tangent_extent = extent(tangent);
+        let v_extent = extent(v_axis);
         let corners = [(0.0_f32, 0.0_f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
         let base = (bytes.len() / 60) as u16;
         for (u, v) in corners {
             let position = [
-                center[0] + tangent[0] * (u * 2.0 - 1.0) * h + v_axis[0] * (v * 2.0 - 1.0) * h,
-                center[1] + tangent[1] * (u * 2.0 - 1.0) * h + v_axis[1] * (v * 2.0 - 1.0) * h,
-                center[2] + tangent[2] * (u * 2.0 - 1.0) * h + v_axis[2] * (v * 2.0 - 1.0) * h,
+                center[0] + tangent[0] * (u * 2.0 - 1.0) * tangent_extent + v_axis[0] * (v * 2.0 - 1.0) * v_extent,
+                center[1] + tangent[1] * (u * 2.0 - 1.0) * tangent_extent + v_axis[1] * (v * 2.0 - 1.0) * v_extent,
+                center[2] + tangent[2] * (u * 2.0 - 1.0) * tangent_extent + v_axis[2] * (v * 2.0 - 1.0) * v_extent,
             ];
             push_vertex(&mut bytes, position, color, [u, v], normal, [tangent[0], tangent[1], tangent[2], 1.0]);
         }
@@ -687,7 +694,404 @@ pub fn cube_mesh(size_m: f32) -> Mesh {
             material_slot: 0,
         }],
     })
-    .expect("cube")
+    .expect("box")
+}
+
+/// Derived surface of a parametric block. Zero inset and zero bevel call [`box_mesh`].
+///
+/// A bevel cuts the twelve outer edges. An inset recesses that face and leaves a border.
+/// Both stay inside the analytic box of `size_m`. Triangles are not the saved object.
+pub fn block_surface_mesh(size_m: [f32; 3], inset_m: [f32; 6], bevel_m: f32) -> Mesh {
+    let inset = [
+        feature_or_zero(inset_m[0]),
+        feature_or_zero(inset_m[1]),
+        feature_or_zero(inset_m[2]),
+        feature_or_zero(inset_m[3]),
+        feature_or_zero(inset_m[4]),
+        feature_or_zero(inset_m[5]),
+    ];
+    let bevel = feature_or_zero(bevel_m);
+    if inset.iter().all(|value| *value <= 1.0e-5) && bevel <= 1.0e-5 {
+        return box_mesh(size_m);
+    }
+    let half = [
+        if size_m[0].is_finite() && size_m[0] > 1.0e-4 { size_m[0] * 0.5 } else { 0.025 },
+        if size_m[1].is_finite() && size_m[1] > 1.0e-4 { size_m[1] * 0.5 } else { 0.025 },
+        if size_m[2].is_finite() && size_m[2] > 1.0e-4 { size_m[2] * 0.5 } else { 0.025 },
+    ];
+    let limit = 0.45 * half[0].min(half[1]).min(half[2]) * 2.0;
+    let bevel = bevel.min(limit);
+    let inset = inset.map(|value| value.min(limit));
+    let mut faces = if bevel > 1.0e-5 { chamfer_faces(half, bevel) } else { box_faces(half) };
+    for (slot, group) in faces.iter_mut().enumerate().take(6) {
+        if inset[slot] <= 1.0e-5 {
+            continue;
+        }
+        let current = std::mem::take(group);
+        if let Some(face) = current.into_iter().next() {
+            *group = recess_face(face, inset[slot]);
+        }
+    }
+    let flat: Vec<SolidFace> = faces.into_iter().flatten().collect();
+    mesh_from_faces(&flat)
+}
+
+struct SolidFace {
+    verts: Vec<[f32; 3]>,
+    hint: [f32; 3],
+}
+
+fn feature_or_zero(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 { value } else { 0.0 }
+}
+
+fn box_faces(half: [f32; 3]) -> Vec<Vec<SolidFace>> {
+    let specs = [
+        ([1.0_f32, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        ([-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0]),
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]),
+    ];
+    specs
+        .into_iter()
+        .map(|(normal, tangent)| {
+            let bitangent = cross3(normal, tangent);
+            let v_axis = [-bitangent[0], -bitangent[1], -bitangent[2]];
+            let center = [normal[0] * half[0], normal[1] * half[1], normal[2] * half[2]];
+            let tangent_extent = tangent[0].abs() * half[0] + tangent[1].abs() * half[1] + tangent[2].abs() * half[2];
+            let v_extent = v_axis[0].abs() * half[0] + v_axis[1].abs() * half[1] + v_axis[2].abs() * half[2];
+            let mut verts = Vec::new();
+            for (u, v) in [(0.0_f32, 0.0_f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                verts.push([
+                    center[0] + tangent[0] * (u * 2.0 - 1.0) * tangent_extent + v_axis[0] * (v * 2.0 - 1.0) * v_extent,
+                    center[1] + tangent[1] * (u * 2.0 - 1.0) * tangent_extent + v_axis[1] * (v * 2.0 - 1.0) * v_extent,
+                    center[2] + tangent[2] * (u * 2.0 - 1.0) * tangent_extent + v_axis[2] * (v * 2.0 - 1.0) * v_extent,
+                ]);
+            }
+            vec![SolidFace { verts: orient_loop(verts, normal), hint: normal }]
+        })
+        .collect()
+}
+
+fn chamfer_faces(half: [f32; 3], bevel: f32) -> Vec<Vec<SolidFace>> {
+    let corners: Vec<([f32; 3], [f32; 3], [f32; 3])> = (0..8)
+        .map(|bits| {
+            let sx = if bits & 1 == 0 { -1.0 } else { 1.0 };
+            let sy = if bits & 2 == 0 { -1.0 } else { 1.0 };
+            let sz = if bits & 4 == 0 { -1.0 } else { 1.0 };
+            (
+                [sx * (half[0] - bevel), sy * half[1], sz * half[2]],
+                [sx * half[0], sy * (half[1] - bevel), sz * half[2]],
+                [sx * half[0], sy * half[1], sz * (half[2] - bevel)],
+            )
+        })
+        .collect();
+    let mut faces = Vec::new();
+    let side_normals = [
+        [1.0_f32, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    for (slot, normal) in side_normals.into_iter().enumerate() {
+        let mut verts = Vec::new();
+        for bits in 0..8 {
+            let sign = match slot / 2 {
+                0 => if bits & 1 == 0 { -1.0 } else { 1.0 },
+                1 => if bits & 2 == 0 { -1.0 } else { 1.0 },
+                _ => if bits & 4 == 0 { -1.0 } else { 1.0 },
+            };
+            if sign != normal[slot / 2] {
+                continue;
+            }
+            let (vx, vy, vz) = corners[bits];
+            match slot / 2 {
+                0 => {
+                    verts.push(vy);
+                    verts.push(vz);
+                }
+                1 => {
+                    verts.push(vx);
+                    verts.push(vz);
+                }
+                _ => {
+                    verts.push(vx);
+                    verts.push(vy);
+                }
+            }
+        }
+        faces.push(vec![SolidFace { verts: orient_loop(verts, normal), hint: normal }]);
+    }
+    for axis in 0..3 {
+        for sign_u in [-1.0_f32, 1.0] {
+            for sign_v in [-1.0_f32, 1.0] {
+                let (neg, pos) = edge_ends(&corners, axis, sign_u, sign_v);
+                let (na, nb) = match axis {
+                    0 => (neg.1, neg.2),
+                    1 => (neg.0, neg.2),
+                    _ => (neg.0, neg.1),
+                };
+                let (pa, pb) = match axis {
+                    0 => (pos.1, pos.2),
+                    1 => (pos.0, pos.2),
+                    _ => (pos.0, pos.1),
+                };
+                let hint = match axis {
+                    0 => [0.0, sign_u, sign_v],
+                    1 => [sign_u, 0.0, sign_v],
+                    _ => [sign_u, sign_v, 0.0],
+                };
+                faces.push(vec![SolidFace { verts: vec![na, nb, pb, pa], hint }]);
+            }
+        }
+    }
+    for bits in 0..8 {
+        let (vx, vy, vz) = corners[bits];
+        let sx = if bits & 1 == 0 { -1.0 } else { 1.0 };
+        let sy = if bits & 2 == 0 { -1.0 } else { 1.0 };
+        let sz = if bits & 4 == 0 { -1.0 } else { 1.0 };
+        faces.push(vec![SolidFace { verts: vec![vx, vy, vz], hint: [sx, sy, sz] }]);
+    }
+    faces
+}
+
+fn edge_ends(corners: &[([f32; 3], [f32; 3], [f32; 3])], axis: usize, u: f32, v: f32) -> (([f32; 3], [f32; 3], [f32; 3]), ([f32; 3], [f32; 3], [f32; 3])) {
+    let bits = match axis {
+        0 => (if u < 0.0 { 0 } else { 2 }) | (if v < 0.0 { 0 } else { 4 }),
+        1 => (if u < 0.0 { 0 } else { 1 }) | (if v < 0.0 { 0 } else { 4 }),
+        _ => (if u < 0.0 { 0 } else { 1 }) | (if v < 0.0 { 0 } else { 2 }),
+    };
+    let other = bits | match axis {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    (corners[bits], corners[other])
+}
+
+fn recess_face(face: SolidFace, distance: f32) -> Vec<SolidFace> {
+    let Some(normal) = normalize3(face.hint) else {
+        return vec![face];
+    };
+    let Some(inner) = offset_loop(&face.verts, normal, distance) else {
+        return vec![face];
+    };
+    let recessed: Vec<[f32; 3]> = inner.iter().map(|vertex| sub3(*vertex, scale3(normal, distance))).collect();
+    let mut out = Vec::new();
+    let count = face.verts.len();
+    for index in 0..count {
+        let next = (index + 1) % count;
+        let border = vec![face.verts[index], face.verts[next], recessed[next], recessed[index]];
+        out.push(SolidFace { hint: centroid_direction(&border), verts: border });
+    }
+    out.push(SolidFace { verts: recessed, hint: normal });
+    out
+}
+
+fn offset_loop(verts: &[[f32; 3]], normal: [f32; 3], distance: f32) -> Option<Vec<[f32; 3]>> {
+    let count = verts.len();
+    if count < 3 || !distance.is_finite() || distance <= 0.0 {
+        return None;
+    }
+    let normal = normalize3(normal)?;
+    let old_area = polygon_span(verts, normal);
+    if old_area <= 1.0e-6 {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = verts[index];
+        let end = verts[(index + 1) % count];
+        let edge = normalize3(sub3(end, start))?;
+        let inward = normalize3(cross3(normal, edge))?;
+        lines.push((add3(start, scale3(inward, distance)), edge));
+    }
+    let mut inner = Vec::with_capacity(count);
+    for index in 0..count {
+        let previous = (index + count - 1) % count;
+        let hit = intersect_lines(lines[previous].0, lines[previous].1, lines[index].0, lines[index].1, normal)?;
+        inner.push(hit);
+    }
+    let new_area = polygon_span(&inner, normal);
+    if new_area <= 1.0e-6 || new_area >= old_area {
+        return None;
+    }
+    Some(inner)
+}
+
+fn mesh_from_faces(faces: &[SolidFace]) -> Mesh {
+    let mut bytes = Vec::new();
+    let mut indices = Vec::new();
+    let color = [1.0_f32, 1.0, 1.0];
+    for face in faces {
+        let hint = normalize3(face.hint).unwrap_or([0.0, 1.0, 0.0]);
+        if face.verts.len() < 3 {
+            continue;
+        }
+        for index in 1..face.verts.len() - 1 {
+            let mut tri = [face.verts[0], face.verts[index], face.verts[index + 1]];
+            let mut normal = face_normal(tri[0], tri[1], tri[2]);
+            if dot3(normal, hint) < 0.0 {
+                tri.swap(1, 2);
+                normal = [-normal[0], -normal[1], -normal[2]];
+            }
+            if dot3(normal, normal) < 1.0e-10 {
+                continue;
+            }
+            let edge = sub3(tri[1], tri[0]);
+            let tangent = normalize_tangent(edge, normal);
+            let base = (bytes.len() / 60) as u16;
+            for (corner, position) in tri.iter().enumerate() {
+                let uv = [[0.0_f32, 0.0], [1.0, 0.0], [0.0, 1.0]][corner];
+                push_vertex(&mut bytes, *position, color, uv, normal, tangent);
+            }
+            for slot in [base, base + 1, base + 2] {
+                indices.extend_from_slice(&slot.to_le_bytes());
+            }
+        }
+    }
+    if indices.is_empty() {
+        return box_mesh([1.0, 1.0, 1.0]);
+    }
+    let index_count = (indices.len() / 2) as u32;
+    create_mesh(MeshDesc {
+        streams: vec![VertexStreamDesc {
+            stride: 60,
+            attributes: vec![
+                MeshVertexAttribute { shader_location: 0, offset: 0, format: MeshVertexFormat::Float32x3 },
+                MeshVertexAttribute { shader_location: 1, offset: 12, format: MeshVertexFormat::Float32x3 },
+                MeshVertexAttribute { shader_location: 2, offset: 24, format: MeshVertexFormat::Float32x2 },
+                MeshVertexAttribute { shader_location: 3, offset: 32, format: MeshVertexFormat::Float32x3 },
+                MeshVertexAttribute { shader_location: 4, offset: 44, format: MeshVertexFormat::Float32x4 },
+            ],
+            bytes,
+        }],
+        index_format: MeshIndexFormat::Uint16,
+        index_bytes: indices,
+        submeshes: vec![SubmeshDesc {
+            first_index: 0,
+            index_count,
+            base_vertex: 0,
+            topology: MeshTopology::TriangleList,
+            material_slot: 0,
+        }],
+    })
+    .expect("block surface")
+}
+
+fn orient_loop(mut verts: Vec<[f32; 3]>, normal: [f32; 3]) -> Vec<[f32; 3]> {
+    if verts.len() < 3 {
+        return verts;
+    }
+    let center = centroid(&verts);
+    let tangent = feature_perpendicular(normal);
+    let bitangent = cross3(normal, tangent);
+    verts.sort_by(|left, right| {
+        let left_angle = (dot3(sub3(*left, center), bitangent)).atan2(dot3(sub3(*left, center), tangent));
+        let right_angle = (dot3(sub3(*right, center), bitangent)).atan2(dot3(sub3(*right, center), tangent));
+        left_angle.partial_cmp(&right_angle).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    verts.dedup_by(|left, right| dist2(*left, *right) < 1.0e-8);
+    if verts.len() >= 3 && dot3(face_normal(verts[0], verts[1], verts[2]), normal) < 0.0 {
+        verts.reverse();
+    }
+    verts
+}
+
+fn intersect_lines(origin: [f32; 3], direction: [f32; 3], other_origin: [f32; 3], other_direction: [f32; 3], normal: [f32; 3]) -> Option<[f32; 3]> {
+    let drop = dominant_axis(normal);
+    let p = drop_axis(origin, drop);
+    let d = drop_axis(direction, drop);
+    let q = drop_axis(other_origin, drop);
+    let e = drop_axis(other_direction, drop);
+    let denom = d[0] * e[1] - d[1] * e[0];
+    if denom.abs() < 1.0e-8 {
+        return None;
+    }
+    let span = [q[0] - p[0], q[1] - p[1]];
+    let distance = (span[0] * e[1] - span[1] * e[0]) / denom;
+    if !distance.is_finite() {
+        return None;
+    }
+    Some(add3(origin, scale3(direction, distance)))
+}
+
+fn polygon_span(verts: &[[f32; 3]], normal: [f32; 3]) -> f32 {
+    let mut sum = [0.0_f32, 0.0, 0.0];
+    for index in 1..verts.len().saturating_sub(1) {
+        sum = add3(sum, cross3(sub3(verts[index], verts[0]), sub3(verts[index + 1], verts[0])));
+    }
+    dot3(sum, normal).abs()
+}
+
+fn centroid(verts: &[[f32; 3]]) -> [f32; 3] {
+    let mut sum = [0.0_f32, 0.0, 0.0];
+    for vertex in verts {
+        sum = add3(sum, *vertex);
+    }
+    scale3(sum, 1.0 / verts.len() as f32)
+}
+
+fn centroid_direction(verts: &[[f32; 3]]) -> [f32; 3] {
+    normalize3(centroid(verts)).unwrap_or([0.0, 1.0, 0.0])
+}
+
+fn feature_perpendicular(normal: [f32; 3]) -> [f32; 3] {
+    let axis = if normal[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    normalize3(cross3(normal, axis)).unwrap_or([0.0, 1.0, 0.0])
+}
+
+fn dominant_axis(normal: [f32; 3]) -> usize {
+    if normal[0].abs() >= normal[1].abs() && normal[0].abs() >= normal[2].abs() {
+        0
+    } else if normal[1].abs() >= normal[2].abs() {
+        1
+    } else {
+        2
+    }
+}
+
+fn drop_axis(value: [f32; 3], axis: usize) -> [f32; 2] {
+    match axis {
+        0 => [value[1], value[2]],
+        1 => [value[0], value[2]],
+        _ => [value[0], value[1]],
+    }
+}
+
+fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
+}
+
+fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn scale3(value: [f32; 3], scalar: f32) -> [f32; 3] {
+    [value[0] * scalar, value[1] * scalar, value[2] * scalar]
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+fn dist2(left: [f32; 3], right: [f32; 3]) -> f32 {
+    let delta = sub3(left, right);
+    dot3(delta, delta)
+}
+
+fn normalize3(value: [f32; 3]) -> Option<[f32; 3]> {
+    let length = dot3(value, value).sqrt();
+    if length < 1.0e-8 { None } else { Some(scale3(value, 1.0 / length)) }
+}
+
+/// Closed cube centered on the origin. Same winding and vertex layout as [`box_mesh`].
+pub fn cube_mesh(size_m: f32) -> Mesh {
+    box_mesh([size_m, size_m, size_m])
 }
 
 /// Capsule along Y, centered on the origin. `cylinder_height_m` is the straight section.
@@ -1050,6 +1454,69 @@ mod tests {
         let bytes = &mesh.streams()[0].bytes;
         let start = vertex * 60 + offset;
         f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_plain_block_is_the_box_and_a_feature_stays_inside_it() {
+        let plain = block_surface_mesh([2.0, 2.0, 2.0], [0.0; 6], 0.0);
+        let box_only = box_mesh([2.0, 2.0, 2.0]);
+        assert_eq!(plain.vertex_count(), box_only.vertex_count());
+        assert_eq!(plain.index_count(), 36);
+        for index in 0..plain.vertex_count() {
+            assert_eq!(plain.position(index), box_only.position(index));
+        }
+        let beveled = block_surface_mesh([2.0, 2.0, 2.0], [0.0; 6], 0.1);
+        assert!(beveled.index_count() > 36, "a chamfer adds faces");
+        assert_inside_and_outward(&beveled, 1.0);
+        let mut inset = [0.0_f32; 6];
+        inset[0] = 0.1;
+        let pocket = block_surface_mesh([2.0, 2.0, 2.0], inset, 0.0);
+        assert!(pocket.index_count() > 36);
+        assert_inside(&pocket, 1.0);
+        let mut recessed = false;
+        let mut opposite = false;
+        for index in 0..pocket.vertex_count() {
+            let position = pocket.position(index).unwrap();
+            recessed |= (position[0] - 0.9).abs() < 0.05 && position[1].abs() < 0.95 && position[2].abs() < 0.95;
+            opposite |= position[0] < -0.99;
+        }
+        assert!(recessed, "the +X face moves inward");
+        assert!(opposite, "the -X face stays on the box");
+        let both = block_surface_mesh([2.0, 2.0, 2.0], inset, 0.1);
+        assert!(both.index_count() > beveled.index_count());
+        assert_inside(&both, 1.0);
+    }
+
+    fn assert_inside(mesh: &Mesh, half: f32) {
+        for index in 0..mesh.vertex_count() {
+            let position = mesh.position(index).unwrap();
+            for axis in 0..3 {
+                assert!(position[axis].abs() <= half + 1.0e-3, "{position:?} leaves the analytic box");
+            }
+        }
+    }
+
+    fn assert_inside_and_outward(mesh: &Mesh, half: f32) {
+        for index in 0..mesh.vertex_count() {
+            let position = mesh.position(index).unwrap();
+            for axis in 0..3 {
+                assert!(position[axis].abs() <= half + 1.0e-3, "{position:?} leaves the analytic box");
+            }
+        }
+        for triangle in mesh.triangle_indices() {
+            let positions = [mesh.position(triangle[0]).unwrap(), mesh.position(triangle[1]).unwrap(), mesh.position(triangle[2]).unwrap()];
+            let geometric = cross3(
+                [positions[1][0] - positions[0][0], positions[1][1] - positions[0][1], positions[1][2] - positions[0][2]],
+                [positions[2][0] - positions[0][0], positions[2][1] - positions[0][1], positions[2][2] - positions[0][2]],
+            );
+            let center = [
+                (positions[0][0] + positions[1][0] + positions[2][0]) / 3.0,
+                (positions[0][1] + positions[1][1] + positions[2][1]) / 3.0,
+                (positions[0][2] + positions[1][2] + positions[2][2]) / 3.0,
+            ];
+            let outward = geometric[0] * center[0] + geometric[1] * center[1] + geometric[2] * center[2];
+            assert!(outward > 0.0, "winding points inward at {positions:?}");
+        }
     }
 
     #[test]

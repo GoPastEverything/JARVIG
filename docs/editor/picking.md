@@ -54,11 +54,16 @@ One owner at a time.
 
 | Gesture | Result |
 | --- | --- |
-| LMB on a visible entity | Replace the selection with that uuid. |
-| Ctrl+LMB on a visible entity | Toggle it. |
-| LMB on empty view | Clear entity selection. |
-| Ctrl+LMB on empty view | No change. |
-| RMB look, MMB pan, Alt+LMB orbit | No selection change. |
+| LMB on a visible entity | Replace. On a parametric solid, Auto and Face select the hit face. Object selects the entity. |
+| Double-click | Promote to the owning entity. The mode stays. |
+| Shift+LMB | Add. |
+| Ctrl+LMB | Toggle. Ctrl wins over Shift. |
+| LMB on empty view | Clear. |
+| Shift or Ctrl on empty view | No change. |
+| Select-mode drag on empty view | Marquee. Left to right selects objects fully enclosed. Right to left selects objects the rectangle touches. Shift adds. Ctrl toggles. The result is whole objects. |
+| RMB look, MMB pan, Alt+LMB orbit | No selection change. Escape does one action and still consumes the key. |
+
+Auto, Object, and Face are a Selection section on a parametric solid. They are not toolbar buttons. Edge and Vertex are not shown. A movement of four pixels or less is still the click in the first rows. The marquee does not hide or recenter the cursor. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. The hit is the projected box of the object. ADR-0068.
 
 While a transform handle is under the cursor, the gizmo takes the press and the scene behind it is not picked. An active camera capture does not pick. A plain click does not bump the world revision. It bumps the selection revision only when the ordered selection changes.
 

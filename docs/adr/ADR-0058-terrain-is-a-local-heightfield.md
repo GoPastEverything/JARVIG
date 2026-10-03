@@ -1,6 +1,6 @@
 # ADR-0058 — Terrain is a local heightfield in the existing world
 
-Status: Accepted
+Status: Accepted. Character asset isolation is ADR-0059. ADR-0060 names the empty-world template Blank and puts project choice in the hub. Land Mode stays one authored world.
 Date: 2026-10-01
 
 ## Context

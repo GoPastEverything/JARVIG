@@ -1,6 +1,6 @@
 # ADR-0054 — The character editor edits the joint
 
-Status: Accepted. Partially superseded by ADR-0056: a joint-only level opens in the level editor. The Character Editor is entered on purpose.
+Status: Accepted. Partially superseded by ADR-0056: a joint-only level opens in the level editor. The Character Editor is entered on purpose. Partially superseded by ADR-0059: a character asset opens in an isolated preview. A level that already contains a rig still uses this workspace in place.
 Date: 2026-09-30
 
 ## Context
