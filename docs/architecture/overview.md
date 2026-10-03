@@ -30,6 +30,10 @@ Early non-goals: a marketplace, a finished cinematic suite, a full server mesh, 
 
 ## What runs today
 
-The lifecycle, module graph, frame tree, cell ids, scene snapshot, material document, and derived-data key exist and are tested in the TypeScript prototype. That prototype is not the shipping runtime. `native/jarvig_core` has the same fixed-step clock behind a C ABI. GPU execution, physics, animation, audio, AI, and replication do not exist yet. The prototype render module uses a null device so hosts can boot without a GPU. The renderer architecture is an RHI ([rhi.md](../rendering/rhi.md)), not a browser canvas. WebGPU via wgpu is the first backend to build, on native and in the browser.
+`JARVIGEditor.exe` is the product editor. It hosts the native engine in-process and presents a Direct3D 12 view on Windows. A launch with no project shows the Hub. Play In Editor runs a runtime copy of the authored level. A loose standalone player can be built beside the editor. The creator manual is [../manual/README.md](../manual/README.md).
+
+The TypeScript packages under `engine/` remain the executable prototype of the contracts. They are not the shipping runtime and they are not the editor. The prototype render module can still boot on a null device. Do not wrap that dock in a browser and call it JARVIGEditor.
+
+In the native editor today: project open and save, the asset registry, glTF import, parametric blocks, translate and rotate, terrain heightfields in Land, joint pose and the Character workspace, and environment lighting. Direct lights and a reflection probe edit in the inspector when the level already contains them. Scale stays disabled. Clip playback, a physics solver, audio, AI, replication, page streaming, and a gameplay scripting language are not in this build. The renderer architecture is an RHI ([rhi.md](../rendering/rhi.md)). The native editor's present path is Direct3D 12. WebGPU via wgpu remains the portable backend described in the RHI pages, and it is not a second editor.
 
 Read [engine-runtime.md](engine-runtime.md) and [dependency-rules.md](dependency-rules.md) before changing boot code.

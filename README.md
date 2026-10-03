@@ -10,15 +10,19 @@ The working codename in the founding document was left TBD. This repository adop
 
 ## Phase
 
-Current phase: **P0 — Foundation / Governance**. The tree compiles, the engine lifecycle boots inside the editor, client, and headless server hosts, and research systems stay off. It is not a playable editor yet.
+The native editor is the product you run. `JARVIGEditor.exe` hosts the engine, opens a project from the Hub, and can play a runtime copy of the level. Research systems stay off by default. Later roadmap milestones, including streaming, a full gameplay loop, and networking, are not done. The creator manual is [`docs/manual/README.md`](docs/manual/README.md).
 
-Status: [`docs/status/CURRENT.md`](docs/status/CURRENT.md).
+Status: [`docs/status/CURRENT.md`](docs/status/CURRENT.md). Milestone sequence: [`ROADMAP.md`](ROADMAP.md).
 
 ## Requirements
 
-- Windows is the primary development OS. PowerShell scripts are first-class.
-- Node.js 22 or newer.
-- pnpm 10.15.1, pinned in `package.json` and activated with Corepack.
+To build and run the editor:
+
+- Windows
+- A Rust toolchain with `cargo`
+- A GPU that can present Direct3D 12
+
+Node.js 22 or newer, and pnpm 10.15.1 pinned in `package.json`, are for the TypeScript prototype, the boundary check, and the old dock. They are not required to launch `JARVIGEditor`. PowerShell scripts stay first-class.
 
 ## Bootstrap
 
@@ -32,8 +36,9 @@ That installs dependencies, runs the boundary check, typecheck, unit/integration
 
 | Action | Command |
 | --- | --- |
-| Launch JARVIGEditor | `cargo run --manifest-path native/Cargo.toml -p jarvig_editor` |
-| Launch the Phase 0 TypeScript dock | `pwsh -File scripts\dev-editor.ps1` |
+| Launch JARVIGEditor | `cargo run --offline --manifest-path native/Cargo.toml -p jarvig_editor --bin JARVIGEditor` |
+| Build the local docs site | `pwsh -File scripts\build-docs.ps1` |
+| Launch the transitional TypeScript dock | `pwsh -File scripts\dev-editor.ps1` |
 | Same transitional dock, via pnpm | `pnpm dev:editor` |
 | Boot the client once | `pwsh -File scripts\dev-client.ps1` |
 | Boot the dedicated server once | `pnpm dev:server` |
@@ -42,7 +47,7 @@ That installs dependencies, runs the boundary check, typecheck, unit/integration
 | Smoke the built hosts | `pnpm smoke` |
 | CLI project info | `pnpm cli info` |
 
-`cargo run --manifest-path native/Cargo.toml -p jarvig_editor` is `JARVIGEditor.exe`. It hosts the engine and presents one view. `pnpm dev:editor` still serves the transitional dock on `http://127.0.0.1:4780` until Ctrl+C. That page is not the product editor. Do not wrap it in a WebView.
+The cargo command is `JARVIGEditor.exe`. A launch with no project shows the Hub. `pnpm dev:editor` still serves the transitional dock on `http://127.0.0.1:4780` until Ctrl+C. That page is not the product editor. Do not wrap it in a WebView. The docs site is written to `docs/site/` and is not part of the engine.
 
 ## Layout
 
@@ -60,4 +65,4 @@ The canonical layout is the one in `designdoc.html` section 5, with the Phase 0 
 
 ## License
 
-JARVIG's own license has not been chosen. See [LICENSES.md](LICENSES.md). PlayCanvas is the intended open-source foundation and is not vendored yet. CryEngine source is not allowed in this repository.
+JARVIG's own license has not been chosen. See [LICENSES.md](LICENSES.md). The native runtime is the engine. PlayCanvas is not vendored, and it is not what the editor runs. CryEngine source is not allowed in this repository.

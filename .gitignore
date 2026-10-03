@@ -18,6 +18,9 @@ Thumbs.db
 !.env.example
 private/
 
+# Generated local documentation site. Do not publish. A public sync must exclude this folder.
+docs/site/
+
 # Local Sketchfab Ghost City import. Credits stay in samples/ghost-city/CREDITS.md. Do not publish the mesh.
 samples/ghost-city/third-party/
 samples/ghost-city/Content/

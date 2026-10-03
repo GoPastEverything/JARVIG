@@ -2,6 +2,8 @@
 
 Source: `designdoc.html` sections 28 and 29. Tickets: [`docs/BACKLOG.md`](docs/BACKLOG.md). This file is the milestone sequence, not a promise that later phases are designed in more detail than the founding doc.
 
+The native editor is what you run. Project open, a perspective view, the outliner, the inspector, translate and rotate, save, and editor undo are in that program. P2's step, eject, and possess are not. Later rows are still the sequence. They are not a claim that streaming, cook, a full gameplay loop, or networking already exist. Status is [`docs/status/CURRENT.md`](docs/status/CURRENT.md). The creator manual is [`docs/manual/README.md`](docs/manual/README.md).
+
 A milestone is done when its exit criterion is true, not when a directory exists.
 
 | ID | Milestone | Exit |

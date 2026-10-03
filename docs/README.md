@@ -2,6 +2,8 @@
 
 `designdoc.html` at the repository root is the founding specification. These pages are the maintainable form of that document. They do not replace it.
 
+The creator manual is [manual/README.md](manual/README.md). Generate the local site with `pwsh -File scripts\build-docs.ps1` and open `docs/site/index.html`. That site is a reader. It is gitignored. It is not a second authority, and it is not copied into a public tree.
+
 ## Authority
 
 1. Accepted ADRs in [`adr/`](adr/README.md)
@@ -16,6 +18,7 @@
 
 | Area | Start here |
 | --- | --- |
+| Creator manual | [manual/README.md](manual/README.md), [getting-started.md](getting-started.md) |
 | Current state | [status/CURRENT.md](status/CURRENT.md) |
 | Tickets | [BACKLOG.md](BACKLOG.md) |
 | Milestones | [../ROADMAP.md](../ROADMAP.md) |

@@ -1,15 +1,13 @@
 # Editor
 
-The product editor is [README.md](README.md). This page is only the transitional TypeScript dock.
+The product editor is `JARVIGEditor.exe`. It hosts the engine. The creator manual starts at [../manual/README.md](../manual/README.md). The window, the camera, and the panels are [README.md](README.md).
 
-See [../architecture/editor-runtime.md](../architecture/editor-runtime.md) and [../architecture/play-in-editor.md](../architecture/play-in-editor.md).
-
-Temporary panel host, not `JARVIGEditor.exe`:
+The TypeScript dock is still available for the old command-bus tests. It is transitional. Do not wrap it in a WebView and call that the editor.
 
 ```powershell
 pwsh -File scripts\dev-editor.ps1
 ```
 
-Equivalent: `pnpm dev:editor`. A dock is served at `http://127.0.0.1:4780` until Ctrl+C. `--once` boots and exits. The page is a view. Commands call the engine. Do not wrap this page in Electron and call it JARVIGEditor.
+Equivalent: `pnpm dev:editor`. A dock is served at `http://127.0.0.1:4780` until Ctrl+C. `--once` boots and exits. That page is a view of the prototype. It is not `JARVIGEditor.exe`.
 
-JRV-0007 (dock, commands, viewport pane) is met by `EditorShell`. The native view is JRV-0058, not a canvas this page owns. Outliner selection, inspector edits, transform undo, and gizmos are still open. Do not wrap this page and call it the native editor.
+See [../architecture/editor-runtime.md](../architecture/editor-runtime.md) and [../architecture/play-in-editor.md](../architecture/play-in-editor.md).

@@ -17,7 +17,7 @@ An item is `SelectionItem::Entity(EntityUuid)`.
 
 Not an `EntityHandle`, not an `ObjectId`, not a `RenderInstanceId`, and not a tree item. The world root is not an item. The nil uuid is not persistent and is rejected.
 
-Only the entity variant exists. An asset, a component, a material, or a subobject can be added later without pretending those ids exist today. The content browser stays a placeholder.
+Only the entity variant exists. An asset, a component, a material, or a subobject can be added later without pretending those ids exist today. The content browser lists project assets. Those assets are not selection items until a placement creates an entity.
 
 Selection does not mutate the world, does not bump the world revision, does not compile a material, and is not an authoring command. It is not saved in the scene. JRV-0069 may remember it with the workspace. It is not an undo step. Editor undo exists for world edits. Changing which entities are selected stays off that stack. ADR-0068.
 
