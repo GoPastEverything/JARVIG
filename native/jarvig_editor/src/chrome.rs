@@ -489,6 +489,59 @@ impl Toolbar {
         }
     }
 
+    /// One inspector shelf button. Tiles put the toolbar icon over the caption.
+    pub fn paint_shelf(&self, hdc: HDC, rect: RECT, caption: &str, font: HFONT, icon: Option<ToolbarCommand>, on: bool, pressed: bool, kind: ShelfPaint) {
+        let background = if on { BUTTON_ON } else if pressed { BUTTON_HOT } else { BUTTON };
+        let fill = if on {
+            brush(brushes().button_on)
+        } else if pressed {
+            brush(brushes().button_hot)
+        } else {
+            brush(brushes().button)
+        };
+        unsafe {
+            FillRect(hdc, &rect, fill);
+            if on {
+                let accent = if kind == ShelfPaint::Row {
+                    RECT { left: rect.left, top: rect.top, right: rect.left + 2, bottom: rect.bottom }
+                } else {
+                    RECT { left: rect.left, top: rect.bottom - 2, right: rect.right, bottom: rect.bottom }
+                };
+                FillRect(hdc, &accent, brush(brushes().accent));
+            }
+            if !font.is_null() {
+                SelectObject(hdc, font);
+            }
+            SetBkMode(hdc, 1);
+            SetTextColor(hdc, if on { TEXT } else { TEXT_DIM });
+        }
+        if kind == ShelfPaint::Tile {
+            if let Some(command) = icon {
+                if let Some(icon) = self.buttons.iter().find(|button| button.command == command).and_then(|button| button.icon.as_ref()) {
+                    let size = ((rect.bottom - rect.top) - 22).clamp(16, 26);
+                    let x = rect.left + ((rect.right - rect.left) - size).max(0) / 2;
+                    let y = rect.top + 4;
+                    let tone = if on { IconTone::Active } else { IconTone::Muted };
+                    blit_icon(hdc, icon, x, y, size, background, tone);
+                }
+            }
+        }
+        let caption = wide(caption);
+        let mut extent = SIZE { cx: 0, cy: 0 };
+        unsafe {
+            GetTextExtentPoint32W(hdc, caption.as_ptr(), (caption.len() - 1) as i32, &mut extent);
+            let (text_x, text_y) = match kind {
+                ShelfPaint::Row => (rect.left + 10, rect.top + ((rect.bottom - rect.top) - extent.cy).max(0) / 2),
+                ShelfPaint::Tile => (rect.left + ((rect.right - rect.left) - extent.cx).max(0) / 2, rect.bottom - 4 - extent.cy),
+                ShelfPaint::Chip => (
+                    rect.left + ((rect.right - rect.left) - extent.cx).max(0) / 2,
+                    rect.top + ((rect.bottom - rect.top) - extent.cy).max(0) / 2,
+                ),
+            };
+            TextOutW(hdc, text_x, text_y, caption.as_ptr(), (caption.len() - 1) as i32);
+        }
+    }
+
     fn slots(&self, dpi: u32, show_modeling: bool) -> Vec<Slot> {
         let metrics = toolbar_metrics(dpi);
         let mut x = dip(6.0, dpi);
@@ -520,6 +573,13 @@ impl Toolbar {
         }
         slots
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfPaint {
+    Chip,
+    Tile,
+    Row,
 }
 
 struct Slot {

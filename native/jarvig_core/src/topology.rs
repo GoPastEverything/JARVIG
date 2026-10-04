@@ -281,6 +281,104 @@ impl SolidBody {
         self.face_loop(id).map(|loop_| loop_.len())
     }
 
+    /// Corners after vertices that sit on a straight edge are ignored. A split rectangle still has four.
+    pub fn corner_count(&self, face: u32) -> Option<usize> {
+        let loop_ = self.face_loop(face)?;
+        Some(corner_indexes(self, loop_).len())
+    }
+
+    /// Divisions `subdivide_face` will use. A rectangular face keeps vertices that an earlier split already placed, so the count rises until those vertices land on the grid.
+    pub fn subdivide_resolution(&self, face: u32, u: u32, v: u32) -> Result<(u32, u32), TopologyError> {
+        if u == 0 || v == 0 || u > SUBDIVIDE_MAX || v > SUBDIVIDE_MAX {
+            return Err(TopologyError::Degenerate);
+        }
+        let quad = self.geometric_quad(face).ok_or(TopologyError::NotQuad)?;
+        Ok((division_count(&quad.u_params, u)?, division_count(&quad.v_params, v)?))
+    }
+
+    /// Faces that use this edge, in stored order.
+    pub fn faces_of_edge(&self, edge: u32) -> Vec<u32> {
+        let Some(edge) = self.edges.iter().find(|entry| entry.id == edge) else {
+            return Vec::new();
+        };
+        self.faces
+            .iter()
+            .filter(|face| {
+                let count = face.vertices.len();
+                (0..count).any(|index| {
+                    let start = face.vertices[index];
+                    let end = face.vertices[(index + 1) % count];
+                    (start == edge.a && end == edge.b) || (start == edge.b && end == edge.a)
+                })
+            })
+            .map(|face| face.id)
+            .collect()
+    }
+
+    /// Faces that use this vertex, in stored order.
+    pub fn faces_of_vertex(&self, vertex: u32) -> Vec<u32> {
+        self.faces.iter().filter(|face| face.vertices.contains(&vertex)).map(|face| face.id).collect()
+    }
+
+    /// Closest edge of one face to a unit ray. The face the cursor landed in chooses the edge when the edge slack misses.
+    pub fn closest_edge_of_face(&self, face: u32, origin: [f64; 3], direction: [f64; 3]) -> Option<u32> {
+        let direction = unit(direction)?;
+        let loop_ = self.face_loop(face)?;
+        let count = loop_.len();
+        let mut best: Option<TopologyPick> = None;
+        for index in 0..count {
+            let edge = self.edge_between(loop_[index], loop_[(index + 1) % count])?;
+            let (start, end) = self.edge_endpoints(edge)?;
+            let (ray_t, distance) = ray_segment(origin, direction, start, end);
+            let pick = TopologyPick { id: edge, ray_t, distance };
+            let replace = best.as_ref().is_none_or(|current| pick_order(&pick, current).is_lt());
+            if replace {
+                best = Some(pick);
+            }
+        }
+        best.map(|pick| pick.id)
+    }
+
+    /// Face whose polygon is closest to `point`, within `slack` meters. Inside the polygon, the distance is to the plane.
+    pub fn nearest_face(&self, point: [f64; 3], slack: f64) -> Option<u32> {
+        if !slack.is_finite() || slack < 0.0 {
+            return None;
+        }
+        let mut best: Option<(u32, f64)> = None;
+        for face in &self.faces {
+            let positions = self.loop_positions(face);
+            if positions.len() < 3 {
+                continue;
+            }
+            let normal = newell(&positions);
+            let span = length(normal);
+            if span < 1.0e-12 {
+                continue;
+            }
+            let normal = scale(normal, 1.0 / span);
+            let plane = dot(sub(point, positions[0]), normal).abs();
+            if plane > slack {
+                continue;
+            }
+            let edge_distance = (0..positions.len())
+                .map(|index| point_segment_distance(point, positions[index], positions[(index + 1) % positions.len()]))
+                .fold(f64::MAX, f64::min);
+            let inside = polygon_contains(&positions, point, normal);
+            let distance = if inside { plane } else { plane.hypot(edge_distance) };
+            if distance > slack {
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some((id, current)) => distance < current - 1.0e-9 || ((distance - current).abs() <= 1.0e-9 && face.id < id),
+            };
+            if replace {
+                best = Some((face.id, distance));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     pub fn face_positions(&self, id: u32) -> Option<Vec<[f64; 3]>> {
         let loop_ = self.face_loop(id)?;
         loop_.iter().map(|id| self.vertex_position(*id)).collect()
@@ -290,6 +388,13 @@ impl SolidBody {
     pub fn unit_normal(&self, face: u32) -> Option<[f64; 3]> {
         let positions = self.face_positions(face)?;
         unit(newell(&positions))
+    }
+
+    /// Polygon area in square meters. Newell's magnitude is twice the area.
+    pub fn face_area(&self, face: u32) -> Option<f64> {
+        let positions = self.face_positions(face)?;
+        let area = newell_length(&positions) * 0.5;
+        if area.is_finite() && area > 0.0 { Some(area) } else { None }
     }
 
     pub fn edge_segments(&self) -> Vec<(u32, [f64; 3], [f64; 3])> {
@@ -399,72 +504,56 @@ impl SolidBody {
         body.finish()
     }
 
-    /// Replaces one quad with a `u` by `v` grid of quads. Corners and the original face id stay.
+    /// Replaces one rectangular face with a `u` by `v` grid of quads. Corners and the original face id stay.
+    ///
+    /// A loop longer than four is still a quad when the extra vertices sit on the straight edges.
+    /// Those vertices stay, and the grid grows so each of them lands on a division.
     pub fn subdivide_face(&self, face: u32, u: u32, v: u32) -> Result<TopologyEdit, TopologyError> {
-        if u == 0 || v == 0 || u > SUBDIVIDE_MAX || v > SUBDIVIDE_MAX {
-            return Err(TopologyError::Degenerate);
-        }
+        let (u, v) = self.subdivide_resolution(face, u, v)?;
+        let origin = self.face_loop(face).ok_or(TopologyError::Missing)?[0];
         let mut body = self.clone();
-        let face_index = body.faces.iter().position(|entry| entry.id == face).ok_or(TopologyError::Missing)?;
-        let loop_ = body.faces[face_index].vertices.clone();
-        if loop_.len() != 4 {
-            return Err(TopologyError::NotQuad);
-        }
         if u == 1 && v == 1 {
             return body.finish();
         }
-        let corners = [loop_[0], loop_[1], loop_[2], loop_[3]];
-        let corner_at = [
-            body.vertex_position(corners[0]).ok_or(TopologyError::Missing)?,
-            body.vertex_position(corners[1]).ok_or(TopologyError::Missing)?,
-            body.vertex_position(corners[2]).ok_or(TopologyError::Missing)?,
-            body.vertex_position(corners[3]).ok_or(TopologyError::Missing)?,
-        ];
+        let quad = body.geometric_quad(face).ok_or(TopologyError::NotQuad)?;
+        let bottom = body.refine_chain(&quad.chains[0], u, face)?;
+        let right = body.refine_chain(&quad.chains[1], v, face)?;
+        let top = body.refine_chain(&quad.chains[2], u, face)?;
+        let left = body.refine_chain(&quad.chains[3], v, face)?;
+        if bottom.len() != u as usize + 1 || right.len() != v as usize + 1 || top.len() != u as usize + 1 || left.len() != v as usize + 1 {
+            return Err(TopologyError::Torn);
+        }
         let mut grid = vec![0u32; ((u + 1) * (v + 1)) as usize];
         let at = |i: u32, j: u32| (i + j * (u + 1)) as usize;
-        grid[at(0, 0)] = corners[0];
-        grid[at(u, 0)] = corners[1];
-        grid[at(u, v)] = corners[2];
-        grid[at(0, v)] = corners[3];
-        let sample = |i: u32, j: u32| bilinear(corner_at, i as f64 / u as f64, j as f64 / v as f64);
-        let born = |body: &mut SolidBody, i: u32, j: u32| -> Result<u32, TopologyError> {
-            let id = body.alloc()?;
-            body.vertices.push(SolidVertex { id, position: sample(i, j) });
-            Ok(id)
-        };
-        let mut bottom = Vec::new();
-        for i in 1..u {
-            let id = born(&mut body, i, 0)?;
-            grid[at(i, 0)] = id;
-            bottom.push(id);
+        for i in 0..=u {
+            grid[at(i, 0)] = bottom[i as usize];
+            grid[at(u - i, v)] = top[i as usize];
         }
-        let mut right = Vec::new();
-        for j in 1..v {
-            let id = born(&mut body, u, j)?;
-            grid[at(u, j)] = id;
-            right.push(id);
+        for j in 0..=v {
+            if grid[at(u, j)] != 0 && grid[at(u, j)] != right[j as usize] {
+                return Err(TopologyError::Torn);
+            }
+            grid[at(u, j)] = right[j as usize];
+            if grid[at(0, v - j)] != 0 && grid[at(0, v - j)] != left[j as usize] {
+                return Err(TopologyError::Torn);
+            }
+            grid[at(0, v - j)] = left[j as usize];
         }
-        let mut top = Vec::new();
-        for i in (1..u).rev() {
-            let id = born(&mut body, i, v)?;
-            grid[at(i, v)] = id;
-            top.push(id);
-        }
-        let mut left = Vec::new();
-        for j in (1..v).rev() {
-            let id = born(&mut body, 0, j)?;
-            grid[at(0, j)] = id;
-            left.push(id);
-        }
+        let corner_at = [
+            body.vertex_position(grid[at(0, 0)]).ok_or(TopologyError::Missing)?,
+            body.vertex_position(grid[at(u, 0)]).ok_or(TopologyError::Missing)?,
+            body.vertex_position(grid[at(u, v)]).ok_or(TopologyError::Missing)?,
+            body.vertex_position(grid[at(0, v)]).ok_or(TopologyError::Missing)?,
+        ];
         for j in 1..v {
             for i in 1..u {
-                grid[at(i, j)] = born(&mut body, i, j)?;
+                let id = body.alloc()?;
+                body.vertices.push(SolidVertex { id, position: bilinear(corner_at, i as f64 / u as f64, j as f64 / v as f64) });
+                grid[at(i, j)] = id;
             }
         }
-        body.split_edge_chain(corners[0], corners[1], &bottom, Some(face))?;
-        body.split_edge_chain(corners[1], corners[2], &right, Some(face))?;
-        body.split_edge_chain(corners[2], corners[3], &top, Some(face))?;
-        body.split_edge_chain(corners[3], corners[0], &left, Some(face))?;
+        let face_index = body.faces.iter().position(|entry| entry.id == face).ok_or(TopologyError::Missing)?;
+        let mut kept = false;
         for j in 0..v {
             for i in 0..u {
                 let cell = [grid[at(i, j)], grid[at(i + 1, j)], grid[at(i + 1, j + 1)], grid[at(i, j + 1)]];
@@ -472,13 +561,17 @@ impl SolidBody {
                 body.ensure_edge(cell[1], cell[2])?;
                 body.ensure_edge(cell[2], cell[3])?;
                 body.ensure_edge(cell[3], cell[0])?;
-                if i == 0 && j == 0 {
+                if !kept && cell.contains(&origin) {
                     body.faces[face_index].vertices = cell.to_vec();
+                    kept = true;
                 } else {
                     let id = body.alloc()?;
                     body.faces.push(SolidFace { id, vertices: cell.to_vec() });
                 }
             }
+        }
+        if !kept {
+            return Err(TopologyError::Torn);
         }
         body.finish()
     }
@@ -741,6 +834,88 @@ impl SolidBody {
             }
         }
         best
+    }
+
+    fn geometric_quad(&self, face: u32) -> Option<GeometricQuad> {
+        let loop_ = self.face_loop(face)?;
+        let mut corners_at = corner_indexes(self, loop_);
+        if corners_at.len() != 4 {
+            return None;
+        }
+        let start = if let Some(pos) = corners_at.iter().position(|index| *index == 0) {
+            pos
+        } else {
+            corners_at.len() - 1
+        };
+        corners_at.rotate_left(start);
+        let count = loop_.len();
+        let mut chains = Vec::with_capacity(4);
+        for slot in 0..4 {
+            let from = corners_at[slot];
+            let to = corners_at[(slot + 1) % 4];
+            let mut chain = Vec::new();
+            let mut cursor = from;
+            loop {
+                chain.push(loop_[cursor]);
+                if cursor == to {
+                    break;
+                }
+                cursor = (cursor + 1) % count;
+                if chain.len() > count {
+                    return None;
+                }
+            }
+            chains.push(chain);
+        }
+        let chains: [Vec<u32>; 4] = chains.try_into().ok()?;
+        let u_params = vec![chain_params(self, &chains[0], false)?, chain_params(self, &chains[2], true)?];
+        let v_params = vec![chain_params(self, &chains[1], false)?, chain_params(self, &chains[3], true)?];
+        Some(GeometricQuad { chains, u_params, v_params })
+    }
+
+    /// Inserts grid vertices along one corner-to-corner chain. A vertex already on a division is kept.
+    fn refine_chain(&mut self, chain: &[u32], count: u32, skip_face: u32) -> Result<Vec<u32>, TopologyError> {
+        if chain.len() < 2 || count == 0 {
+            return Err(TopologyError::Torn);
+        }
+        let start = self.vertex_position(chain[0]).ok_or(TopologyError::Missing)?;
+        let end = self.vertex_position(*chain.last().ok_or(TopologyError::Torn)?).ok_or(TopologyError::Missing)?;
+        let mut current = chain.to_vec();
+        let mut grid = vec![chain[0]];
+        for step in 1..count {
+            let desired = add(start, scale(sub(end, start), step as f64 / count as f64));
+            if let Some(id) = current.iter().copied().find(|id| self.vertex_position(*id).is_some_and(|position| distance(position, desired) <= 1.0e-4)) {
+                grid.push(id);
+                continue;
+            }
+            let id = self.alloc()?;
+            self.vertices.push(SolidVertex { id, position: desired });
+            let mut host = None;
+            for index in 0..current.len() - 1 {
+                let (Some(a), Some(b)) = (self.vertex_position(current[index]), self.vertex_position(current[index + 1])) else {
+                    return Err(TopologyError::Missing);
+                };
+                let along = project_segment(desired, a, b);
+                let span = distance(a, b);
+                if along > 1.0e-6 && along < span - 1.0e-6 && point_segment_distance(desired, a, b) <= 1.0e-4 {
+                    host = Some(index);
+                    break;
+                }
+            }
+            let Some(index) = host else {
+                return Err(TopologyError::Torn);
+            };
+            self.split_edge_chain(current[index], current[index + 1], &[id], Some(skip_face))?;
+            current.insert(index + 1, id);
+            grid.push(id);
+        }
+        grid.push(*chain.last().ok_or(TopologyError::Torn)?);
+        for id in &chain[1..chain.len() - 1] {
+            if !grid.contains(id) {
+                return Err(TopologyError::Torn);
+            }
+        }
+        Ok(grid)
     }
 
     fn finish(mut self) -> Result<TopologyEdit, TopologyError> {
@@ -1026,6 +1201,94 @@ impl SolidBody {
             }
         }
         Ok(())
+    }
+}
+
+struct GeometricQuad {
+    chains: [Vec<u32>; 4],
+    u_params: Vec<Vec<f64>>,
+    v_params: Vec<Vec<f64>>,
+}
+
+fn corner_indexes(body: &SolidBody, loop_: &[u32]) -> Vec<usize> {
+    let count = loop_.len();
+    let mut corners = Vec::new();
+    if count < 3 {
+        return corners;
+    }
+    for index in 0..count {
+        let (Some(prev), Some(point), Some(next)) = (
+            body.vertex_position(loop_[(index + count - 1) % count]),
+            body.vertex_position(loop_[index]),
+            body.vertex_position(loop_[(index + 1) % count]),
+        ) else {
+            continue;
+        };
+        if !point_on_open_segment(prev, point, next) {
+            corners.push(index);
+        }
+    }
+    corners
+}
+
+fn point_on_open_segment(prev: [f64; 3], point: [f64; 3], next: [f64; 3]) -> bool {
+    let span = distance(prev, next);
+    if span < MIN_EDGE_M {
+        return false;
+    }
+    let along = project_segment(point, prev, next);
+    along > MIN_EDGE_M && along < span - MIN_EDGE_M && point_segment_distance(point, prev, next) <= 1.0e-5
+}
+
+fn chain_params(body: &SolidBody, chain: &[u32], reverse: bool) -> Option<Vec<f64>> {
+    let start = body.vertex_position(*chain.first()?)?;
+    let end = body.vertex_position(*chain.last()?)?;
+    let span = distance(start, end);
+    if span < MIN_EDGE_M {
+        return None;
+    }
+    let mut params = Vec::new();
+    for id in &chain[1..chain.len() - 1] {
+        let position = body.vertex_position(*id)?;
+        let mut t = project_segment(position, start, end) / span;
+        if reverse {
+            t = 1.0 - t;
+        }
+        params.push(t);
+    }
+    Some(params)
+}
+
+fn division_count(edge_params: &[Vec<f64>], requested: u32) -> Result<u32, TopologyError> {
+    let mut count = requested.max(1);
+    loop {
+        if count > SUBDIVIDE_MAX {
+            return Err(TopologyError::NotQuad);
+        }
+        let mut fits = true;
+        for params in edge_params {
+            let mut slots = Vec::new();
+            for t in params {
+                let slot = (t * count as f64).round();
+                if slot < 1.0 || slot > count as f64 - 1.0 || (slot / count as f64 - t).abs() > 1.0e-4 {
+                    fits = false;
+                    break;
+                }
+                let slot = slot as u32;
+                if slots.contains(&slot) {
+                    fits = false;
+                    break;
+                }
+                slots.push(slot);
+            }
+            if !fits {
+                break;
+            }
+        }
+        if fits {
+            return Ok(count);
+        }
+        count += 1;
     }
 }
 
@@ -1377,6 +1640,7 @@ mod tests {
         assert_eq!(body.edges.len(), 12);
         assert_eq!(body.faces.len(), 6);
         assert_eq!(body.next_id, 21);
+        assert!((body.face_area(3).unwrap() - 4.0).abs() < 1.0e-9, "the top of a 2 m cube is 4 m²");
         let expected = [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]];
         for (index, normal) in expected.iter().enumerate() {
             let got = body.unit_normal((index + 1) as u32).unwrap();
@@ -1441,7 +1705,12 @@ mod tests {
         assert!(edit.body.faces.iter().find(|face| face.id == 5).unwrap().vertices.contains(&edge.b));
         assert_eq!(edit.body.faces.iter().find(|face| face.id == 2).unwrap().vertices, vec![1, 5, 7, 3]);
         edit.body.validate().unwrap();
-        assert_eq!(edit.body.subdivide_face(3, 2, 2), Err(TopologyError::NotQuad));
+        let divided = edit.body.subdivide_face(3, 2, 2).expect("a split rectangle is still a quad");
+        divided.body.validate().unwrap();
+        let mid = edit.body.vertices.iter().find(|vertex| vertex.id > 8).unwrap();
+        let copies = divided.body.vertices.iter().filter(|vertex| distance(vertex.position, mid.position) <= 1.0e-6).count();
+        assert_eq!(copies, 1, "the split vertex stays on the grid");
+        assert_eq!(divided.body.face_len(3), Some(4));
     }
 
     #[test]
@@ -1565,6 +1834,50 @@ mod tests {
         let normal = raised.body.unit_normal(side).unwrap();
         let origin = [side_at[0] + normal[0] * 2.0, side_at[1] + normal[1] * 2.0, side_at[2] + normal[2] * 2.0];
         assert_eq!(raised.body.pick_face(origin, [-normal[0], -normal[1], -normal[2]]).unwrap().id, side);
+    }
+
+    #[test]
+    fn the_next_cell_and_the_split_side_both_subdivide() {
+        let divided = box_body().subdivide_face(3, 2, 2).unwrap();
+        divided.body.validate().unwrap();
+        let tops = top_faces(&divided.body);
+        assert_eq!(tops.len(), 4, "{tops:?}");
+        for face in &tops {
+            let center = centroid(&divided.body, *face);
+            let hit = divided.body.pick_face([center[0], center[1] + 3.0, center[2]], [0.0, -1.0, 0.0]).unwrap();
+            assert_eq!(hit.id, *face, "ray through the cell center");
+            let near = divided.body.nearest_face(center, 0.02).unwrap();
+            assert_eq!(near, *face);
+        }
+        let side = divided.body.faces_of_edge(20);
+        assert!(side.contains(&1), "{side:?}");
+        assert_eq!(divided.body.corner_count(1), Some(4));
+        assert!(divided.body.face_len(1).unwrap() > 4);
+        let (u, v) = divided.body.subdivide_resolution(1, 2, 2).unwrap();
+        assert!(u >= 2 && v >= 2, "{u} {v}");
+        let sided = divided.body.subdivide_face(1, 2, 2).unwrap();
+        sided.body.validate().unwrap();
+        assert!(sided.body.face_len(1) == Some(4));
+        let next = tops.into_iter().find(|face| *face != 3).unwrap();
+        let again = divided.body.subdivide_face(next, 2, 2).unwrap();
+        again.body.validate().unwrap();
+        let children: Vec<u32> = top_faces(&again.body)
+            .into_iter()
+            .filter(|face| {
+                again.body.face_positions(*face).unwrap().iter().all(|position| {
+                    let center = centroid(&divided.body, next);
+                    (position[0] - center[0]).abs() <= 0.5 + 1.0e-6 && (position[2] - center[2]).abs() <= 0.5 + 1.0e-6
+                })
+            })
+            .collect();
+        assert!(children.len() >= 4, "{children:?}");
+        for face in &children {
+            let center = centroid(&again.body, *face);
+            assert_eq!(again.body.pick_face([center[0], center[1] + 3.0, center[2]], [0.0, -1.0, 0.0]).unwrap().id, *face);
+            assert_eq!(again.body.subdivide_resolution(*face, 2, 2).unwrap(), (2, 2));
+        }
+        let edge = again.body.closest_edge_of_face(next, [0.0, 5.0, 0.0], [0.0, -1.0, 0.0]);
+        assert!(edge.is_some());
     }
 
     #[test]

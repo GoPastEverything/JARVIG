@@ -88,12 +88,26 @@ pub enum ControlClass {
     Combo,
 }
 
+/// How an inspector button is drawn. Native is a standard Win32 control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlFace {
+    Native,
+    /// One cell of the Select row, or Cancel and Done.
+    Chip,
+    /// Icon and a short name. Model tools use a two-column grid of these.
+    Tile,
+    /// Full-width dark row. Section titles and history actions use this.
+    Row,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InspectorBinding {
     Label,
     Text { type_id: TypeId, field: FieldId },
     Axis { type_id: TypeId, field: FieldId, axis: u8 },
     Check { type_id: TypeId, field: FieldId },
+    /// Editor cage toggle. Not a component field.
+    ShowGrid,
     Choice { type_id: TypeId, field: FieldId },
     Command { command: InspectorCommand, type_id: TypeId },
     Section { title: String },
@@ -119,6 +133,10 @@ pub struct PlannedControl {
     pub choices: Vec<String>,
     pub selected: usize,
     pub checked: bool,
+    pub face: ControlFace,
+    /// More than one means this control shares its row. Zero is a normal stacked control.
+    pub row_columns: u8,
+    pub row_index: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +147,8 @@ pub struct PlanOptions {
     pub uniform_scale: bool,
     pub show_commands: bool,
     pub show_add: bool,
+    /// View > Show Grid. The Geometry check reads this. It is not a saved field.
+    pub show_grid: bool,
 }
 
 impl PlanOptions {
@@ -140,6 +160,7 @@ impl PlanOptions {
             uniform_scale: false,
             show_commands: true,
             show_add: true,
+            show_grid: false,
         }
     }
 }
@@ -169,8 +190,8 @@ pub struct InspectorSection {
     pub type_id: TypeId,
     pub fields: Vec<InspectorField>,
     pub commands: Vec<InspectorCommand>,
-    /// Buttons whose label is not the static command name. Feature rows use this.
-    pub feature_edits: Vec<(InspectorCommand, String)>,
+    /// Buttons whose label is not the static command name. The bool is the active mode chip.
+    pub feature_edits: Vec<(InspectorCommand, String, bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,47 +386,29 @@ fn attach_solid_tools(
         return;
     }
     let Some(record) = record else { return };
-    let (element_name, element_value, edge_length) = match element {
-        SolidElement::Face(face) => ("Face", jarvig_core::face_name(face).to_string(), None),
-        SolidElement::BodyFace(0) | SolidElement::Object => ("Face", "None".into(), None),
-        SolidElement::BodyFace(face) => ("Face", format!("F:{face}"), None),
-        SolidElement::Edge(0) => ("Edge", "None".into(), None),
-        SolidElement::Edge(edge) => ("Edge", format!("E:{edge}"), record.display_body().and_then(|body| body.edge_length(edge))),
-        SolidElement::Vertex(0) => ("Vertex", "None".into(), None),
-        SolidElement::Vertex(vertex) => ("Vertex", format!("V:{vertex}"), None),
-    };
-    let mut selection_fields = vec![solid_note(SOLID_UI_FACE, element_name, element_value)];
-    if let Some(length) = edge_length {
-        selection_fields.push(solid_note(SOLID_UI_LENGTH, "Length", format!("{length:.3} m")));
-    }
-    let mode_edits = ["Auto", "Object", "Face", "Edge", "Vertex"]
-        .into_iter()
-        .zip([
-            InspectorCommand::SelectionAuto,
-            InspectorCommand::SelectionObject,
-            InspectorCommand::SelectionFace,
-            InspectorCommand::SelectionEdge,
-            InspectorCommand::SelectionVertex,
-        ])
-        .map(|(name, command)| {
-            let label = if name == mode_name { format!("{name}  ·") } else { name.to_string() };
-            (command, label)
-        })
-        .collect();
-    insert_section_after(
-        sections,
-        "Actor",
-        InspectorSection {
-            title: "Selection".into(),
-            type_id: TYPE_PARAMETRIC_BLOCK,
-            fields: selection_fields,
-            commands: Vec::new(),
-            feature_edits: mode_edits,
-        },
-    );
+    let mode_edits = [
+        ("Auto", InspectorCommand::SelectionAuto),
+        ("Object", InspectorCommand::SelectionObject),
+        ("Face", InspectorCommand::SelectionFace),
+        ("Edge", InspectorCommand::SelectionEdge),
+        ("Vert", InspectorCommand::SelectionVertex),
+    ]
+    .into_iter()
+    .map(|(name, command)| {
+        let active = name == mode_name || (name == "Vert" && mode_name == "Vertex");
+        (command, name.to_string(), active)
+    })
+    .collect();
+    sections.push(InspectorSection {
+        title: "Select".into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields: Vec::new(),
+        commands: Vec::new(),
+        feature_edits: mode_edits,
+    });
     let mut feature_edits = Vec::new();
     if record.bevel_m > 1.0e-9 {
-        feature_edits.push((InspectorCommand::EditBevel, format!("Bevel  {:.3} m", record.bevel_m)));
+        feature_edits.push((InspectorCommand::EditBevel, format!("Bevel  {:.3} m", record.bevel_m), false));
     }
     for face in 0..6u8 {
         let inset = record.inset_m[face as usize];
@@ -413,28 +416,17 @@ fn attach_solid_tools(
             feature_edits.push((
                 InspectorCommand::EditInset(face),
                 format!("Inset {}  {inset:.3} m", jarvig_core::face_name(face)),
+                false,
             ));
         }
     }
-    let mut feature_fields = vec![solid_note(
-        SOLID_UI_BLOCK,
-        "Block",
-        format!("{:.3} × {:.3} × {:.3} m", record.size_m[0], record.size_m[1], record.size_m[2]),
-    )];
-    for (index, summary) in topology_log(record).into_iter().enumerate() {
-        feature_fields.push(solid_note(FieldId(260 + index as u32), "Edit", summary));
-    }
-    insert_section_after(
-        sections,
-        "Dimensions",
-        InspectorSection {
-            title: "Features".into(),
-            type_id: TYPE_PARAMETRIC_BLOCK,
-            fields: feature_fields,
-            commands: Vec::new(),
-            feature_edits,
-        },
-    );
+    sections.push(InspectorSection {
+        title: "History".into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields: history_fields(record),
+        commands: Vec::new(),
+        feature_edits,
+    });
     let face_tools = vec![
         InspectorCommand::ExtrudeFace,
         InspectorCommand::InsetFace,
@@ -443,37 +435,158 @@ fn attach_solid_tools(
         InspectorCommand::SubdivideFace4,
     ];
     let edge_tools = vec![InspectorCommand::MoveEdge, InspectorCommand::ExtrudeEdge, InspectorCommand::SplitEdge];
-    let (title, commands) = if mode_name == "Edge" || matches!(element, SolidElement::Edge(_)) {
-        ("Edge Tools", edge_tools)
-    } else if mode_name == "Vertex" || matches!(element, SolidElement::Vertex(_)) {
-        ("Vertex Tools", vec![InspectorCommand::MoveVertex])
-    } else if mode_name == "Face" || matches!(element, SolidElement::Face(_) | SolidElement::BodyFace(_)) {
-        ("Face Tools", face_tools)
-    } else {
-        let mut commands = vec![InspectorCommand::Bevel, InspectorCommand::ResetShape];
-        if capabilities.patternable {
-            commands.extend([
-                InspectorCommand::Duplicate,
-                InspectorCommand::MirrorX,
-                InspectorCommand::MirrorY,
-                InspectorCommand::MirrorZ,
-                InspectorCommand::AlignToGround,
-                InspectorCommand::SnapTranslation,
-            ]);
-        }
-        ("Object Tools", commands)
-    };
-    insert_section_after(
-        sections,
-        "Features",
-        InspectorSection {
-            title: title.into(),
-            type_id: TYPE_PARAMETRIC_BLOCK,
-            fields: Vec::new(),
-            commands,
-            feature_edits: Vec::new(),
+    let mut object_tools = vec![InspectorCommand::Bevel, InspectorCommand::ResetShape];
+    if capabilities.patternable {
+        object_tools.extend([
+            InspectorCommand::Duplicate,
+            InspectorCommand::MirrorX,
+            InspectorCommand::MirrorY,
+            InspectorCommand::MirrorZ,
+            InspectorCommand::AlignToGround,
+            InspectorCommand::SnapTranslation,
+        ]);
+    }
+    let commands = match mode_name {
+        "Edge" => edge_tools,
+        "Vertex" => vec![InspectorCommand::MoveVertex],
+        "Face" => face_tools.clone(),
+        "Object" => object_tools,
+        _ => match element {
+            SolidElement::Edge(id) if id != 0 => edge_tools,
+            SolidElement::Vertex(id) if id != 0 => vec![InspectorCommand::MoveVertex],
+            SolidElement::Face(_) | SolidElement::BodyFace(_) => face_tools,
+            _ => object_tools,
         },
-    );
+    };
+    sections.push(InspectorSection {
+        title: "Model".into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields: element_fields(record, element),
+        commands,
+        feature_edits: Vec::new(),
+    });
+    sections.push(InspectorSection {
+        title: "Geometry".into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields: geometry_fields(record),
+        commands: Vec::new(),
+        feature_edits: Vec::new(),
+    });
+    order_solid_sections(sections);
+}
+
+fn element_fields(record: &jarvig_core::BlockRecord, element: SolidElement) -> Vec<InspectorField> {
+    let body = record.display_body();
+    match element {
+        SolidElement::Object => Vec::new(),
+        SolidElement::Face(face) => {
+            let mut fields = vec![solid_note(SOLID_UI_FACE, "Face", jarvig_core::face_name(face).to_string())];
+            fields.push(solid_note(SOLID_UI_AREA, "Area", format!("{:.3} m²", analytic_face_area(record.size_m, face))));
+            fields.push(solid_note(SOLID_UI_NORMAL, "Normal", jarvig_core::face_name(face).to_string()));
+            fields
+        }
+        SolidElement::BodyFace(0) => vec![solid_note(SOLID_UI_FACE, "Face", "None".into())],
+        SolidElement::BodyFace(face) => {
+            let mut fields = vec![solid_note(SOLID_UI_FACE, "Face", format!("F:{face}"))];
+            if let Some(body) = &body {
+                if let Some(area) = body.face_area(face) {
+                    fields.push(solid_note(SOLID_UI_AREA, "Area", format!("{area:.3} m²")));
+                }
+                if let Some(normal) = body.unit_normal(face) {
+                    fields.push(solid_note(SOLID_UI_NORMAL, "Normal", normal_label(normal)));
+                }
+            }
+            fields
+        }
+        SolidElement::Edge(0) => vec![solid_note(SOLID_UI_FACE, "Edge", "None".into())],
+        SolidElement::Edge(edge) => {
+            let mut fields = vec![solid_note(SOLID_UI_FACE, "Edge", format!("E:{edge}"))];
+            if let Some(length) = body.as_ref().and_then(|body| body.edge_length(edge)) {
+                fields.push(solid_note(SOLID_UI_LENGTH, "Length", format!("{length:.3} m")));
+            }
+            fields
+        }
+        SolidElement::Vertex(0) => vec![solid_note(SOLID_UI_FACE, "Vertex", "None".into())],
+        SolidElement::Vertex(vertex) => vec![solid_note(SOLID_UI_FACE, "Vertex", format!("V:{vertex}"))],
+    }
+}
+
+fn geometry_fields(record: &jarvig_core::BlockRecord) -> Vec<InspectorField> {
+    let (faces, edges, vertices) = if let Some(body) = record.display_body() {
+        (body.faces.len().to_string(), body.edges.len().to_string(), body.vertices.len().to_string())
+    } else {
+        ("—".into(), "—".into(), "—".into())
+    };
+    let mut fields = vec![
+        solid_note(SOLID_UI_FACES, "Faces", faces),
+        solid_note(SOLID_UI_EDGES, "Edges", edges),
+        solid_note(SOLID_UI_VERTS, "Vertices", vertices),
+        solid_note(SOLID_UI_CLOSED, "Closed", "Yes".into()),
+    ];
+    if record.body.is_some() {
+        let mut grid = solid_note(SOLID_UI_GRID, "Show Grid", String::new());
+        grid.widget = WidgetKind::Check;
+        grid.editable = true;
+        fields.push(grid);
+    }
+    fields
+}
+
+fn history_fields(record: &jarvig_core::BlockRecord) -> Vec<InspectorField> {
+    let mut fields = vec![solid_note(
+        SOLID_UI_BLOCK,
+        "Block",
+        format!("{:.3} × {:.3} × {:.3} m", record.size_m[0], record.size_m[1], record.size_m[2]),
+    )];
+    let start = record.history.len().saturating_sub(8);
+    let shown = &record.history[start..];
+    for (offset, op) in shown.iter().enumerate().rev() {
+        let number = start + offset + 1;
+        fields.push(solid_note(FieldId(260 + number as u32), &format!("{number:02}"), op.summary()));
+    }
+    fields
+}
+
+fn analytic_face_area(size: [f64; 3], face: u8) -> f64 {
+    match face {
+        0 | 1 => size[1] * size[2],
+        2 | 3 => size[0] * size[2],
+        _ => size[0] * size[1],
+    }
+}
+
+fn normal_label(normal: [f64; 3]) -> String {
+    let axes = ["X", "Y", "Z"];
+    let mut axis = 0usize;
+    for index in 1..3 {
+        if normal[index].abs() > normal[axis].abs() {
+            axis = index;
+        }
+    }
+    if normal[axis].abs() >= 0.999 {
+        format!("{}{}", if normal[axis] >= 0.0 { "+" } else { "-" }, axes[axis])
+    } else {
+        format!("{:.2}, {:.2}, {:.2}", normal[0], normal[1], normal[2])
+    }
+}
+
+fn order_solid_sections(sections: &mut Vec<InspectorSection>) {
+    let rank = |title: &str| match title {
+        "Actor" => 0,
+        "Select" => 1,
+        "Transform" => 2,
+        "Dimensions" => 3,
+        "Model" => 4,
+        "Active Tool" => 5,
+        "Geometry" => 6,
+        "History" => 7,
+        "Collision" => 8,
+        "Material" => 9,
+        "Advanced" => 30,
+        "Components" => 31,
+        _ => 20,
+    };
+    sections.sort_by_key(|section| rank(section.title.as_str()));
 }
 
 /// The open modeling operation. A drag commits on mouse-up. Amount stays for a typed value.
@@ -489,60 +602,62 @@ pub struct ModelingView {
     pub element_label: &'static str,
 }
 
-/// Replaces the start buttons with Cancel, Apply, and the amount when the operation has one.
+/// Hides the tool shelf and opens the Active Tool card. Mode chips and history stay.
 pub fn attach_modeling_session(model: &mut InspectorModel, view: &ModelingView) {
     let InspectorBody::Entity { sections } = &mut model.body else { return };
     for section in sections.iter_mut() {
-        section.commands.retain(|command| {
-            !matches!(
-                command,
-                InspectorCommand::ExtrudeFace
-                    | InspectorCommand::InsetFace
-                    | InspectorCommand::Bevel
-                    | InspectorCommand::ResetShape
-                    | InspectorCommand::MoveEdge
-                    | InspectorCommand::ExtrudeEdge
-                    | InspectorCommand::SplitEdge
-                    | InspectorCommand::MoveVertex
-                    | InspectorCommand::SubdivideFace
-                    | InspectorCommand::SubdivideFace4
-            )
-        });
-        section.feature_edits.clear();
-        section.fields.retain(|field| field.field != SOLID_UI_FACE && !(260..268).contains(&field.field.0));
+        section.commands.retain(|command| !modeling_start(*command));
+        section.feature_edits.retain(|(command, _, _)| mode_chip(*command) || feature_reopen(*command));
+        section.fields.retain(|field| !matches!(field.field, SOLID_UI_FACE | SOLID_UI_AREA | SOLID_UI_NORMAL | SOLID_UI_LENGTH));
     }
-    let mut fields = vec![solid_note(SOLID_UI_FACE, view.element_label, view.face.clone())];
+    sections.retain(|section| section.title != "Model" || !section.fields.is_empty() || !section.commands.is_empty());
+    let mut fields = vec![
+        solid_note(SOLID_UI_TOOL, "Tool", view.title.into()),
+        solid_note(SOLID_UI_FACE, view.element_label, view.face.clone()),
+    ];
     if view.show_amount {
         fields.push(solid_amount(view));
     }
-    let section = InspectorSection {
-        title: view.title.into(),
+    sections.retain(|section| section.title != "Active Tool");
+    sections.push(InspectorSection {
+        title: "Active Tool".into(),
         type_id: TYPE_PARAMETRIC_BLOCK,
         fields,
         commands: vec![InspectorCommand::CancelModeling, InspectorCommand::ApplyModeling],
         feature_edits: Vec::new(),
-    };
-    let index = sections.iter().position(|existing| existing.title == "Features").unwrap_or(sections.len());
-    sections.insert(index, section);
+    });
+    order_solid_sections(sections);
 }
 
-/// Last topology edits, as labels. Clicking one does not rebuild the solid.
-fn topology_log(record: &jarvig_core::BlockRecord) -> Vec<String> {
-    let rows: Vec<String> = record
-        .history
-        .iter()
-        .filter_map(|op| match op {
-            jarvig_core::BlockOp::MoveEdge { .. }
-            | jarvig_core::BlockOp::ExtrudeEdge { .. }
-            | jarvig_core::BlockOp::SplitEdge { .. }
-            | jarvig_core::BlockOp::SubdivideFace { .. }
-            | jarvig_core::BlockOp::MoveVertex { .. }
-            | jarvig_core::BlockOp::ExtrudeFaces { .. } => Some(op.summary()),
-            _ => None,
-        })
-        .collect();
-    let start = rows.len().saturating_sub(8);
-    rows[start..].to_vec()
+fn modeling_start(command: InspectorCommand) -> bool {
+    matches!(
+        command,
+        InspectorCommand::ExtrudeFace
+            | InspectorCommand::InsetFace
+            | InspectorCommand::Bevel
+            | InspectorCommand::ResetShape
+            | InspectorCommand::MoveEdge
+            | InspectorCommand::ExtrudeEdge
+            | InspectorCommand::SplitEdge
+            | InspectorCommand::MoveVertex
+            | InspectorCommand::SubdivideFace
+            | InspectorCommand::SubdivideFace4
+    )
+}
+
+fn mode_chip(command: InspectorCommand) -> bool {
+    matches!(
+        command,
+        InspectorCommand::SelectionAuto
+            | InspectorCommand::SelectionObject
+            | InspectorCommand::SelectionFace
+            | InspectorCommand::SelectionEdge
+            | InspectorCommand::SelectionVertex
+    )
+}
+
+fn feature_reopen(command: InspectorCommand) -> bool {
+    matches!(command, InspectorCommand::EditBevel | InspectorCommand::EditInset(_))
 }
 
 fn solid_amount(view: &ModelingView) -> InspectorField {
@@ -556,14 +671,6 @@ fn solid_amount(view: &ModelingView) -> InspectorField {
     field.precision = 3;
     field.step = 0.001;
     field
-}
-
-fn insert_section_after(sections: &mut Vec<InspectorSection>, after: &str, section: InspectorSection) {
-    if sections.iter().any(|existing| existing.title == section.title) {
-        return;
-    }
-    let index = sections.iter().position(|existing| existing.title == after).map(|index| index + 1).unwrap_or(sections.len());
-    sections.insert(index, section);
 }
 
 fn solid_note(field: FieldId, label: &str, display: String) -> InspectorField {
@@ -847,6 +954,9 @@ pub fn same_control_layout(left: &PlannedControl, right: &PlannedControl) -> boo
         && left.stretch == right.stretch
         && left.right_gutter == right.right_gutter
         && left.right_slot == right.right_slot
+        && left.face == right.face
+        && left.row_columns == right.row_columns
+        && left.row_index == right.row_index
 }
 
 pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl> {
@@ -900,6 +1010,8 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
                         4,
                         y,
                     );
+                    header.face = ControlFace::Row;
+                    header.height = 22;
                     header.right_gutter = header_commands.len() as i32 * 76;
                     items.push(header);
                     for (index, command) in header_commands.iter().enumerate() {
@@ -927,29 +1039,7 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
                     y = push_field(&mut items, field, y, options);
                 }
                 if options.show_commands {
-                    for command in &section.commands {
-                        if command_in_header(*command) {
-                            continue;
-                        }
-                        items.push(control(
-                            ControlClass::Button,
-                            InspectorBinding::Command { command: *command, type_id: section.type_id },
-                            command_label(*command).into(),
-                            12,
-                            y,
-                        ));
-                        y += 24;
-                    }
-                    for (command, label) in &section.feature_edits {
-                        items.push(control(
-                            ControlClass::Button,
-                            InspectorBinding::Command { command: *command, type_id: section.type_id },
-                            label.clone(),
-                            12,
-                            y,
-                        ));
-                        y += 24;
-                    }
+                    push_shelf(&mut items, section, &mut y);
                 }
                 y += 8;
             }
@@ -960,6 +1050,55 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
         }
     }
     items
+}
+
+fn push_shelf(items: &mut Vec<PlannedControl>, section: &InspectorSection, y: &mut i32) {
+    let (face, columns, height) = match section.title.as_str() {
+        "Select" => (ControlFace::Chip, 5u8, 28i32),
+        "Model" => (ControlFace::Tile, 2, 56),
+        "Active Tool" => (ControlFace::Chip, 2, 28),
+        _ => (ControlFace::Row, 0, 24),
+    };
+    let mut slots = Vec::new();
+    for command in &section.commands {
+        if command_in_header(*command) {
+            continue;
+        }
+        slots.push((InspectorBinding::Command { command: *command, type_id: section.type_id }, command_label(*command).to_string(), false));
+    }
+    for (command, label, active) in &section.feature_edits {
+        slots.push((InspectorBinding::Command { command: *command, type_id: section.type_id }, label.clone(), *active));
+    }
+    if slots.is_empty() {
+        return;
+    }
+    if columns == 0 {
+        for (binding, text, active) in slots {
+            let mut button = control(ControlClass::Button, binding, text, 12, *y);
+            button.face = face;
+            button.height = height;
+            button.checked = active;
+            items.push(button);
+            *y += height + 4;
+        }
+        return;
+    }
+    let width = columns as usize;
+    let count = slots.len();
+    for (index, (binding, text, active)) in slots.into_iter().enumerate() {
+        let column = (index % width) as u8;
+        let mut button = control(ControlClass::Button, binding, text, 8, *y);
+        button.stretch = false;
+        button.face = face;
+        button.row_columns = columns;
+        button.row_index = column;
+        button.height = height;
+        button.checked = active;
+        items.push(button);
+        if column + 1 == columns || index + 1 == count {
+            *y += height + 4;
+        }
+    }
 }
 
 fn command_in_header(command: InspectorCommand) -> bool {
@@ -983,7 +1122,7 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::InsetFace => "Inset",
         InspectorCommand::Bevel => "Bevel",
         InspectorCommand::CancelModeling => "Cancel",
-        InspectorCommand::ApplyModeling => "Apply",
+        InspectorCommand::ApplyModeling => "Done",
         InspectorCommand::MirrorX => "Mirror X",
         InspectorCommand::MirrorY => "Mirror Y",
         InspectorCommand::MirrorZ => "Mirror Z",
@@ -1016,6 +1155,22 @@ pub const SOLID_UI_BLOCK: FieldId = FieldId(242);
 pub const SOLID_UI_BEVEL: FieldId = FieldId(243);
 /// Edge length for the selected topological edge. Not a registry field.
 pub const SOLID_UI_LENGTH: FieldId = FieldId(244);
+/// Area of the selected face, square meters. Not a registry field.
+pub const SOLID_UI_AREA: FieldId = FieldId(252);
+/// Outward normal of the selected face. Not a registry field.
+pub const SOLID_UI_NORMAL: FieldId = FieldId(253);
+/// Stored or analytic face count. Not a registry field.
+pub const SOLID_UI_FACES: FieldId = FieldId(254);
+/// Stored or analytic edge count. Not a registry field.
+pub const SOLID_UI_EDGES: FieldId = FieldId(255);
+/// Stored or analytic vertex count. Not a registry field.
+pub const SOLID_UI_VERTS: FieldId = FieldId(256);
+/// Closed-solid readout. A stored body and the analytic box are closed.
+pub const SOLID_UI_CLOSED: FieldId = FieldId(257);
+/// Show Grid check. The plan reads [`PlanOptions::show_grid`]. Not a registry field.
+pub const SOLID_UI_GRID: FieldId = FieldId(258);
+/// Name of the open modeling operation. Not a registry field.
+pub const SOLID_UI_TOOL: FieldId = FieldId(259);
 
 /// Current inset readout for one face. Not submitted through SetProperty.
 pub fn solid_ui_inset(face: u8) -> FieldId {
@@ -1367,8 +1522,14 @@ fn push_field(items: &mut Vec<PlannedControl>, field: &InspectorField, mut y: i3
     let enabled = field.editable;
     match field.widget {
         WidgetKind::Check => {
-            let mut row = control(ControlClass::Check, InspectorBinding::Check { type_id: field.type_id, field: field.field }, field.label.clone(), 12, y);
-            row.checked = matches!(field.display.as_str(), "true" | "1");
+            let grid = field.field == SOLID_UI_GRID;
+            let binding = if grid {
+                InspectorBinding::ShowGrid
+            } else {
+                InspectorBinding::Check { type_id: field.type_id, field: field.field }
+            };
+            let mut row = control(ControlClass::Check, binding, field.label.clone(), 12, y);
+            row.checked = if grid { options.show_grid } else { matches!(field.display.as_str(), "true" | "1") };
             row.enabled = enabled;
             items.push(row);
             y + 24
@@ -1514,6 +1675,9 @@ fn control(class: ControlClass, binding: InspectorBinding, text: String, x: i32,
         choices: Vec::new(),
         selected: 0,
         checked: false,
+        face: ControlFace::Native,
+        row_columns: 0,
+        row_index: 0,
     }
 }
 
@@ -1812,11 +1976,11 @@ mod tests {
         selection.replace(SelectionItem::entity(block).unwrap()).unwrap();
         let mut model = build(&selection, &world);
         let titles = model.section_titles();
-        for title in ["Dimensions", "Features", "Selection", "Object Tools", "Collision", "Material"] {
+        for title in ["Dimensions", "History", "Select", "Model", "Geometry", "Collision", "Material"] {
             assert!(titles.iter().any(|existing| *existing == title), "missing {title} in {titles:?}");
         }
         assert!(!titles.iter().any(|existing| {
-            matches!(*existing, "Shape" | "Modeling" | "Pattern" | "Placement" | "Face Tools")
+            matches!(*existing, "Shape" | "Modeling" | "Pattern" | "Placement" | "Face Tools" | "Object Tools" | "Features" | "Selection")
         }));
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_ORIGIN).unwrap().display, "Center");
         assert!(!model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_ORIGIN).unwrap().editable);
@@ -1826,44 +1990,60 @@ mod tests {
         assert!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_HISTORY).is_none());
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_BLOCK).unwrap().display, "2.000 × 2.000 × 2.000 m");
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, jarvig_core::FIELD_BLOCK_COLLISION).unwrap().display, "Analytic box");
-        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "None");
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).is_none());
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACES).unwrap().display, "6");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_EDGES).unwrap().display, "12");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_VERTS).unwrap().display, "8");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_CLOSED).unwrap().display, "Yes");
         let planned = plan(&model, &PlanOptions::editing());
-        for label in ["Reset Shape", "Bevel", "Duplicate", "Mirror X", "Mirror Y", "Mirror Z", "Align", "Snap", "Auto  ·", "Object", "Face", "Edge", "Vertex"] {
+        for label in ["Reset Shape", "Bevel", "Duplicate", "Mirror X", "Mirror Y", "Mirror Z", "Align", "Snap", "Auto", "Object", "Face", "Edge", "Vert"] {
             assert!(planned.iter().any(|control| control.text == label), "missing {label}");
         }
+        let auto = planned.iter().find(|control| control.text == "Auto").unwrap();
+        assert!(auto.checked);
+        assert_eq!(auto.face, ControlFace::Chip);
+        assert_eq!(auto.row_columns, 5);
+        assert!(!planned.iter().any(|control| control.text == "Show Grid"));
         assert!(!planned.iter().any(|control| {
             matches!(control.text.as_str(), "Extrude" | "Inset" | "Union" | "Subtract" | "Sketch" | "Edit Edges" | "Shell" | "Cancel" | "Apply" | "Move Edge" | "Extrude Edge" | "Split Edge" | "Subdivide" | "4×4")
         }));
-        let face_model = build_solid(&selection, &world, &[], &[], SolidElement::Face(1), "Auto");
+        let mut face_model = build_solid(&selection, &world, &[], &[], SolidElement::Face(1), "Auto");
         assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "-X");
-        assert!(face_model.section_titles().iter().any(|title| *title == "Face Tools"));
+        assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AREA).unwrap().display, "4.000 m²");
+        assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_NORMAL).unwrap().display, "-X");
+        assert!(face_model.section_titles().iter().any(|title| *title == "Model"));
+        assert!(!face_model.section_titles().iter().any(|title| *title == "Face Tools"));
         let face_plan = plan(&face_model, &PlanOptions::editing());
         for label in ["Extrude", "Inset", "Bevel", "Subdivide", "4×4"] {
             assert!(face_plan.iter().any(|control| control.text == label), "missing {label}");
         }
+        let extrude = face_plan.iter().find(|control| control.text == "Extrude").unwrap();
+        assert_eq!(extrude.face, ControlFace::Tile);
+        assert_eq!(extrude.row_columns, 2);
         assert!(!face_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Duplicate" | "Mirror X" | "Move Edge")));
         let edge_model = build_solid(&selection, &world, &[], &[], SolidElement::Edge(12), "Edge");
         assert_eq!(edge_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "E:12");
         assert_eq!(edge_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_LENGTH).unwrap().display, "2.000 m");
-        assert!(edge_model.section_titles().iter().any(|title| *title == "Edge Tools"));
+        assert!(edge_model.section_titles().iter().any(|title| *title == "Model"));
         let edge_plan = plan(&edge_model, &PlanOptions::editing());
-        for label in ["Move Edge", "Extrude Edge", "Split Edge", "Edge  ·"] {
+        for label in ["Move Edge", "Extrude Edge", "Split Edge", "Edge"] {
             assert!(edge_plan.iter().any(|control| control.text == label), "missing {label}");
         }
         assert!(!edge_plan.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Reset Shape" | "Subdivide" | "4×4")));
         let vertex_model = build_solid(&selection, &world, &[], &[], SolidElement::Vertex(3), "Vertex");
         assert_eq!(vertex_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "V:3");
         assert!(vertex_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_LENGTH).is_none());
-        assert!(vertex_model.section_titles().iter().any(|title| *title == "Vertex Tools"));
+        assert!(vertex_model.section_titles().iter().any(|title| *title == "Model"));
         let vertex_plan = plan(&vertex_model, &PlanOptions::editing());
         assert!(vertex_plan.iter().any(|control| control.text == "Move"));
-        assert!(vertex_plan.iter().any(|control| control.text == "Vertex  ·"));
+        let vert = vertex_plan.iter().find(|control| control.text == "Vert").unwrap();
+        assert!(vert.checked);
         assert!(!vertex_plan.iter().any(|control| matches!(control.text.as_str(), "Move Edge" | "Extrude" | "Bevel" | "Subdivide" | "4×4")));
         world.set_block_bevel(block, 0.9).unwrap();
         let featured = build(&selection, &world);
         assert!(plan(&featured, &PlanOptions::editing()).iter().any(|control| control.text == "Bevel  0.900 m"));
-        set_selected_face_label(&mut model, "+X");
-        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "+X");
+        set_selected_face_label(&mut face_model, "+X");
+        assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "+X");
         assert!(plan(&model, &PlanOptions::editing()).iter().any(|control| control.text == "Reset Shape"));
         attach_modeling_session(
             &mut model,
@@ -1878,14 +2058,30 @@ mod tests {
                 element_label: "Face",
             },
         );
-        assert!(model.section_titles().iter().any(|title| *title == "Bevel"));
+        assert!(model.section_titles().iter().any(|title| *title == "Active Tool"));
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_TOOL).unwrap().display, "Bevel");
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "All edges");
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().display, "0.600");
         assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().editable);
         let session_plan = plan(&model, &PlanOptions::editing());
-        for label in ["Amount", "0.600", "Cancel", "Apply", "Duplicate", "Align"] {
+        for label in ["Amount", "0.600", "Cancel", "Done", "Duplicate", "Align", "Auto", "Object"] {
             assert!(session_plan.iter().any(|control| control.text == label), "missing {label}");
         }
-        assert!(!session_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel" | "Move Edge" | "Subdivide" | "4×4")));
+        assert!(!session_plan.iter().any(|control| control.text == "Apply"));
+        assert!(!session_plan.iter().any(|control| {
+            matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel" | "Move Edge" | "Subdivide" | "4×4")
+                && matches!(control.binding, InspectorBinding::Command { .. })
+        }));
+        let shaped = world.create_block(jarvig_core::Vec3::new(3.0, 1.0, -4.0), jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        selection.replace(SelectionItem::entity(shaped).unwrap()).unwrap();
+        world.subdivide_block_face(shaped, 3, 2, 2).unwrap();
+        let stored = build_solid(&selection, &world, &[], &[], SolidElement::BodyFace(3), "Face");
+        assert_eq!(stored.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "F:3");
+        assert_eq!(stored.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AREA).unwrap().display, "1.000 m²");
+        assert_eq!(stored.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_NORMAL).unwrap().display, "+Y");
+        assert!(stored.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACES).unwrap().display.parse::<u32>().unwrap() > 6);
+        let grid = plan(&stored, &PlanOptions::editing());
+        assert!(grid.iter().any(|control| control.text == "Show Grid" && matches!(control.binding, InspectorBinding::ShowGrid)));
+        assert!(grid.iter().any(|control| control.text.contains("Subdivide")));
     }
 }

@@ -27,7 +27,7 @@ Auto, Object, Face, Edge, and Vertex appear in the inspector only while a parame
 | Edge | The edge under the cursor | That edge drawn thick |
 | Vertex | The vertex under the cursor | That vertex marked |
 
-Double-click promotes to the whole solid and leaves the mode alone. The whole solid shows Object Tools. A face shows Face Tools: Extrude, Inset, Bevel, Subdivide, and 4×4. An edge shows Edge Tools: Move Edge, Extrude Edge, and Split Edge. A vertex shows Move. The inspector names a stored face as `F:`, an edge as `E:`, and a vertex as `V:`. Those names are the solid's own ids.
+Double-click promotes to the whole solid and leaves the mode alone. The inspector Select row is Auto, Object, Face, Edge, and Vert. Model changes with that mode. Object shows Bevel, Reset Shape, Duplicate, Mirror, Align, and Snap. A face shows Extrude, Inset, Bevel, Subdivide, and 4×4. An edge shows Move Edge, Extrude Edge, and Split Edge. A vertex shows Move. The selected face shows its id, area, and normal above those tiles. An edge shows its id and length. Geometry lists faces, edges, vertices, and whether the solid is closed. Show Grid is in Geometry once the solid has stored faces, and it is the same switch as View > Show Grid. The inspector names a stored face as `F:`, an edge as `E:`, and a vertex as `V:`. Those names are the solid's own ids.
 
 ## Extrude, inset, and bevel
 
@@ -37,7 +37,7 @@ The three tools share one session. The toolbar icon, the Amount field, and one a
 2. Click the face you want, unless you are beveling the whole object.
 3. Click **Extrude**, **Inset**, or **Bevel**.
 4. Pull the arrow, or the face, or type an amount.
-5. Releasing the mouse commits a drag. **Apply** commits a typed amount. **Cancel** restores the solid to the moment the session opened.
+5. Releasing the mouse commits a drag. **Done** commits a typed amount. **Cancel** restores the solid to the moment the session opened. The amount, Cancel, and Done are the Active Tool card. That card closes when the operation finishes.
 
 While the session is open:
 
@@ -85,7 +85,7 @@ Move Edge and Extrude Edge are different tools.
 
 **Move**, on a vertex, moves that one point the same way Move Edge moves two.
 
-**Split Edge** puts a new vertex at the middle of the edge. **Subdivide**, on a four-sided face, replaces that face with a 2 by 2 grid of faces you can select. **4×4** does the same with sixteen faces. The toolbar Subdiv stays 2 by 2. No face selected uses +X, and the editor says so. A face that is not a quad is left alone. The original face id stays on one corner cell. Click another cell to edit that cell. Shift-click adds cells. Ctrl-click removes one.
+**Split Edge** puts a new vertex at the middle of the edge. **Subdivide** replaces a rectangular face with a 2 by 2 grid of faces you can select. **4×4** does the same with sixteen faces. A rectangle whose edges were already split by a neighbor is still a quad: those vertices stay, and the grid is fine enough to include them. The toolbar Subdiv stays 2 by 2. A selected face is the one that is divided. A selected edge or vertex uses a rectangular face of that element, the one facing the camera. No element selected uses +X, and the editor says so. A face that is not a rectangle is left alone, and the log names its corner count. The original face id stays on one corner cell. From Edge, Vertex, or Object, Subdivide switches to Face so the next click selects a face. Click another cell to edit that cell. Shift-click adds cells. Ctrl-click removes one.
 
 The same tools are on the toolbar while a solid is selected: **Subdiv**, **Edge**, **Extend**, **Split**, and **Vertex**. Subdiv and Split run when you click them. Edge, Extend, and Vertex arm a drag.
 

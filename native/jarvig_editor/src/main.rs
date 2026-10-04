@@ -240,6 +240,7 @@ const LBN_SETFOCUS: u32 = 4;
 const ES_MULTILINE: u32 = 0x0004;
 const ES_READONLY: u32 = 0x0800;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
+const BS_OWNERDRAW: u32 = 0x000B;
 const CBS_DROPDOWNLIST: u32 = 0x0003;
 const CBS_HASSTRINGS: u32 = 0x0200;
 const WS_DISABLED: u32 = 0x0800_0000;
@@ -370,6 +371,12 @@ enum SelectionMode {
     Face,
     Edge,
     Vertex,
+}
+
+enum SubdivideTarget {
+    Face(u32),
+    PlusX,
+    Refuse(String),
 }
 
 /// One open modeling operation. The viewport handle and the amount field share this state.
@@ -904,6 +911,8 @@ struct Editor {
     region_normal: [f64; 3],
     selected_edge: Option<(EntityUuid, u32)>,
     selected_vertex: Option<(EntityUuid, u32)>,
+    /// Face under the click that selected the current edge. Subdivide uses it when the edge is shared.
+    subdivide_hint: Option<(EntityUuid, u32)>,
     edge_hover: Option<u32>,
     vertex_hover: Option<u32>,
     body_face_hover: Option<u32>,
@@ -1091,6 +1100,10 @@ struct InspectorControl {
     stretch: bool,
     right_gutter: i32,
     right_slot: Option<i32>,
+    face: inspector::ControlFace,
+    row_columns: u8,
+    row_index: u8,
+    checked: bool,
 }
 
 struct ViewportHandle(HWND);
@@ -1501,6 +1514,7 @@ impl Editor {
             region_normal: [0.0; 3],
             selected_edge: None,
             selected_vertex: None,
+            subdivide_hint: None,
             edge_hover: None,
             vertex_hover: None,
             body_face_hover: None,
@@ -2161,7 +2175,7 @@ impl Editor {
     fn patch_inspector_controls(&mut self, planned: &[inspector::PlannedControl]) {
         self.inspector_applying = true;
         let focus = unsafe { GetFocus() };
-        for (control, item) in self.inspector_controls.iter().zip(planned) {
+        for (control, item) in self.inspector_controls.iter_mut().zip(planned) {
             match item.class {
                 inspector::ControlClass::Check => {
                     let want = usize::from(item.checked);
@@ -2182,7 +2196,14 @@ impl Editor {
                     }
                     set_control_text(control.hwnd, &item.text);
                 }
-                inspector::ControlClass::Label | inspector::ControlClass::Button => set_control_text(control.hwnd, &item.text),
+                inspector::ControlClass::Label | inspector::ControlClass::Button => {
+                    set_control_text(control.hwnd, &item.text);
+                    if item.face != inspector::ControlFace::Native {
+                        control.checked = item.checked;
+                        control.face = item.face;
+                        unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(control.hwnd, std::ptr::null(), 1); }
+                    }
+                }
             }
         }
         self.inspector_applying = false;
@@ -2214,6 +2235,7 @@ impl Editor {
         options.show_commands = !self.session_active();
         let terrain_selected = self.selection.primary_entity() == self.engine.world().terrain_entity() && self.engine.world().terrain_entity().is_some();
         options.show_add = !self.session_active() && self.selection.count() == 1 && (!self.land_mode || terrain_selected);
+        options.show_grid = self.show_grid;
         if self.session_active() {
             options.banner = Some(
                 if self.play == PlayPhase::Paused {
@@ -2261,7 +2283,9 @@ impl Editor {
             inspector::ControlClass::Label => 0,
             inspector::ControlClass::Edit => WS_BORDER | ES_AUTOHSCROLL | if planned.enabled { WS_TABSTOP } else { ES_READONLY },
             inspector::ControlClass::Check => BS_AUTOCHECKBOX | WS_TABSTOP,
-            inspector::ControlClass::Button => WS_TABSTOP,
+            inspector::ControlClass::Button => {
+                WS_TABSTOP | if planned.face == inspector::ControlFace::Native { 0 } else { BS_OWNERDRAW }
+            }
             inspector::ControlClass::Combo => CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
         };
         if !planned.enabled && planned.class != inspector::ControlClass::Edit {
@@ -2297,6 +2321,10 @@ impl Editor {
             stretch: planned.stretch,
             right_gutter: planned.right_gutter,
             right_slot: planned.right_slot,
+            face: planned.face,
+            row_columns: planned.row_columns,
+            row_index: planned.row_index,
+            checked: planned.checked,
         });
     }
 
@@ -2306,6 +2334,22 @@ impl Editor {
         }
         let font = if self.ui_font.is_null() { unsafe { GetStockObject(DEFAULT_GUI_FONT) as HFONT } } else { self.ui_font };
         unsafe { SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1); }
+    }
+
+    fn paint_inspector_shelf(&self, draw: &windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT) {
+        let Some(control) = self.inspector_controls.iter().find(|control| control.hwnd == draw.hwndItem) else { return };
+        let caption = window_text(draw.hwndItem);
+        let icon = match &control.binding {
+            inspector::InspectorBinding::Command { command, .. } if control.face == inspector::ControlFace::Tile => shelf_icon(*command),
+            _ => None,
+        };
+        let kind = match control.face {
+            inspector::ControlFace::Chip => chrome::ShelfPaint::Chip,
+            inspector::ControlFace::Tile => chrome::ShelfPaint::Tile,
+            inspector::ControlFace::Row | inspector::ControlFace::Native => chrome::ShelfPaint::Row,
+        };
+        let pressed = draw.itemState & 1 != 0;
+        self.toolbar_icons.paint_shelf(draw.hDC, draw.rcItem, &caption, self.ui_font, icon, control.checked, pressed, kind);
     }
 
     fn layout_inspector_controls(&mut self) {
@@ -2321,7 +2365,13 @@ impl Editor {
         let max_scroll = (self.inspector_span - height).max(0);
         self.inspector_scroll = self.inspector_scroll.clamp(0, max_scroll);
         for control in &self.inspector_controls {
-            let (x, w) = if let Some(slot) = control.right_slot {
+            let (x, w) = if control.row_columns > 1 {
+                let columns = control.row_columns as i32;
+                let gap = 4;
+                let inner = (width - 16).max(columns * 32);
+                let tile_w = ((inner - gap * (columns - 1)) / columns).max(24);
+                (8 + control.row_index as i32 * (tile_w + gap), tile_w)
+            } else if let Some(slot) = control.right_slot {
                 let w = control.width.max(24);
                 (width - 8 - (slot + 1) * (w + 4), w)
             } else if control.stretch {
@@ -2617,6 +2667,15 @@ impl Editor {
             inspector::InspectorBinding::Uniform => {
                 self.uniform_scale = unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) } == 1;
             }
+            inspector::InspectorBinding::ShowGrid => {
+                self.show_grid = unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) } == 1;
+                self.sync_view_menu();
+                self.append(if self.show_grid {
+                    "Topology grid is on. Each line is an edge of the solid."
+                } else {
+                    "Topology grid is off. Face, Edge, and Vertex modes still draw it."
+                });
+            }
             _ => {}
         }
     }
@@ -2733,6 +2792,7 @@ impl Editor {
     }
 
     fn set_selection_mode(&mut self, mode: SelectionMode) {
+        self.subdivide_hint = None;
         self.selection_mode = mode;
         match mode {
             SelectionMode::Object => self.clear_element_selection(),
@@ -2759,6 +2819,7 @@ impl Editor {
     }
 
     fn clear_element_selection(&mut self) {
+        self.subdivide_hint = None;
         let had = self.selected_face.take().is_some()
             || self.selected_body_face.take().is_some()
             || !self.selected_body_faces.is_empty()
@@ -3324,6 +3385,82 @@ impl Editor {
         }
     }
 
+    fn subdivide_target(&self, entity: EntityUuid, body: &SolidBody, divisions: u32) -> SubdivideTarget {
+        if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+            return SubdivideTarget::Face(face);
+        }
+        if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
+            return SubdivideTarget::Face(u32::from(face) + 1);
+        }
+        if let Some((_, face)) = self.subdivide_hint.filter(|(id, _)| *id == entity) {
+            if body.subdivide_resolution(face, divisions, divisions).is_ok() {
+                return SubdivideTarget::Face(face);
+            }
+        }
+        if let Some((_, edge)) = self.selected_edge.filter(|(id, _)| *id == entity) {
+            return match self.preferred_subdivide_face(entity, body, &body.faces_of_edge(edge), divisions) {
+                Some(face) => SubdivideTarget::Face(face),
+                None => SubdivideTarget::Refuse(format!("Subdivide needs a quad along edge E:{edge}.")),
+            };
+        }
+        if let Some((_, vertex)) = self.selected_vertex.filter(|(id, _)| *id == entity) {
+            return match self.preferred_subdivide_face(entity, body, &body.faces_of_vertex(vertex), divisions) {
+                Some(face) => SubdivideTarget::Face(face),
+                None => SubdivideTarget::Refuse(format!("Subdivide needs a quad at vertex V:{vertex}.")),
+            };
+        }
+        SubdivideTarget::PlusX
+    }
+
+    fn preferred_subdivide_face(&self, entity: EntityUuid, body: &SolidBody, faces: &[u32], divisions: u32) -> Option<u32> {
+        let pose = self.engine.world().entity_world_pose(entity).ok();
+        let mut best: Option<(u32, f64, f64)> = None;
+        for face in faces {
+            if body.subdivide_resolution(*face, divisions, divisions).is_err() {
+                continue;
+            }
+            let (facing, distance) = pose.as_ref().map(|pose| self.face_view_score(pose, body, *face)).unwrap_or((0.0, 0.0));
+            let replace = best.is_none_or(|(_, best_facing, best_distance)| {
+                facing > best_facing + 1.0e-3 || ((facing - best_facing).abs() <= 1.0e-3 && distance < best_distance)
+            });
+            if replace {
+                best = Some((*face, facing, distance));
+            }
+        }
+        best.map(|(face, _, _)| face)
+    }
+
+    fn face_view_score(&self, pose: &ResolvedPose, body: &SolidBody, face: u32) -> (f64, f64) {
+        let Some(positions) = body.face_positions(face) else {
+            return (f64::MIN, f64::MAX);
+        };
+        if positions.is_empty() {
+            return (f64::MIN, f64::MAX);
+        }
+        let mut sum = [0.0; 3];
+        for position in &positions {
+            sum[0] += position[0];
+            sum[1] += position[1];
+            sum[2] += position[2];
+        }
+        let scale = positions.len() as f64;
+        let world = self.world_of(pose, [sum[0] / scale, sum[1] / scale, sum[2] / scale]);
+        let Some(normal) = body.unit_normal(face) else {
+            return (f64::MIN, f64::MAX);
+        };
+        let world_normal = pose.rotation.rotate(Vec3::new(normal[0], normal[1], normal[2]));
+        let Some(camera) = self.editor_camera.as_ref() else {
+            return (0.0, 0.0);
+        };
+        let toward = vec_sub(camera.position, world);
+        let distance = vec_len(toward);
+        if distance < 1.0e-8 {
+            return (0.0, distance);
+        }
+        let facing = (world_normal.x * toward.x + world_normal.y * toward.y + world_normal.z * toward.z) / distance;
+        (facing, distance)
+    }
+
     fn subdivide_selected_face(&mut self, entity: EntityUuid, divisions: u32) {
         if self.session_active() || self.land_mode || self.character_workspace {
             self.append("Return to the level before modeling a solid.");
@@ -3341,27 +3478,40 @@ impl Editor {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         };
-        let face = if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
-            face
-        } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
-            u32::from(face) + 1
-        } else {
-            self.append("Subdivide used +X. Select a face to choose another.");
-            1
-        };
-        match body.face_len(face) {
-            Some(4) => {}
-            Some(_) => {
-                self.append("Subdivide Face needs a quad.");
+        let face = match self.subdivide_target(entity, &body, divisions) {
+            SubdivideTarget::Refuse(message) => {
+                self.append(&message);
                 return;
             }
-            None => {
+            SubdivideTarget::PlusX => {
+                self.append("Subdivide used +X. Select a face to choose another.");
+                1
+            }
+            SubdivideTarget::Face(face) => face,
+        };
+        let (u, v) = match body.subdivide_resolution(face, divisions, divisions) {
+            Ok(pair) => pair,
+            Err(jarvig_core::TopologyError::NotQuad) => {
+                let corners = body.corner_count(face).unwrap_or(0);
+                if corners == 4 {
+                    self.append(&format!("Subdivide cannot fit F:{face} under 8 divisions. Pick a smaller cell."));
+                } else {
+                    self.append(&format!("Subdivide needs a quad. F:{face} has {corners} corners."));
+                }
+                return;
+            }
+            Err(jarvig_core::TopologyError::Missing) => {
                 self.append("That element is not on the solid.");
                 return;
             }
-        }
+            Err(error) => {
+                self.append(&format!("Subdivide was not applied: {error}."));
+                return;
+            }
+        };
+        let switched = !matches!(self.selection_mode, SelectionMode::Auto | SelectionMode::Face);
         let opened = self.history_begin("Subdivide Face", &[entity]);
-        match self.engine.execute_authoring(AuthoringCommand::SubdivideBlockFace { target: entity, face, u: divisions, v: divisions }) {
+        match self.engine.execute_authoring(AuthoringCommand::SubdivideBlockFace { target: entity, face, u, v }) {
             Ok(jarvig_core::AuthoringResult::Unchanged) => {
                 if opened {
                     self.history_commit();
@@ -3372,12 +3522,17 @@ impl Editor {
                 if opened {
                     self.history_commit();
                 }
+                if switched {
+                    self.selection_mode = SelectionMode::Face;
+                }
+                self.subdivide_hint = None;
                 self.selected_face = None;
                 self.selected_body_face = Some((entity, face));
                 self.selected_body_faces = vec![face];
                 self.selected_edge = None;
                 self.selected_vertex = None;
-                self.append(&format!("Subdivided face F:{face} {divisions}×{divisions}."));
+                let follow = if switched { " Face mode is on. Click the next piece." } else { "" };
+                self.append(&format!("Subdivided face F:{face} {u}×{v}.{follow}"));
                 self.inspector_force_realize = true;
                 self.sync_outliner();
             }
@@ -7499,7 +7654,13 @@ impl Editor {
         self.note_element_pick(SelectionMode::Edge, elapsed_us(started));
         if let Some(pick) = pick {
             self.note_edge(entity, pick.id);
+        } else if let Some(face) = body.pick_face(origin, direction) {
+            if let Some(edge) = body.closest_edge_of_face(face.id, origin, direction) {
+                self.note_edge(entity, edge);
+                self.subdivide_hint = Some((entity, face.id));
+            }
         } else {
+            self.subdivide_hint = None;
             self.selected_edge = None;
             self.selected_face = None;
             self.selected_body_face = None;
@@ -7548,6 +7709,15 @@ impl Editor {
             self.note_element_pick(SelectionMode::Face, elapsed_us(started));
             if let Some(pick) = pick {
                 self.note_body_face(entity, pick.id, ctrl, shift);
+            } else {
+                let local = pose.rotation.conjugate().rotate(Vec3::new(
+                    point.x - pose.translation.x,
+                    point.y - pose.translation.y,
+                    point.z - pose.translation.z,
+                ));
+                if let Some(face) = body.nearest_face([local.x, local.y, local.z], 0.02) {
+                    self.note_body_face(entity, face, ctrl, shift);
+                }
             }
             return;
         }
@@ -7743,6 +7913,7 @@ impl Editor {
     }
 
     fn note_body_face(&mut self, entity: EntityUuid, face: u32, ctrl: bool, shift: bool) {
+        self.subdivide_hint = None;
         self.selected_face = None;
         self.selected_edge = None;
         self.selected_vertex = None;
@@ -7779,6 +7950,7 @@ impl Editor {
     }
 
     fn note_edge(&mut self, entity: EntityUuid, edge: u32) {
+        self.subdivide_hint = None;
         let next = Some((entity, edge));
         self.selected_face = None;
         self.selected_body_face = None;
@@ -7792,6 +7964,7 @@ impl Editor {
     }
 
     fn note_vertex(&mut self, entity: EntityUuid, vertex: u32) {
+        self.subdivide_hint = None;
         let next = Some((entity, vertex));
         self.selected_face = None;
         self.selected_body_face = None;
@@ -15098,6 +15271,7 @@ impl Editor {
             ID_VIEW_GRID => {
                 self.show_grid = !self.show_grid;
                 self.sync_view_menu();
+                self.realize_inspector_controls();
                 self.append(if self.show_grid {
                     "Topology grid is on. Each line is an edge of the solid."
                 } else {
@@ -15506,6 +15680,21 @@ fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
         }
         ModelingTool::Inset | ModelingTool::Bevel => amount.clamp(0.0, jarvig_core::feature_limit(session.baseline_size)),
         ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => session.amount,
+    }
+}
+
+fn shelf_icon(command: inspector::InspectorCommand) -> Option<chrome::ToolbarCommand> {
+    use chrome::ToolbarCommand::{Bevel, Extrude, ExtrudeEdge, Inset, MoveEdge, MoveVertex, SplitEdge, Subdivide};
+    match command {
+        inspector::InspectorCommand::ExtrudeFace => Some(Extrude),
+        inspector::InspectorCommand::InsetFace | inspector::InspectorCommand::EditInset(_) => Some(Inset),
+        inspector::InspectorCommand::Bevel | inspector::InspectorCommand::EditBevel => Some(Bevel),
+        inspector::InspectorCommand::SubdivideFace | inspector::InspectorCommand::SubdivideFace4 => Some(Subdivide),
+        inspector::InspectorCommand::MoveEdge => Some(MoveEdge),
+        inspector::InspectorCommand::ExtrudeEdge => Some(ExtrudeEdge),
+        inspector::InspectorCommand::SplitEdge => Some(SplitEdge),
+        inspector::InspectorCommand::MoveVertex => Some(MoveVertex),
+        _ => None,
     }
 }
 
@@ -17349,6 +17538,16 @@ unsafe extern "system" fn inspector_proc(hwnd: HWND, message: u32, wparam: WPARA
                 editor.on_inspector_wheel(wparam);
             }
             0
+        }
+        WM_DRAWITEM => {
+            let draw = &*(lparam as *mut windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT);
+            if draw.CtlType == 4 {
+                if let Some(editor) = editor {
+                    editor.paint_inspector_shelf(draw);
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_COMMAND => {
             let notify = (wparam >> 16) as u32;
