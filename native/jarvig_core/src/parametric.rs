@@ -83,6 +83,8 @@ pub enum BlockOp {
     SubdivideFace { face: u32, u: u32, v: u32 },
     /// One vertex moved. Loops that already contain it stay connected.
     MoveVertex { vertex: u32, delta_m: [f64; 3] },
+    /// The named faces move by one vector. Each boundary edge gains a wall. The log is not replayed.
+    ExtrudeFaces { faces: Vec<u32>, delta_m: [f64; 3] },
 }
 
 impl BlockOp {
@@ -98,13 +100,25 @@ impl BlockOp {
             Self::SplitEdge { edge } => format!("Split edge E:{edge}"),
             Self::SubdivideFace { face, u, v } => format!("Subdivide face F:{face} {u}×{v}"),
             Self::MoveVertex { vertex, delta_m } => format!("Move vertex V:{vertex} {}", meters(delta_span(*delta_m))),
+            Self::ExtrudeFaces { faces, delta_m } => {
+                if faces.len() == 1 {
+                    format!("Extrude face F:{} {}", faces[0], meters(delta_span(*delta_m)))
+                } else {
+                    format!("Extrude {} faces {}", faces.len(), meters(delta_span(*delta_m)))
+                }
+            }
         }
     }
 
     pub(crate) fn is_topology(&self) -> bool {
         matches!(
             self,
-            Self::MoveEdge { .. } | Self::ExtrudeEdge { .. } | Self::SplitEdge { .. } | Self::SubdivideFace { .. } | Self::MoveVertex { .. }
+            Self::MoveEdge { .. }
+                | Self::ExtrudeEdge { .. }
+                | Self::SplitEdge { .. }
+                | Self::SubdivideFace { .. }
+                | Self::MoveVertex { .. }
+                | Self::ExtrudeFaces { .. }
         )
     }
 
@@ -118,6 +132,13 @@ impl BlockOp {
             Self::SplitEdge { edge } => *edge != 0,
             Self::SubdivideFace { face, u, v } => *face != 0 && (1..=crate::topology::SUBDIVIDE_MAX).contains(u) && (1..=crate::topology::SUBDIVIDE_MAX).contains(v),
             Self::MoveVertex { vertex, delta_m } => *vertex != 0 && delta_m.iter().all(|axis| axis.is_finite()),
+            Self::ExtrudeFaces { faces, delta_m } => {
+                !faces.is_empty()
+                    && faces.iter().all(|id| *id != 0)
+                    && faces.iter().enumerate().all(|(index, id)| !faces[..index].contains(id))
+                    && delta_m.iter().all(|axis| axis.is_finite())
+                    && delta_m.iter().any(|axis| axis.abs() >= 1.0e-9)
+            }
         }
     }
 }
@@ -1141,6 +1162,111 @@ mod tests {
         assert!(again.body.as_ref().unwrap().edges.iter().any(|edge| edge.id == 12));
         assert!(world.push_block_face(id, 0, [2.0, 2.0, 2.0], Vec3::new(0.0, 1.0, -4.0), 0.25).is_err());
         assert!(world.set_block_bevel(id, 0.1).is_err());
+    }
+
+    #[test]
+    fn a_subdivided_face_extrudes_twice_and_reloads_as_the_same_body() {
+        let document = empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        assert_eq!(world.subdivide_block_face(id, 3, 4, 4).unwrap(), crate::AuthoringResult::Applied);
+        let divided = world.authored_block(id).unwrap().body.unwrap();
+        let cap = divided
+            .faces
+            .iter()
+            .find(|face| {
+                divided.unit_normal(face.id).unwrap()[1] > 0.9
+                    && divided.face_positions(face.id).unwrap().iter().all(|position| position[0].abs() <= 0.51 && position[2].abs() <= 0.51)
+            })
+            .unwrap()
+            .id;
+        let before_faces = divided.faces.len();
+        let before_vertices = divided.vertices.len();
+        assert_eq!(world.extrude_block_faces(id, &[cap], [0.0, 0.4, 0.0]).unwrap(), crate::AuthoringResult::Applied);
+        let raised = world.authored_block(id).unwrap();
+        assert!(matches!(raised.history.last(), Some(BlockOp::ExtrudeFaces { faces, .. }) if faces.as_slice() == [cap]));
+        let raised_body = raised.body.unwrap();
+        assert_eq!(raised_body.faces.len(), before_faces + 4);
+        assert!(raised_body.vertices.len() > before_vertices);
+        raised_body.validate().unwrap();
+        let cap_loop = raised_body.face_loop(cap).unwrap().to_vec();
+        let cap_y = raised_body.face_positions(cap).unwrap().iter().map(|position| position[1]).sum::<f64>() / cap_loop.len() as f64;
+        let neighbor_id = raised_body
+            .faces
+            .iter()
+            .find(|face| face.id != cap && raised_body.unit_normal(face.id).unwrap()[1] > 0.9)
+            .unwrap()
+            .id;
+        let neighbor_positions = raised_body.face_positions(neighbor_id).unwrap();
+        let neighbor_y = neighbor_positions.iter().map(|position| position[1]).sum::<f64>() / neighbor_positions.len() as f64;
+        assert!((cap_y - neighbor_y - 0.4).abs() < 1.0e-6, "{cap_y} {neighbor_y}");
+        assert_eq!(raised_body.face_loop(neighbor_id).unwrap().iter().filter(|vertex| cap_loop.contains(vertex)).count(), 0);
+        let side = raised_body
+            .faces
+            .iter()
+            .find(|face| {
+                let cap_loop = raised_body.face_loop(cap).unwrap();
+                let shared = face.vertices.iter().filter(|vertex| cap_loop.contains(vertex)).count();
+                face.id != cap && shared == 2 && raised_body.unit_normal(face.id).unwrap()[1].abs() < 0.2
+            })
+            .unwrap()
+            .id;
+        let normal = raised_body.unit_normal(side).unwrap();
+        assert_eq!(
+            world.extrude_block_faces(id, &[side], [normal[0] * 0.4, normal[1] * 0.4, normal[2] * 0.4]).unwrap(),
+            crate::AuthoringResult::Applied
+        );
+        let edited = world.authored_block(id).unwrap();
+        let face_count = edited.body.as_ref().unwrap().faces.len();
+        let vertex_ids: Vec<u32> = edited.body.as_ref().unwrap().vertices.iter().map(|vertex| vertex.id).collect();
+        let edge_ids: Vec<u32> = edited.body.as_ref().unwrap().edges.iter().map(|edge| edge.id).collect();
+        let face_ids: Vec<u32> = edited.body.as_ref().unwrap().faces.iter().map(|face| face.id).collect();
+        assert!(face_ids.contains(&cap) && face_ids.contains(&side));
+        assert_eq!(edited.history.iter().filter(|op| matches!(op, BlockOp::ExtrudeFaces { .. })).count(), 2);
+        let mesh_id = world.object_mesh(id).unwrap();
+        let mesh = world.meshes().get(mesh_id).unwrap();
+        let set = world.derived_meshlets(mesh_id).unwrap();
+        let coverage = crate::meshlet_coverage(mesh, set);
+        assert_eq!(coverage.missing_triangles, 0);
+        assert_eq!(coverage.duplicate_triangles, 0);
+        assert!(coverage.canonical_triangles >= 12);
+        let json = LevelDocument::capture(&world, document.level_uuid, "Extrude").unwrap().to_json();
+        assert!(json.contains("\"body\"") && json.contains("extrude-faces") && json.contains("subdivide-face"));
+        let loaded = parse_level(&json).unwrap().instantiate().unwrap();
+        let again = loaded.authored_block(id).unwrap();
+        let loaded_body = again.body.unwrap();
+        loaded_body.validate().unwrap();
+        assert_eq!(loaded_body.faces.len(), face_count);
+        assert_eq!(loaded_body.vertices.iter().map(|vertex| vertex.id).collect::<Vec<_>>(), vertex_ids);
+        assert_eq!(loaded_body.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(), edge_ids);
+        assert_eq!(loaded_body.faces.iter().map(|face| face.id).collect::<Vec<_>>(), face_ids);
+        assert_eq!(again.history.len(), edited.history.len());
+        assert!(again.history.iter().any(|op| matches!(op, BlockOp::SubdivideFace { face: 3, u: 4, v: 4 })));
+        assert_eq!(again.history.iter().filter(|op| matches!(op, BlockOp::ExtrudeFaces { .. })).count(), 2);
+        let reloaded_mesh = loaded.object_mesh(id).unwrap();
+        let reloaded_set = loaded.derived_meshlets(reloaded_mesh).unwrap();
+        let reloaded_coverage = crate::meshlet_coverage(loaded.meshes().get(reloaded_mesh).unwrap(), reloaded_set);
+        assert_eq!(reloaded_coverage.missing_triangles, 0);
+        assert_eq!(reloaded_coverage.duplicate_triangles, 0);
+        assert_eq!(reloaded_coverage.canonical_triangles, coverage.canonical_triangles);
+        let mesh_ref = loaded.meshes().get(reloaded_mesh).unwrap();
+        let facts = crate::SurfaceDetailFacts {
+            opaque: true,
+            skinned: false,
+            ui: false,
+            particle: false,
+            bounds_min: mesh_ref.bounds().aabb.min,
+            bounds_max: mesh_ref.bounds().aabb.max,
+            exact: true,
+        };
+        assert!(crate::microgeometry_active(crate::MicrogeometryMode::Auto, &facts));
+        let clusters = vec![
+            crate::DetailCluster { flag: 1, projected_px: 5.0, compatible: true, has_anchor: true, exact: true };
+            reloaded_set.meshlets.len()
+        ];
+        let reasons = crate::select_detail_clusters(&clusters, 256);
+        assert!(reasons.iter().all(|reason| *reason == crate::DetailReject::Exact));
+        assert_eq!(reasons.iter().filter(|reason| **reason == crate::DetailReject::Selected).count(), 0);
     }
 
     #[test]

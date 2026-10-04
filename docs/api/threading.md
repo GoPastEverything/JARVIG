@@ -10,7 +10,7 @@ Every public operation states where it may run. An unstated thread is a bug in t
 | Job | Safe inside the engine job system, once that system exists. Not a license to spawn an OS thread and touch the world. |
 | Async | The call only starts work. Completion is a request handle. |
 
-The in-process queue is `JobManager` in `jarvig_core`. ADR-0052. Workers are the Job class. They do not mutate the world and they do not create GPU resources. The host publishes a finished result on the simulation and render thread. `JARVIGWorker.exe` is not built.
+The in-process queue is `JobManager` in `jarvig_core`. ADR-0052. Workers are the Job class. They do not mutate the world and they do not create GPU resources. The host publishes a finished result on the simulation and render thread. `JARVIGWorker.exe` is not built. Einstein surface builds use a sibling `JobManager` with one worker, `jarvig-einstein-0`. Parent-mesh LOD, registry scans, and terrain stay on the general pool. ADR-0071. The editor's combined worker count stays at most four. That worker still does not mutate the world or create GPU resources.
 
 - World mutation is simulation-thread only.
 - GPU resource creation is render-thread only, which is that same thread.

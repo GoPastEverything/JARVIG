@@ -574,6 +574,8 @@ pub struct Renderer {
     micro_inflight_key: u64,
     micro_stage: &'static str,
     micro_queue_wait_us: u32,
+    micro_classify_us: u32,
+    micro_host_wait_us: u32,
     micro_publish_us: u32,
     micro_cancelled: u32,
     micro_stale_discarded: u32,
@@ -775,6 +777,10 @@ pub struct GpuSceneFrameStats {
     /// Largest normal displacement, in micrometers, so the stat stays an integer.
     pub micro_max_displacement_um: u32,
     pub micro_queue_wait_us: u32,
+    /// Cluster classification on the frame thread, before a build is queued.
+    pub micro_classify_us: u32,
+    /// Time a finished build sat before the frame thread accepted it.
+    pub micro_host_wait_us: u32,
     pub micro_cancelled: u32,
     pub micro_stale_discarded: u32,
     pub micro_publish_us: u32,
@@ -1662,6 +1668,8 @@ impl Renderer {
             micro_inflight_key: 0,
             micro_stage: "Ready",
             micro_queue_wait_us: 0,
+            micro_classify_us: 0,
+            micro_host_wait_us: 0,
             micro_publish_us: 0,
             micro_cancelled: 0,
             micro_stale_discarded: 0,
@@ -1865,6 +1873,12 @@ impl Renderer {
     pub fn note_micro_cancelled(&mut self) {
         self.micro_cancelled = self.micro_cancelled.saturating_add(1);
         self.gpu_scene.stats.micro_cancelled = self.micro_cancelled;
+    }
+
+    /// Host delay between the worker finishing and this thread taking the mesh. Not the GPU upload.
+    pub fn note_micro_host_wait(&mut self, microseconds: u32) {
+        self.micro_host_wait_us = microseconds;
+        self.gpu_scene.stats.micro_host_wait_us = microseconds;
     }
 
     /// The worker finished without a mesh the renderer kept. The next frame may request that key again.

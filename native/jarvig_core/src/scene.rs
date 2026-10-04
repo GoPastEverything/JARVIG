@@ -10,6 +10,20 @@
 
 use std::collections::HashSet;
 
+std::thread_local! {
+    static LAST_BLOCK_REBUILD_US: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Microseconds spent rebuilding the last derived block mesh on this thread.
+pub fn last_block_rebuild_us() -> u32 {
+    LAST_BLOCK_REBUILD_US.with(|slot| slot.get())
+}
+
+fn note_block_rebuild(started: std::time::Instant) {
+    let micros = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+    LAST_BLOCK_REBUILD_US.with(|slot| slot.set(micros));
+}
+
 use jarvig_material::MaterialInstanceId;
 
 use crate::level::{CameraRecord, LightRecord, MaterialAssetRef, MeshAssetRef, ProbeRecord, WorldSettingsRecord};
@@ -3554,6 +3568,17 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.store_topology_edit(id, |body| body.subdivide_face(face, u, v), crate::BlockOp::SubdivideFace { face, u, v })
     }
 
+    /// Moves the named faces and adds a wall on each boundary edge. Records the edit.
+    pub fn extrude_block_faces(&mut self, id: EntityId, faces: &[u32], delta: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
+        let owned = faces.to_vec();
+        let logged = owned.clone();
+        self.store_topology_edit(
+            id,
+            move |body| body.extrude_faces(&owned, delta),
+            crate::BlockOp::ExtrudeFaces { faces: logged, delta_m: delta },
+        )
+    }
+
     fn refuse_body(&self, index: usize) -> Result<(), AuthoringError> {
         if self.blocks[index].record.body.is_some() {
             Err(AuthoringError::InvalidOperation)
@@ -3623,8 +3648,10 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     fn install_block(&mut self, handle: EntityHandle, frame: FrameId, record: crate::BlockRecord) -> Result<(), AuthoringError> {
+        let started = std::time::Instant::now();
         let mesh = self.meshes.insert(block_mesh(&record));
         self.attach_derived_meshlets(mesh);
+        note_block_rebuild(started);
         let object = self.insert_object_with_handle(mesh, frame, Vec3::new(1.0, 1.0, 1.0), handle);
         if let Some(slot) = self.objects.iter_mut().find(|slot| slot.id == object) {
             slot.authored_mesh = None;
@@ -3639,9 +3666,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     fn rebuild_block_mesh(&mut self, index: usize) -> Result<(), AuthoringError> {
+        let started = std::time::Instant::now();
         let handle = self.blocks[index].handle;
         let mesh = self.meshes.insert(block_mesh(&self.blocks[index].record));
         self.attach_derived_meshlets(mesh);
+        note_block_rebuild(started);
         let object = self.objects.iter_mut().find(|object| object.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
         let previous = object.mesh;
         object.mesh = mesh;

@@ -176,7 +176,7 @@ pub use parametric::{
     snap_translation, swap_insets, BlockOp, BlockRecord, BlockSolid, FacePush, ReferenceSegment, BLOCK_DIMENSION_SNAP_M, BLOCK_EXTRUDE_STEP_M, BLOCK_HISTORY_LIMIT,
     BLOCK_INSET_STEP_M, BLOCK_MAX_EXTENT_M, BLOCK_MIN_EXTENT_M, BLOCK_POSITION_SNAP_M, FLY_COLLISION_RADIUS_M, REFERENCE_GRID_Y_M,
 };
-pub use topology::{SolidBody, SolidEdge, SolidFace, SolidVertex, TopologyEdit, TopologyError, TopologyPick, SUBDIVIDE_MAX};
+pub use topology::{last_solid_validate_us, SolidBody, SolidEdge, SolidFace, SolidVertex, TopologyEdit, TopologyError, TopologyPick, SUBDIVIDE_MAX};
 pub use player::{
     apply_player_start_property, compose_spawn_rotation, parse_player, parse_player_start_fields, player_start_lines, validate_relative_asset, PlayerDocument, PlayerStartRecord,
     PLAYER_FORMAT_VERSION, PLAYER_SCHEMA,
@@ -195,7 +195,7 @@ pub use project::{
     save_project_atomic, ProjectDocument, ProjectError, LIGHTING_LAB_PROJECT_UUID, PROJECT_FORMAT_VERSION, PROJECT_SCHEMA,
 };
 pub use scene::{
-    instance_gpu_transforms, AuthoringCapabilities, CameraId, ComponentBinding, ComponentQueryHit, ComponentRole, EntityCapabilities, EntityFocus, EntityOwnership, ExtractedCamera, ExtractedGameCamera, FocusError, JointDebugSegment, JointId, LandDrawClass, MaterialSlotBinding, MementoEffect, ObjectId,
+    instance_gpu_transforms, last_block_rebuild_us, AuthoringCapabilities, CameraId, ComponentBinding, ComponentQueryHit, ComponentRole, EntityCapabilities, EntityFocus, EntityOwnership, ExtractedCamera, ExtractedGameCamera, FocusError, JointDebugSegment, JointId, LandDrawClass, MaterialSlotBinding, MementoEffect, ObjectId,
     RenderFrameId, RenderInstance, RenderInstanceId, RenderSceneSnapshot, SceneWorld, TerrainSurfaceMetrics,
 };
 pub use jarvig_material::{ColorSpace, MaterialInstanceId};

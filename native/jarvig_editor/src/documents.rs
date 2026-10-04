@@ -640,8 +640,8 @@ impl Editor {
             let _ = self.jobs.take_result::<jarvig_core::ParentGeometry>(job.id);
         }
         if let Some(job) = cancel_micro {
-            self.jobs.cancel(job.id);
-            let _ = self.jobs.take_result::<super::MicroJobProduct>(job.id);
+            self.einstein_jobs.cancel(job.id);
+            let _ = self.einstein_jobs.take_result::<super::MicroJobProduct>(job.id);
         }
         if let Some(renderer) = self.renderer.as_mut() {
             if let Err(error) = renderer.release_world_scene() {

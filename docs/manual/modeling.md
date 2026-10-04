@@ -27,7 +27,7 @@ Auto, Object, Face, Edge, and Vertex appear in the inspector only while a parame
 | Edge | The edge under the cursor | That edge drawn thick |
 | Vertex | The vertex under the cursor | That vertex marked |
 
-Double-click promotes to the whole solid and leaves the mode alone. The whole solid shows Object Tools. A face shows Face Tools: Extrude, Inset, Bevel, and Subdivide. An edge shows Edge Tools: Move Edge, Extrude Edge, and Split Edge. A vertex shows Move. The inspector names a stored face as `F:`, an edge as `E:`, and a vertex as `V:`. Those names are the solid's own ids.
+Double-click promotes to the whole solid and leaves the mode alone. The whole solid shows Object Tools. A face shows Face Tools: Extrude, Inset, Bevel, Subdivide, and 4×4. An edge shows Edge Tools: Move Edge, Extrude Edge, and Split Edge. A vertex shows Move. The inspector names a stored face as `F:`, an edge as `E:`, and a vertex as `V:`. Those names are the solid's own ids.
 
 ## Extrude, inset, and bevel
 
@@ -85,13 +85,17 @@ Move Edge and Extrude Edge are different tools.
 
 **Move**, on a vertex, moves that one point the same way Move Edge moves two.
 
-**Split Edge** puts a new vertex at the middle of the edge. **Subdivide**, on a four-sided face, replaces that face with a 2 by 2 grid of faces you can select. No face selected uses +X, and the editor says so. A face that is not a quad is left alone.
+**Split Edge** puts a new vertex at the middle of the edge. **Subdivide**, on a four-sided face, replaces that face with a 2 by 2 grid of faces you can select. **4×4** does the same with sixteen faces. The toolbar Subdiv stays 2 by 2. No face selected uses +X, and the editor says so. A face that is not a quad is left alone. The original face id stays on one corner cell. Click another cell to edit that cell. Shift-click adds cells. Ctrl-click removes one.
 
 The same tools are on the toolbar while a solid is selected: **Subdiv**, **Edge**, **Extend**, **Split**, and **Vertex**. Subdiv and Split run when you click them. Edge, Extend, and Vertex arm a drag.
 
 Select the edge or vertex first. With Move active, the red, green, and blue arrows sit on that element. Pull an arrow the way you move a whole object. Releasing the mouse commits. Extend pulls a new face out along that arrow. You can also press in the view and drag, the way Extrude drags its arrow. Escape or a right-click during the drag restores the solid and records nothing. Ctrl+Z undoes the committed drag.
 
-Clear a bevel and any inset before an edge edit. After the solid stores its faces and edges, Extrude, Inset, and Bevel on that solid ask you to move edges, or to use Reset Shape to return to the box.
+Clear a bevel and any inset before an edge edit. After the solid stores its faces and edges, Inset and Bevel ask you to use Reset Shape to return to the box. Extrude pulls the faces you have selected. One interior cell of a 4×4 top can come up on its own. The cap you pulled, and the new side faces around it, can be selected and extruded again. The solid stays closed. Two faces that meet still share one edge, so moving that edge moves both.
+
+**View > Show Grid** draws every stored edge, including while the whole object is selected. Face, Edge, and Vertex draw those edges on their own. Object mode stays a clean box until you turn the grid on. The lines are the editable cage. They are not the dense surface the renderer may draw later. The cage draws every edge, including after many subdivisions.
+
+Face and Auto on a stored body do not cover the cells with the object Move arrows. Switch to Object to move the whole solid. While an Extrude arrow is up, a click drags that region or does nothing. Escape, then click, selects a different cell. A click that misses the shaded triangle can still select the cell the ray enters.
 
 Loop cut, knife, dissolve, connect, and a separate chamfer are not in this build.
 

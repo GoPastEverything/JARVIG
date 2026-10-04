@@ -119,6 +119,11 @@ pub struct JobManager {
 
 impl JobManager {
     pub fn new(workers: usize) -> Self {
+        Self::named("jarvig-job", workers)
+    }
+
+    /// A second pool does not see the first pool's queue. The editor keeps the sum of workers at most four.
+    pub fn named(prefix: &str, workers: usize) -> Self {
         let workers = workers.clamp(1, 4);
         let inner = Arc::new(Mutex::new(Inner { next: 1, shutdown: false, jobs: BTreeMap::new(), queue: VecDeque::new() }));
         let wake = Arc::new(Condvar::new());
@@ -126,14 +131,25 @@ impl JobManager {
         for index in 0..workers {
             let inner = Arc::clone(&inner);
             let wake = Arc::clone(&wake);
+            let name = format!("{prefix}-{index}");
             let handle = thread::Builder::new()
-                .name(format!("jarvig-job-{index}"))
+                .name(name)
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || worker_loop(inner, wake))
                 .expect("job worker");
             threads.push(handle);
         }
         Self { inner, wake, threads }
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.threads.len()
+    }
+
+    /// Workers that have taken a job and have not finished it.
+    pub fn busy_count(&self) -> usize {
+        let guard = self.inner.lock().expect("job queue");
+        guard.jobs.values().filter(|job| matches!(job.state, JobState::Running | JobState::CancelRequested)).count()
     }
 
     pub fn submit<T, F>(&self, desc: JobDesc, work: F) -> JobId
@@ -424,6 +440,23 @@ mod tests {
         assert_eq!(snap.cache_key.as_deref(), Some("asset:fingerprint:v1"));
         manager.cancel(blocker);
         wait_until(&manager, blocker, |snap| snap.state.finished());
+    }
+
+    #[test]
+    fn two_managers_do_not_share_a_queue() {
+        let general = JobManager::named("jarvig-job", 1);
+        let einstein = JobManager::named("jarvig-einstein", 1);
+        assert_eq!(general.worker_count(), 1);
+        assert_eq!(einstein.worker_count(), 1);
+        assert_eq!(general.busy_count(), 0);
+        let id = einstein.submit(JobDesc { name: "Build Einstein Surface".into(), asset: None, cache_key: Some("micro:1".into()), dependencies: Vec::new() }, |_ctx| {
+            Ok::<u32, String>(3)
+        });
+        let snap = wait_until(&einstein, id, |snap| snap.state == JobState::Completed);
+        assert_eq!(snap.name, "Build Einstein Surface");
+        assert!(general.snapshots().is_empty());
+        assert_eq!(einstein.take_result::<u32>(id).unwrap().unwrap(), 3);
+        assert_eq!(einstein.busy_count(), 0);
     }
 
     #[test]

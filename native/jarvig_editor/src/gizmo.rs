@@ -312,6 +312,18 @@ pub fn operation_handle_vertices(
     vertices
 }
 
+/// Arrow for a region extrude. `direction` is already in world space.
+pub fn region_arrow_vertices(center: Vec3, direction: Vec3, camera: Vec3, length: f64, active: bool) -> Vec<OverlayVertex> {
+    let mut vertices = Vec::new();
+    let Some(direction) = normalize(direction) else { return vertices };
+    let color = if active { [1.0, 0.95, 0.55, 1.0] } else { [0.20, 0.78, 0.28, 1.0] };
+    let end = center + direction.scale(length * 0.62);
+    let tip = center + direction.scale(length * 0.92);
+    push_box(&mut vertices, center, camera, end, length * 0.02, color);
+    push_cone(&mut vertices, center, camera, end, tip, length * 0.07, color);
+    vertices
+}
+
 pub fn scalar_along(delta: Vec3, axis: Vec3) -> f64 {
     dot(delta, axis)
 }

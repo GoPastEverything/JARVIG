@@ -13,6 +13,26 @@ const MIN_DELTA_M: f64 = 1.0e-9;
 const INTERIOR_EPS: f64 = 1.0e-4;
 /// A segment parallel to a triangle is not a pierce.
 const PARALLEL_EPS: f64 = 1.0e-12;
+/// Step used to see whether a sweep walks into a neighbor or off its boundary.
+const SWEEP_PROBE_M: f64 = 1.0e-3;
+/// A pick this close to a stored edge still belongs to that face. Shared grid lines are not misses.
+const PICK_BOUNDARY_M: f64 = 1.0e-5;
+
+std::thread_local! {
+    static LAST_SOLID_VALIDATE_US: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Microseconds spent in the last `validate` on this thread. The editor reads it after an edit.
+pub fn last_solid_validate_us() -> u32 {
+    LAST_SOLID_VALIDATE_US.with(|slot| slot.get())
+}
+
+/// Where a point sits relative to one face.
+enum FacePlace {
+    Outside,
+    Boundary,
+    Inside,
+}
 /// Subdivision factors above this are refused. One means the face is unchanged.
 pub const SUBDIVIDE_MAX: u32 = 8;
 
@@ -140,6 +160,14 @@ impl SolidBody {
 
     /// Closed manifold: two faces per ordinary edge, opposite windings, no crack and no collapse.
     pub fn validate(&self) -> Result<(), TopologyError> {
+        let started = std::time::Instant::now();
+        let result = self.validate_manifold();
+        let micros = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        LAST_SOLID_VALIDATE_US.with(|slot| slot.set(micros));
+        result
+    }
+
+    fn validate_manifold(&self) -> Result<(), TopologyError> {
         if self.next_id == 0 || self.vertices.is_empty() || self.edges.is_empty() || self.faces.is_empty() {
             return Err(TopologyError::Torn);
         }
@@ -455,6 +483,162 @@ impl SolidBody {
         body.finish()
     }
 
+    /// Moves the selected faces by `delta` and keeps one closed solid.
+    ///
+    /// The selected ids stay on the caps. Each boundary vertex is duplicated once and shared by
+    /// every selected face that used it. A vertex whose whole fan is selected moves in place.
+    /// A sweep that leaves the neighbor grows a wall quad. A sweep that stays on that neighbor
+    /// trims the neighbor to the new edge instead, so the two faces share it and the overlapped
+    /// strip is not a second polygon.
+    pub fn extrude_faces(&self, faces: &[u32], delta: [f64; 3]) -> Result<TopologyEdit, TopologyError> {
+        if !usable_delta(delta) {
+            return Err(TopologyError::Degenerate);
+        }
+        if faces.is_empty() {
+            return Err(TopologyError::Missing);
+        }
+        let mut selected = Vec::with_capacity(faces.len());
+        for id in faces {
+            if *id == 0 || selected.contains(id) {
+                return Err(TopologyError::Degenerate);
+            }
+            if self.faces.iter().all(|face| face.id != *id) {
+                return Err(TopologyError::Missing);
+            }
+            selected.push(*id);
+        }
+        let mut body = self.clone();
+        let mut boundary: Vec<(u32, u32, u32)> = Vec::new();
+        let mut interior: Vec<u32> = Vec::new();
+        for edge in &body.edges {
+            let incidents = body.incident_face_indexes(edge.a, edge.b);
+            let selected_hits = incidents.iter().filter(|index| selected.contains(&body.faces[**index].id)).count();
+            if selected_hits == 0 {
+                continue;
+            }
+            if selected_hits > 2 || incidents.len() != 2 {
+                return Err(TopologyError::Torn);
+            }
+            if selected_hits == 2 {
+                interior.push(edge.id);
+                continue;
+            }
+            let face_index = incidents.iter().copied().find(|index| selected.contains(&body.faces[*index].id)).ok_or(TopologyError::Torn)?;
+            let neighbor_index = incidents.into_iter().find(|index| !selected.contains(&body.faces[*index].id)).ok_or(TopologyError::Torn)?;
+            let neighbor = body.faces[neighbor_index].id;
+            let loop_ = &body.faces[face_index].vertices;
+            let count = loop_.len();
+            let directed = (0..count).find_map(|index| {
+                let start = loop_[index];
+                let end = loop_[(index + 1) % count];
+                ((start == edge.a && end == edge.b) || (start == edge.b && end == edge.a)).then_some((start, end, neighbor))
+            });
+            boundary.push(directed.ok_or(TopologyError::Torn)?);
+        }
+        let mut degree: Vec<(u32, u32)> = Vec::new();
+        for (start, end, _) in &boundary {
+            for vertex in [*start, *end] {
+                if let Some(slot) = degree.iter_mut().find(|(id, _)| *id == vertex) {
+                    slot.1 += 1;
+                } else {
+                    degree.push((vertex, 1));
+                }
+            }
+        }
+        // A boundary vertex with any count other than two is a branch, a touch, or a crack.
+        // One duplicate would then be asked to close more than two walls.
+        if degree.iter().any(|(_, count)| *count != 2) {
+            return Err(TopologyError::Torn);
+        }
+        let mut used = Vec::new();
+        for id in &selected {
+            let loop_ = body.face_loop(*id).ok_or(TopologyError::Missing)?;
+            for vertex in loop_ {
+                if !used.contains(vertex) {
+                    used.push(*vertex);
+                }
+            }
+        }
+        let mut map: Vec<(u32, u32)> = Vec::with_capacity(used.len());
+        for vertex in used {
+            if degree.iter().any(|(id, _)| *id == vertex) {
+                let position = add(body.vertex_position(vertex).ok_or(TopologyError::Missing)?, delta);
+                // Landing on a corner that is already there reuses it. A fresh vertex on that
+                // spot would be a zero-length edge or a T-junction.
+                let existing = body
+                    .vertices
+                    .iter()
+                    .find(|entry| entry.id != vertex && distance(entry.position, position) < MIN_EDGE_M)
+                    .map(|entry| entry.id);
+                if let Some(id) = existing {
+                    map.push((vertex, id));
+                } else {
+                    let id = body.alloc()?;
+                    body.vertices.push(SolidVertex { id, position });
+                    map.push((vertex, id));
+                }
+            } else {
+                body.translate(vertex, delta)?;
+                map.push((vertex, vertex));
+            }
+        }
+        let mapped = |map: &[(u32, u32)], id: u32| map.iter().find(|(old, _)| *old == id).map(|(_, new)| *new).ok_or(TopologyError::Torn);
+        for face in &mut body.faces {
+            if !selected.contains(&face.id) {
+                continue;
+            }
+            for vertex in &mut face.vertices {
+                *vertex = mapped(&map, *vertex)?;
+            }
+        }
+        // Interior edges move with the caps. Leaving the old endpoints would orphan the record.
+        for edge_id in interior {
+            let edge = body.edges.iter_mut().find(|edge| edge.id == edge_id).ok_or(TopologyError::Torn)?;
+            edge.a = mapped(&map, edge.a)?;
+            edge.b = mapped(&map, edge.b)?;
+        }
+        let mut carve = Vec::new();
+        let mut walls = Vec::new();
+        for (start, end, neighbor) in boundary {
+            let start_new = mapped(&map, start)?;
+            let end_new = mapped(&map, end)?;
+            if start_new == start || end_new == end || start_new == end_new || start_new == end || end_new == start {
+                return Err(TopologyError::Degenerate);
+            }
+            let start_at = body.vertex_position(start).ok_or(TopologyError::Missing)?;
+            let end_at = body.vertex_position(end).ok_or(TopologyError::Missing)?;
+            let start_new_at = body.vertex_position(start_new).ok_or(TopologyError::Missing)?;
+            let end_new_at = body.vertex_position(end_new).ok_or(TopologyError::Missing)?;
+            if body.sweep_enters_face(neighbor, start_at, end_at, start_new_at, end_new_at) {
+                let start_place = body.place_on_face(neighbor, start_new_at);
+                let end_place = body.place_on_face(neighbor, end_new_at);
+                if !matches!(start_place, FacePlace::Inside | FacePlace::Boundary) || !matches!(end_place, FacePlace::Inside | FacePlace::Boundary) {
+                    // The sweep leaves this neighbor and enters the next face. Clipping across
+                    // that next face is a different edit, so this one refuses.
+                    return Err(TopologyError::Torn);
+                }
+                carve.push((neighbor, start, end, start_new, end_new));
+            } else {
+                walls.push((start, end, start_new, end_new));
+            }
+        }
+        for (neighbor, start, end, start_new, end_new) in carve {
+            body.carve_strip(neighbor, start, end, start_new, end_new)?;
+        }
+        body.remove_unused_edges();
+        for (start, end, start_new, end_new) in walls {
+            body.ensure_edge(start, end)?;
+            body.ensure_edge(end, end_new)?;
+            body.ensure_edge(end_new, start_new)?;
+            body.ensure_edge(start_new, start)?;
+            // [start, end, end', start'] opposes the neighbor on the old edge and the cap on the new one.
+            // Reversing it would give both faces the same direction, which the closed-solid check rejects.
+            let wall_id = body.alloc()?;
+            body.faces.push(SolidFace { id: wall_id, vertices: vec![start, end, end_new, start_new] });
+        }
+        body.finish()
+    }
+
     /// Scales about the current center, then recenters. Ids stay.
     pub fn scale_to(&self, size_m: [f64; 3]) -> Result<TopologyEdit, TopologyError> {
         if size_m.iter().any(|axis| !axis.is_finite() || *axis <= 0.0) {
@@ -520,7 +704,7 @@ impl SolidBody {
         }).min_by(pick_order)
     }
 
-    /// First face whose triangle the unit ray enters.
+    /// Closest face the unit ray enters. A planar loop uses the polygon, so a concave deck does not fill its notch. A bent loop keeps the fan.
     pub fn pick_face(&self, origin: [f64; 3], direction: [f64; 3]) -> Option<TopologyPick> {
         let direction = unit(direction)?;
         let mut best: Option<TopologyPick> = None;
@@ -529,12 +713,30 @@ impl SolidBody {
             if positions.len() < 3 {
                 continue;
             }
+            let consider = |best: &mut Option<TopologyPick>, ray_t: f64, id: u32| {
+                let pick = TopologyPick { id, ray_t, distance: 0.0 };
+                let replace = best.as_ref().is_none_or(|current| {
+                    let order = pick_order(&pick, current);
+                    order.is_lt() || (order.is_eq() && pick.id < current.id)
+                });
+                if replace {
+                    *best = Some(pick);
+                }
+            };
+            let normal = newell(&positions);
+            let span = length(normal);
+            if span >= 1.0e-12 {
+                let normal = scale(normal, 1.0 / span);
+                if nearly_planar(&positions, normal) {
+                    if let Some(ray_t) = ray_polygon(origin, direction, &positions, normal) {
+                        consider(&mut best, ray_t, face.id);
+                    }
+                    continue;
+                }
+            }
             for index in 1..positions.len() - 1 {
                 if let Some(ray_t) = ray_triangle(origin, direction, [positions[0], positions[index], positions[index + 1]]) {
-                    let pick = TopologyPick { id: face.id, ray_t, distance: 0.0 };
-                    if best.map(|current| pick_order(&pick, &current).is_lt()).unwrap_or(true) {
-                        best = Some(pick);
-                    }
+                    consider(&mut best, ray_t, face.id);
                 }
             }
         }
@@ -657,6 +859,114 @@ impl SolidBody {
         Ok(())
     }
 
+    /// Drops the strip a coplanar sweep covers and leaves the neighbor on the new edge.
+    fn carve_strip(&mut self, neighbor: u32, start: u32, end: u32, start_new: u32, end_new: u32) -> Result<(), TopologyError> {
+        self.split_vertex_onto_edge(start_new)?;
+        self.split_vertex_onto_edge(end_new)?;
+        let current = self.faces.iter().find(|face| face.id == neighbor).ok_or(TopologyError::Missing)?.vertices.clone();
+        let start_on = current.contains(&start_new);
+        let end_on = current.contains(&end_new);
+        let next = if start_on && end_on {
+            remove_strip(&current, start_new, end_new, start, end)?
+        } else if !start_on && !end_on {
+            splice_detour(&current, end, start, end_new, start_new)?
+        } else {
+            return Err(TopologyError::Torn);
+        };
+        if next.len() < 3 {
+            return Err(TopologyError::Torn);
+        }
+        let face = self.faces.iter_mut().find(|face| face.id == neighbor).ok_or(TopologyError::Missing)?;
+        face.vertices = next;
+        self.ensure_edge(start_new, end_new)?;
+        if !start_on {
+            self.ensure_edge(end, end_new)?;
+            self.ensure_edge(start, start_new)?;
+        }
+        Ok(())
+    }
+
+    /// Inserts `vertex` into the one edge it already lies on. A corner match is left alone.
+    fn split_vertex_onto_edge(&mut self, vertex: u32) -> Result<(), TopologyError> {
+        let position = self.vertex_position(vertex).ok_or(TopologyError::Missing)?;
+        let mut host = None;
+        for edge in &self.edges {
+            if edge.a == vertex || edge.b == vertex {
+                continue;
+            }
+            let (Some(start), Some(end)) = (self.vertex_position(edge.a), self.vertex_position(edge.b)) else {
+                continue;
+            };
+            let along = project_segment(position, start, end);
+            let span = distance(start, end);
+            if along > MIN_EDGE_M && along < span - MIN_EDGE_M && point_segment_distance(position, start, end) < MIN_EDGE_M {
+                if host.is_some() {
+                    return Err(TopologyError::Torn);
+                }
+                host = Some((edge.a, edge.b));
+            }
+        }
+        if let Some((start, end)) = host {
+            self.split_edge_chain(start, end, &[vertex], None)?;
+        }
+        Ok(())
+    }
+
+    fn remove_unused_edges(&mut self) {
+        let mut used = Vec::new();
+        for face in &self.faces {
+            let count = face.vertices.len();
+            for index in 0..count {
+                let start = face.vertices[index];
+                let end = face.vertices[(index + 1) % count];
+                used.push((start.min(end), start.max(end)));
+            }
+        }
+        self.edges.retain(|edge| used.contains(&(edge.a.min(edge.b), edge.a.max(edge.b))));
+    }
+
+    /// The sweep steps into `face` rather than off its boundary into empty space.
+    fn sweep_enters_face(&self, face: u32, start: [f64; 3], end: [f64; 3], start_new: [f64; 3], end_new: [f64; 3]) -> bool {
+        let old_mid = midpoint(start, end);
+        let new_mid = midpoint(start_new, end_new);
+        let step = sub(new_mid, old_mid);
+        let span = length(step);
+        if span < MIN_DELTA_M {
+            return false;
+        }
+        let probe = if span <= SWEEP_PROBE_M { new_mid } else { add(old_mid, scale(step, SWEEP_PROBE_M / span)) };
+        matches!(self.place_on_face(face, probe), FacePlace::Inside | FacePlace::Boundary)
+    }
+
+    fn place_on_face(&self, face: u32, point: [f64; 3]) -> FacePlace {
+        let Some(positions) = self.face_positions(face) else {
+            return FacePlace::Outside;
+        };
+        if positions.len() < 3 {
+            return FacePlace::Outside;
+        }
+        let normal = newell(&positions);
+        let span = length(normal);
+        if span < 1.0e-12 {
+            return FacePlace::Outside;
+        }
+        let normal = scale(normal, 1.0 / span);
+        if dot(sub(point, positions[0]), normal).abs() > MIN_EDGE_M {
+            return FacePlace::Outside;
+        }
+        let on_edge = (0..positions.len()).any(|index| {
+            let start = positions[index];
+            let end = positions[(index + 1) % positions.len()];
+            let along = project_segment(point, start, end);
+            let span = distance(start, end);
+            along >= -MIN_EDGE_M && along <= span + MIN_EDGE_M && point_segment_distance(point, start, end) <= MIN_EDGE_M
+        });
+        if on_edge {
+            return FacePlace::Boundary;
+        }
+        if polygon_contains(&positions, point, normal) { FacePlace::Inside } else { FacePlace::Outside }
+    }
+
     fn ensure_edge(&mut self, a: u32, b: u32) -> Result<u32, TopologyError> {
         if a == b {
             return Err(TopologyError::Degenerate);
@@ -745,6 +1055,114 @@ fn insert_chain(loop_: &mut Vec<u32>, a: u32, b: u32, points_a_to_b: &[u32]) {
     for (offset, id) in points.into_iter().enumerate() {
         loop_.insert(index + 1 + offset, id);
     }
+}
+
+/// Replaces the path `new_a ... old vertices ... new_b` with the direct edge, keeping the other way around.
+fn remove_strip(loop_: &[u32], new_a: u32, new_b: u32, old_a: u32, old_b: u32) -> Result<Vec<u32>, TopologyError> {
+    let count = loop_.len();
+    for index in 0..count {
+        if loop_[index] != new_a && loop_[index] != new_b {
+            continue;
+        }
+        let mut cursor = (index + 1) % count;
+        let mut seen_old = 0u32;
+        let mut guard = 0;
+        while loop_[cursor] != new_a && loop_[cursor] != new_b {
+            if loop_[cursor] == old_a || loop_[cursor] == old_b {
+                seen_old += 1;
+            }
+            cursor = (cursor + 1) % count;
+            guard += 1;
+            if guard > count {
+                break;
+            }
+        }
+        if guard > count || loop_[cursor] == loop_[index] || seen_old < 2 {
+            continue;
+        }
+        let mut next = Vec::new();
+        let mut walk = cursor;
+        loop {
+            next.push(loop_[walk]);
+            if walk == index {
+                break;
+            }
+            walk = (walk + 1) % count;
+            if next.len() > count {
+                return Err(TopologyError::Torn);
+            }
+        }
+        return Ok(next);
+    }
+    Err(TopologyError::Torn)
+}
+
+/// Replaces neighbor edge `end → start` with the three edges that walk around an interior strip.
+fn splice_detour(loop_: &[u32], end: u32, start: u32, end_new: u32, start_new: u32) -> Result<Vec<u32>, TopologyError> {
+    let count = loop_.len();
+    let slot = (0..count).find(|index| loop_[*index] == end && loop_[(*index + 1) % count] == start).ok_or(TopologyError::Torn)?;
+    let mut next = Vec::with_capacity(count + 2);
+    for (index, vertex) in loop_.iter().copied().enumerate() {
+        next.push(vertex);
+        if index == slot {
+            next.push(end_new);
+            next.push(start_new);
+        }
+    }
+    Ok(next)
+}
+
+fn nearly_planar(positions: &[[f64; 3]], normal: [f64; 3]) -> bool {
+    let origin = positions[0];
+    positions.iter().all(|point| dot(sub(*point, origin), normal).abs() <= 1.0e-4)
+}
+
+fn ray_polygon(origin: [f64; 3], direction: [f64; 3], positions: &[[f64; 3]], normal: [f64; 3]) -> Option<f64> {
+    let denom = dot(normal, direction);
+    if denom.abs() < PARALLEL_EPS {
+        return None;
+    }
+    let ray_t = dot(sub(positions[0], origin), normal) / denom;
+    if ray_t <= 1.0e-6 {
+        return None;
+    }
+    let point = add(origin, scale(direction, ray_t));
+    face_pick_contains(positions, point, normal).then_some(ray_t)
+}
+
+fn face_pick_contains(positions: &[[f64; 3]], point: [f64; 3], normal: [f64; 3]) -> bool {
+    if polygon_contains(positions, point, normal) {
+        return true;
+    }
+    let count = positions.len();
+    (0..count).any(|index| point_segment_distance(point, positions[index], positions[(index + 1) % count]) <= PICK_BOUNDARY_M)
+}
+
+fn polygon_contains(positions: &[[f64; 3]], point: [f64; 3], normal: [f64; 3]) -> bool {
+    let (axis_u, axis_v) = dominant_axes(normal);
+    let target = [point[axis_u], point[axis_v]];
+    let mut inside = false;
+    let count = positions.len();
+    for index in 0..count {
+        let start = [positions[index][axis_u], positions[index][axis_v]];
+        let end = [positions[(index + 1) % count][axis_u], positions[(index + 1) % count][axis_v]];
+        let crosses = (start[1] > target[1]) != (end[1] > target[1]);
+        if !crosses || (end[1] - start[1]).abs() < 1.0e-15 {
+            continue;
+        }
+        let crossing = start[0] + (end[0] - start[0]) * (target[1] - start[1]) / (end[1] - start[1]);
+        if target[0] < crossing {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn dominant_axes(normal: [f64; 3]) -> (usize, usize) {
+    let ax = normal[0].abs();
+    let ay = normal[1].abs();
+    let az = normal[2].abs();
+    if ax >= ay && ax >= az { (1, 2) } else if ay >= az { (0, 2) } else { (0, 1) }
 }
 
 fn usable_delta(delta: [f64; 3]) -> bool {
@@ -1087,5 +1505,189 @@ mod tests {
         let divided = body.subdivide_face(1, 2, 2).unwrap();
         // Four new quads replace two triangles, and each of the four neighbors becomes a pentagon.
         assert_eq!(crate::mesh_from_body(&divided.body).triangle_indices().len(), 22);
+    }
+
+    fn centroid(body: &SolidBody, face: u32) -> [f64; 3] {
+        let positions = body.face_positions(face).unwrap();
+        let mut sum = [0.0; 3];
+        for position in &positions {
+            sum = add(sum, *position);
+        }
+        scale(sum, 1.0 / positions.len() as f64)
+    }
+
+    fn top_faces(body: &SolidBody) -> Vec<u32> {
+        body.faces.iter().filter(|face| body.unit_normal(face.id).unwrap()[1] > 0.9).map(|face| face.id).collect()
+    }
+
+    fn interior_top(body: &SolidBody) -> Vec<u32> {
+        top_faces(body)
+            .into_iter()
+            .filter(|face| {
+                body.face_positions(*face).unwrap().iter().all(|position| position[0].abs() <= 0.5 + 1.0e-6 && position[2].abs() <= 0.5 + 1.0e-6)
+            })
+            .collect()
+    }
+
+    fn shared_vertices(body: &SolidBody, left: u32, right: u32) -> usize {
+        let loop_ = body.face_loop(left).unwrap();
+        body.face_loop(right).unwrap().iter().filter(|vertex| loop_.contains(vertex)).count()
+    }
+
+    #[test]
+    fn picking_a_subdivided_cell_hits_that_cell_and_its_shared_edge() {
+        let divided = box_body().subdivide_face(3, 4, 4).unwrap();
+        assert!(last_solid_validate_us() > 0);
+        let cap = interior_top(&divided.body)[0];
+        let center = centroid(&divided.body, cap);
+        let hit = divided.body.pick_face([center[0], center[1] + 3.0, center[2]], [0.0, -1.0, 0.0]).unwrap();
+        assert_eq!(hit.id, cap);
+        let neighbor = top_faces(&divided.body).into_iter().find(|face| *face != cap && shared_vertices(&divided.body, cap, *face) == 2).unwrap();
+        let shared: Vec<_> = divided
+            .body
+            .face_loop(cap)
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|vertex| divided.body.face_loop(neighbor).unwrap().contains(vertex))
+            .collect();
+        assert_eq!(shared.len(), 2);
+        let start = divided.body.vertex_position(shared[0]).unwrap();
+        let end = divided.body.vertex_position(shared[1]).unwrap();
+        let mid = [(start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5, (start[2] + end[2]) * 0.5];
+        let edge_hit = divided.body.pick_face([mid[0], mid[1] + 3.0, mid[2]], [0.0, -1.0, 0.0]).unwrap();
+        assert!(edge_hit.id == cap || edge_hit.id == neighbor, "{}", edge_hit.id);
+        let raised = divided.body.extrude_faces(&[cap], [0.0, 0.4, 0.0]).unwrap();
+        let cap_at = centroid(&raised.body, cap);
+        assert_eq!(raised.body.pick_face([cap_at[0], cap_at[1] + 3.0, cap_at[2]], [0.0, -1.0, 0.0]).unwrap().id, cap);
+        let side = raised.body.faces.iter().find(|face| face.id >= 21).unwrap().id;
+        let side_at = centroid(&raised.body, side);
+        let normal = raised.body.unit_normal(side).unwrap();
+        let origin = [side_at[0] + normal[0] * 2.0, side_at[1] + normal[1] * 2.0, side_at[2] + normal[2] * 2.0];
+        assert_eq!(raised.body.pick_face(origin, [-normal[0], -normal[1], -normal[2]]).unwrap().id, side);
+    }
+
+    #[test]
+    fn extruding_one_face_of_a_box_adds_a_closed_cap_and_four_walls() {
+        let body = box_body();
+        let edit = body.extrude_faces(&[3], [0.0, 0.4, 0.0]).unwrap();
+        assert_eq!(edit.body.vertices.len(), 12);
+        assert_eq!(edit.body.edges.len(), 20);
+        assert_eq!(edit.body.faces.len(), 10);
+        assert!((edit.size_m[1] - 2.4).abs() < 1.0e-9, "{:?}", edit.size_m);
+        assert!((edit.shift[1] - 0.2).abs() < 1.0e-9, "{:?}", edit.shift);
+        edit.body.validate().unwrap();
+        assert!(edit.body.face_loop(3).is_some());
+        let side = edit.body.faces.iter().find(|face| face.id >= 21).unwrap().clone();
+        assert_eq!(shared_vertices(&edit.body, 3, side.id), 2);
+        let neighbor = edit.body.faces.iter().find(|face| face.id != 3 && face.id < 21 && shared_vertices(&edit.body, side.id, face.id) == 2).unwrap().id;
+        assert_eq!(shared_vertices(&edit.body, 3, neighbor), 0);
+        let boundary_y = side
+            .vertices
+            .iter()
+            .filter(|vertex| edit.body.face_loop(neighbor).unwrap().contains(vertex))
+            .map(|vertex| edit.body.vertex_position(*vertex).unwrap()[1])
+            .sum::<f64>()
+            / 2.0;
+        assert!((centroid(&edit.body, 3)[1] - boundary_y - 0.4).abs() < 1.0e-9, "{}", centroid(&edit.body, 3)[1] - boundary_y);
+        let normal = edit.body.unit_normal(side.id).unwrap();
+        assert!(normal[1].abs() < 0.1 && dot(normal, centroid(&edit.body, side.id)) > 0.2, "{normal:?}");
+        assert_eq!(body.extrude_faces(&[], [0.0, 0.4, 0.0]), Err(TopologyError::Missing));
+        assert_eq!(body.extrude_faces(&[3, 3], [0.0, 0.4, 0.0]), Err(TopologyError::Degenerate));
+        assert_eq!(body.extrude_faces(&[99], [0.0, 0.4, 0.0]), Err(TopologyError::Missing));
+        assert_eq!(body.extrude_faces(&[3], [0.0, 0.0, 0.0]), Err(TopologyError::Degenerate));
+        assert_eq!(body.extrude_faces(&[3], [0.0, -3.0, 0.0]), Err(TopologyError::Torn));
+    }
+
+    #[test]
+    fn extruding_an_interior_cell_then_a_new_side_keeps_shared_edges() {
+        let divided = box_body().subdivide_face(3, 4, 4).unwrap();
+        assert_eq!(divided.body.faces.len(), 21);
+        let interior = interior_top(&divided.body);
+        assert_eq!(interior.len(), 4);
+        let cap = interior[0];
+        let neighbor = top_faces(&divided.body).into_iter().find(|face| *face != cap && shared_vertices(&divided.body, cap, *face) == 2).unwrap();
+        let raised = divided.body.extrude_faces(&[cap], [0.0, 0.4, 0.0]).unwrap();
+        assert_eq!(raised.body.faces.len(), 25);
+        raised.body.validate().unwrap();
+        assert!(raised.body.face_loop(cap).is_some());
+        assert!((centroid(&raised.body, cap)[1] - centroid(&raised.body, neighbor)[1] - 0.4).abs() < 1.0e-6);
+        let side = raised
+            .body
+            .faces
+            .iter()
+            .find(|face| shared_vertices(&raised.body, cap, face.id) == 2 && shared_vertices(&raised.body, neighbor, face.id) == 2)
+            .unwrap();
+        assert_eq!(shared_vertices(&raised.body, cap, neighbor), 0);
+        let normal = raised.body.unit_normal(side.id).unwrap();
+        let again = raised.body.extrude_faces(&[side.id], scale(normal, 0.4)).unwrap();
+        again.body.validate().unwrap();
+        assert!(again.body.faces.len() > raised.body.faces.len());
+        assert!(again.body.face_loop(cap).is_some());
+        assert!(again.body.face_loop(side.id).is_some());
+        let deck = again
+            .body
+            .faces
+            .iter()
+            .find(|face| {
+                face.id != side.id
+                    && shared_vertices(&again.body, side.id, face.id) == 2
+                    && again.body.unit_normal(face.id).unwrap()[1] > 0.9
+                    && shared_vertices(&again.body, cap, face.id) == 0
+            })
+            .unwrap()
+            .id;
+        assert_eq!(shared_vertices(&again.body, side.id, deck), 2);
+        assert_eq!(shared_vertices(&again.body, cap, side.id), 0);
+        let shelf = again.body.faces.iter().find(|face| shared_vertices(&again.body, cap, face.id) == 2 && shared_vertices(&again.body, side.id, face.id) == 2).unwrap();
+        assert!(shelf.id != side.id && shelf.id != cap);
+        assert!(again.body.unit_normal(deck).unwrap()[1] > 0.9);
+        assert_eq!(divided.body.extrude_faces(&[cap], [0.0, -3.0, 0.0]), Err(TopologyError::Torn));
+        assert_eq!(raised.body.extrude_faces(&[side.id], scale(normal, -0.4)), Err(TopologyError::Torn));
+    }
+
+    #[test]
+    fn extruding_a_new_side_of_a_raised_box_adds_another_shelf() {
+        let raised = box_body().extrude_faces(&[3], [0.0, 0.4, 0.0]).unwrap();
+        let side = raised.body.faces.iter().find(|face| face.id >= 21).unwrap().id;
+        let normal = raised.body.unit_normal(side).unwrap();
+        let again = raised.body.extrude_faces(&[side], scale(normal, 0.4)).unwrap();
+        again.body.validate().unwrap();
+        assert!(again.body.face_loop(3).is_some());
+        assert!(again.body.face_loop(side).is_some());
+        assert!(again.body.faces.len() > raised.body.faces.len());
+        assert_eq!(shared_vertices(&again.body, 3, side), 0);
+    }
+
+    #[test]
+    fn extruding_the_four_central_cells_moves_their_shared_vertex_once() {
+        let divided = box_body().subdivide_face(3, 4, 4).unwrap();
+        let caps = interior_top(&divided.body);
+        assert_eq!(caps.len(), 4);
+        let shared = divided
+            .body
+            .vertices
+            .iter()
+            .find(|vertex| caps.iter().all(|face| divided.body.face_loop(*face).unwrap().contains(&vertex.id)))
+            .unwrap()
+            .id;
+        let before = divided.body.vertex_position(1).unwrap()[1];
+        let edit = divided.body.extrude_faces(&caps, [0.0, 0.4, 0.0]).unwrap();
+        edit.body.validate().unwrap();
+        assert!(caps.iter().all(|face| edit.body.face_loop(*face).unwrap().contains(&shared)));
+        let rise = edit.body.vertex_position(shared).unwrap()[1] - edit.body.vertex_position(1).unwrap()[1];
+        let original = divided.body.vertex_position(shared).unwrap()[1] - before;
+        assert!((rise - original - 0.4).abs() < 1.0e-6, "{rise} {original}");
+    }
+
+    #[test]
+    fn extruding_two_cells_that_only_share_a_vertex_is_refused() {
+        let divided = box_body().subdivide_face(3, 2, 2).unwrap();
+        let tops = top_faces(&divided.body);
+        let pair = tops.iter().copied().find_map(|left| {
+            tops.iter().copied().find(|right| *right != left && shared_vertices(&divided.body, left, *right) == 1).map(|right| (left, right))
+        });
+        let (left, right) = pair.unwrap();
+        assert_eq!(divided.body.extrude_faces(&[left, right], [0.0, 0.4, 0.0]), Err(TopologyError::Torn));
     }
 }

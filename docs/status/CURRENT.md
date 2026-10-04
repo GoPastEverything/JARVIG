@@ -12,6 +12,8 @@ Selection on a parametric solid is Auto, Object, Face, Edge, and Vertex. A singl
 
 While a block is selected, the toolbar also shows Subdiv, Edge, Extend, Split, and Vertex. Subdiv and Split run on the click. Edge, Extend, and Vertex arm a drag. With Move active, the same translate gizmo sits on the selected edge or vertex. Dragging an axis edits that element. Extend extrudes a new face along the axis. A press that misses the gizmo drags on the view plane. Releasing the mouse commits.
 
+Extrude on a stored body pulls the selected cells and adds their side faces. View > Show Grid draws every stored edge. Face, Edge, and Vertex draw that cage on their own. Face and Auto on a stored body leave the object Move arrows off the cells. Switch to Object to move the whole solid. While an Extrude arrow is up, a click drags that region or does nothing. The toolbar paints from a memory bitmap. Einstein surface builds use one dedicated worker, separate from parent-mesh, content, and terrain jobs. Exact solids still draw no relief. The status line times face, edge, and vertex picks, validation, mesh rebuild, inspector refresh, and cage draw.
+
 Users start at [getting-started.md](../getting-started.md): a new project, a room of blocks, glTF or GLB import, save, and play. The creator manual is [manual/README.md](../manual/README.md). The rendered site is `docs/site/index.html`. Rebuild it with `pwsh -File scripts\build-docs.ps1`. It is a reader, not a second authority.
 
 The editor cold start is:

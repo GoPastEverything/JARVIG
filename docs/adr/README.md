@@ -59,7 +59,7 @@ Do not edit an Accepted ADR in place to change the decision. Write a new ADR and
 | [0049](ADR-0049-component-membership-is-not-a-second-registry.md) | Component membership is not a second registry | Accepted |
 | [0050](ADR-0050-authored-world-is-source-runtime-world-is-instance.md) | The authored world is source data; the runtime world is an instance | Accepted |
 | [0051](ADR-0051-imported-mesh-is-an-asset.md) | An imported mesh is an asset, not a level | Accepted |
-| [0052](ADR-0052-in-process-job-queue.md) | An in-process job queue is not a second engine | Accepted |
+| [0052](ADR-0052-in-process-job-queue.md) | An in-process job queue is not a second engine | Accepted. The single shared queue for Einstein surface builds is superseded by 0071 |
 | [0053](ADR-0053-a-joint-rides-on-the-local-frame.md) | A joint rides on the local frame | Accepted |
 | [0054](ADR-0054-character-editor-uses-the-joint.md) | The character editor edits the joint | Accepted, level-open sentence partially superseded by 0056, character isolation by 0059 |
 | [0055](ADR-0055-a-character-is-rigid-parts-on-the-joint.md) | A character document is rigid parts on the joint | Accepted, pivot sentence partially superseded by 0056, startup-level sentence by 0059 |
@@ -76,6 +76,8 @@ Do not edit an Accepted ADR in place to change the decision. Write a new ADR and
 | [0066](ADR-0066-a-solid-keeps-its-parameters.md) | A solid keeps its parameters, and the inspector shows what it can do | Accepted. The permanent Modeling form and the mouse-up face commit are superseded by 0067 |
 | [0067](ADR-0067-a-modeling-operation-is-one-session.md) | A modeling operation is one session across the toolbar, the panel, and the viewport | Accepted. Mixing commands into Features is superseded by 0068. The mouse-up sentence is superseded by 0069 |
 | [0068](ADR-0068-selection-promotes-and-an-edit-is-one-transaction.md) | Selection promotes, and an edit is one transaction | Accepted. The sentence that Edge and Vertex are not shown is superseded by 0069 |
-| [0069](ADR-0069-direct-manipulation-commits-and-topology-is-the-solid.md) | Direct manipulation commits, and topology is the solid | Accepted |
+| [0069](ADR-0069-direct-manipulation-commits-and-topology-is-the-solid.md) | Direct manipulation commits, and topology is the solid | Accepted. The analytic-extrude refusal is superseded for Extrude by 0070. Inset and Bevel stay refused |
+| [0070](ADR-0070-region-extrude-is-authored-topology.md) | Region extrude is authored topology, and the cage is the solid | Accepted |
+| [0071](ADR-0071-einstein-has-its-own-latency-queue.md) | Einstein surface builds have their own latency queue | Accepted |
 
 RFCs are not in this list. See [../rfc/README.md](../rfc/README.md).

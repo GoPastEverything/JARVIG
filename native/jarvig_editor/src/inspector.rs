@@ -75,6 +75,8 @@ pub enum InspectorCommand {
     MoveVertex,
     /// Replaces the selected quad with a 2 by 2 grid of real faces.
     SubdivideFace,
+    /// Replaces the selected quad with a 4 by 4 grid of real faces.
+    SubdivideFace4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +440,7 @@ fn attach_solid_tools(
         InspectorCommand::InsetFace,
         InspectorCommand::Bevel,
         InspectorCommand::SubdivideFace,
+        InspectorCommand::SubdivideFace4,
     ];
     let edge_tools = vec![InspectorCommand::MoveEdge, InspectorCommand::ExtrudeEdge, InspectorCommand::SplitEdge];
     let (title, commands) = if mode_name == "Edge" || matches!(element, SolidElement::Edge(_)) {
@@ -502,6 +505,7 @@ pub fn attach_modeling_session(model: &mut InspectorModel, view: &ModelingView) 
                     | InspectorCommand::SplitEdge
                     | InspectorCommand::MoveVertex
                     | InspectorCommand::SubdivideFace
+                    | InspectorCommand::SubdivideFace4
             )
         });
         section.feature_edits.clear();
@@ -532,7 +536,8 @@ fn topology_log(record: &jarvig_core::BlockRecord) -> Vec<String> {
             | jarvig_core::BlockOp::ExtrudeEdge { .. }
             | jarvig_core::BlockOp::SplitEdge { .. }
             | jarvig_core::BlockOp::SubdivideFace { .. }
-            | jarvig_core::BlockOp::MoveVertex { .. } => Some(op.summary()),
+            | jarvig_core::BlockOp::MoveVertex { .. }
+            | jarvig_core::BlockOp::ExtrudeFaces { .. } => Some(op.summary()),
             _ => None,
         })
         .collect();
@@ -997,6 +1002,7 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::SplitEdge => "Split Edge",
         InspectorCommand::MoveVertex => "Move",
         InspectorCommand::SubdivideFace => "Subdivide",
+        InspectorCommand::SubdivideFace4 => "4×4",
     }
 }
 
@@ -1826,13 +1832,13 @@ mod tests {
             assert!(planned.iter().any(|control| control.text == label), "missing {label}");
         }
         assert!(!planned.iter().any(|control| {
-            matches!(control.text.as_str(), "Extrude" | "Inset" | "Union" | "Subtract" | "Sketch" | "Edit Edges" | "Shell" | "Cancel" | "Apply" | "Move Edge" | "Extrude Edge" | "Split Edge" | "Subdivide")
+            matches!(control.text.as_str(), "Extrude" | "Inset" | "Union" | "Subtract" | "Sketch" | "Edit Edges" | "Shell" | "Cancel" | "Apply" | "Move Edge" | "Extrude Edge" | "Split Edge" | "Subdivide" | "4×4")
         }));
         let face_model = build_solid(&selection, &world, &[], &[], SolidElement::Face(1), "Auto");
         assert_eq!(face_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "-X");
         assert!(face_model.section_titles().iter().any(|title| *title == "Face Tools"));
         let face_plan = plan(&face_model, &PlanOptions::editing());
-        for label in ["Extrude", "Inset", "Bevel", "Subdivide"] {
+        for label in ["Extrude", "Inset", "Bevel", "Subdivide", "4×4"] {
             assert!(face_plan.iter().any(|control| control.text == label), "missing {label}");
         }
         assert!(!face_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Duplicate" | "Mirror X" | "Move Edge")));
@@ -1844,7 +1850,7 @@ mod tests {
         for label in ["Move Edge", "Extrude Edge", "Split Edge", "Edge  ·"] {
             assert!(edge_plan.iter().any(|control| control.text == label), "missing {label}");
         }
-        assert!(!edge_plan.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Reset Shape" | "Subdivide")));
+        assert!(!edge_plan.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Reset Shape" | "Subdivide" | "4×4")));
         let vertex_model = build_solid(&selection, &world, &[], &[], SolidElement::Vertex(3), "Vertex");
         assert_eq!(vertex_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "V:3");
         assert!(vertex_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_LENGTH).is_none());
@@ -1852,7 +1858,7 @@ mod tests {
         let vertex_plan = plan(&vertex_model, &PlanOptions::editing());
         assert!(vertex_plan.iter().any(|control| control.text == "Move"));
         assert!(vertex_plan.iter().any(|control| control.text == "Vertex  ·"));
-        assert!(!vertex_plan.iter().any(|control| matches!(control.text.as_str(), "Move Edge" | "Extrude" | "Bevel" | "Subdivide")));
+        assert!(!vertex_plan.iter().any(|control| matches!(control.text.as_str(), "Move Edge" | "Extrude" | "Bevel" | "Subdivide" | "4×4")));
         world.set_block_bevel(block, 0.9).unwrap();
         let featured = build(&selection, &world);
         assert!(plan(&featured, &PlanOptions::editing()).iter().any(|control| control.text == "Bevel  0.900 m"));
@@ -1880,6 +1886,6 @@ mod tests {
         for label in ["Amount", "0.600", "Cancel", "Apply", "Duplicate", "Align"] {
             assert!(session_plan.iter().any(|control| control.text == label), "missing {label}");
         }
-        assert!(!session_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel" | "Move Edge" | "Subdivide")));
+        assert!(!session_plan.iter().any(|control| matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel" | "Move Edge" | "Subdivide" | "4×4")));
     }
 }

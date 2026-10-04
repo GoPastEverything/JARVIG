@@ -1320,6 +1320,11 @@ fn block_history_json(history: &[crate::BlockOp]) -> Json {
                     ("v", Json::int(*v as i64)),
                 ]),
                 crate::BlockOp::MoveVertex { vertex, delta_m } => topology_delta_json("move-vertex", "vertex", *vertex, *delta_m),
+                crate::BlockOp::ExtrudeFaces { faces, delta_m } => Json::object(vec![
+                    ("op", Json::string("extrude-faces")),
+                    ("faces", Json::array(faces.iter().copied().map(|id| Json::int(id as i64)).collect())),
+                    ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+                ]),
             })
             .collect(),
     )
@@ -1351,6 +1356,7 @@ fn parse_block_history(json: &Json) -> Result<Vec<crate::BlockOp>, LevelError> {
                 v: required_u32(entry, "v")?,
             },
             "move-vertex" => crate::BlockOp::MoveVertex { vertex: nonzero_u32(entry, "vertex")?, delta_m: required_delta(entry)? },
+            "extrude-faces" => crate::BlockOp::ExtrudeFaces { faces: required_face_ids(entry)?, delta_m: required_delta(entry)? },
             other => return Err(LevelError::Corrupt(format!("unknown block edit {other}"))),
         };
         history.push(op);
@@ -1468,6 +1474,22 @@ fn nonzero_u32(json: &Json, key: &str) -> Result<u32, LevelError> {
         return Err(LevelError::Corrupt("block element id is zero".into()));
     }
     Ok(value)
+}
+
+fn required_face_ids(json: &Json) -> Result<Vec<u32>, LevelError> {
+    let values = json.get("faces").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block faces are missing".into()))?;
+    if values.is_empty() {
+        return Err(LevelError::Corrupt("block faces are empty".into()));
+    }
+    let mut faces = Vec::new();
+    for value in values {
+        let id = json_u32(value, "face")?;
+        if id == 0 || faces.contains(&id) {
+            return Err(LevelError::Corrupt("block face id is repeated or zero".into()));
+        }
+        faces.push(id);
+    }
+    Ok(faces)
 }
 
 fn required_delta(json: &Json) -> Result<[f64; 3], LevelError> {

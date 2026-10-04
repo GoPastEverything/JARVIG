@@ -23,6 +23,18 @@ mod marquee;
 use std::num::NonZeroIsize;
 use std::time::Instant;
 
+std::thread_local! {
+    static CAGE_DRAW_US: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn elapsed_us(started: Instant) -> u32 {
+    started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32
+}
+
+fn last_cage_draw_us() -> u32 {
+    CAGE_DRAW_US.with(|slot| slot.get())
+}
+
 use dock::{
     dip_to_px, key_route, panel_takes_text, px_to_dip, Axis, DipPoint, DipRect, DockWorkspace, DropZone,
     Layout, PanelId, WorkspaceCommand, CONTENT, INSPECTOR, OUTLINER, OUTPUT, PERSPECTIVE, SCHEMA_VERSION,
@@ -197,6 +209,7 @@ const ID_VIEW_RESET_DEBUG: usize = 1415;
 const ID_VIEW_EINSTEIN_OFF: usize = 1416;
 const ID_VIEW_FREEZE_DIAGNOSTIC: usize = 1417;
 const ID_VIEW_COMPARE_LEAF: usize = 1418;
+const ID_VIEW_GRID: usize = 1419;
 const ID_VIEW_RECAPTURE: usize = 1327;
 const ID_PROBE_STATIC: usize = 1328;
 const ID_PROBE_ON_DEMAND: usize = 1329;
@@ -344,6 +357,11 @@ fn topology_tool(tool: ModelingTool) -> bool {
     matches!(tool, ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex)
 }
 
+/// Face extrude on a stored body. `element` is the primary face id. Analytic extrude keeps it at zero.
+fn region_extrude(session: ModelingSession) -> bool {
+    session.tool == ModelingTool::Extrude && session.element != 0
+}
+
 /// Viewport pick resolution. Auto still selects a face.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionMode {
@@ -362,7 +380,7 @@ struct ModelingSession {
     tool: ModelingTool,
     entity: EntityUuid,
     face: u8,
-    /// Edge or vertex id. Zero for an analytic face operation.
+    /// Edge, vertex, or the primary face of a region extrude. Zero for an analytic face operation.
     element: u32,
     baseline_size: [f64; 3],
     baseline_inset: [f64; 6],
@@ -581,6 +599,7 @@ struct MicroJobProduct {
     mesh: jarvig_core::MicroMesh,
     queue_wait_us: u32,
     skipped: u32,
+    finished_at: Instant,
 }
 
 struct LandChunkProduct {
@@ -671,6 +690,13 @@ struct Editor {
     pick_broadphase_us: u128,
     pick_mesh_us: u128,
     selection_change_us: u128,
+    face_pick_us: u32,
+    edge_pick_us: u32,
+    vertex_pick_us: u32,
+    solid_validate_us: u32,
+    mesh_rebuild_us: u32,
+    inspector_refresh_us: u32,
+    cage_draw_us: u32,
     meshlet_debug: bool,
     meshlet_shade: bool,
     meshlet_frustum: bool,
@@ -751,6 +777,8 @@ struct Editor {
     rfc_holes: Vec<rfc_runtime::HoleSample>,
     rfc_integrate: Vec<rfc_runtime::IntegrateSample>,
     jobs: jarvig_core::JobManager,
+    /// Einstein surface builds. Not the general pool. One worker.
+    einstein_jobs: jarvig_core::JobManager,
     parent_job: Option<ParentJob>,
     micro_job: Option<MicroJob>,
     registry_job: Option<jarvig_core::JobId>,
@@ -866,6 +894,14 @@ struct Editor {
     modeling_session: Option<ModelingSession>,
     selected_face: Option<(EntityUuid, u8)>,
     selected_body_face: Option<(EntityUuid, u32)>,
+    /// Every face in the current solid's selection. The primary id stays in `selected_body_face`.
+    selected_body_faces: Vec<u32>,
+    /// View menu. Object mode draws the editable cage only while this is on.
+    show_grid: bool,
+    /// Faces captured when a region extrude opened. Empty when that session is closed.
+    region_faces: Vec<u32>,
+    /// Outward direction of `region_faces`, in the solid's local frame.
+    region_normal: [f64; 3],
     selected_edge: Option<(EntityUuid, u32)>,
     selected_vertex: Option<(EntityUuid, u32)>,
     edge_hover: Option<u32>,
@@ -1263,6 +1299,13 @@ impl Editor {
             pick_broadphase_us: 0,
             pick_mesh_us: 0,
             selection_change_us: 0,
+            face_pick_us: 0,
+            edge_pick_us: 0,
+            vertex_pick_us: 0,
+            solid_validate_us: 0,
+            mesh_rebuild_us: 0,
+            inspector_refresh_us: 0,
+            cage_draw_us: 0,
             meshlet_debug: false,
             meshlet_shade: true,
             meshlet_frustum: true,
@@ -1343,6 +1386,7 @@ impl Editor {
             rfc_holes: Vec::new(),
             rfc_integrate: Vec::new(),
             jobs: jarvig_core::JobManager::new(2),
+            einstein_jobs: jarvig_core::JobManager::named("jarvig-einstein", 1),
             parent_job: None,
             micro_job: None,
             registry_job: None,
@@ -1451,6 +1495,10 @@ impl Editor {
             modeling_session: None,
             selected_face: None,
             selected_body_face: None,
+            selected_body_faces: Vec::new(),
+            show_grid: false,
+            region_faces: Vec::new(),
+            region_normal: [0.0; 3],
             selected_edge: None,
             selected_vertex: None,
             edge_hover: None,
@@ -1978,6 +2026,7 @@ impl Editor {
             }
             if self.selected_body_face.is_some_and(|(id, _)| !owns(id)) {
                 self.selected_body_face = None;
+                self.selected_body_faces.clear();
             }
             if self.selected_edge.is_some_and(|(id, _)| !owns(id)) {
                 self.selected_edge = None;
@@ -1994,6 +2043,7 @@ impl Editor {
         let inspector_started = Instant::now();
         self.rebuild_inspector();
         let inspector_us = inspector_started.elapsed().as_micros();
+        self.inspector_refresh_us = inspector_us.min(u128::from(u32::MAX)) as u32;
         if selection_changed && !self.self_test {
             self.append(&format!(
                 "selection pick_broadphase_us={} pick_mesh_us={} selection_change_us={} inspector_refresh_us={} selection_highlight_us=0",
@@ -2038,9 +2088,12 @@ impl Editor {
                 SelectionMode::Vertex => "Vertex",
             };
             let mut model = inspector::build_solid(&self.selection, self.viewed_world(), &staged, &meshes, element, mode_name);
+            if self.selected_body_faces.len() > 1 {
+                inspector::set_selected_face_label(&mut model, &format!("{} faces", self.selected_body_faces.len()));
+            }
             if let Some(session) = self.modeling_session {
                 if self.selection.primary_entity() == Some(session.entity) {
-                    inspector::attach_modeling_session(&mut model, &modeling_view(session));
+                    inspector::attach_modeling_session(&mut model, &modeling_view(session, &self.region_faces));
                     if let inspector::InspectorBody::Entity { sections } = &mut model.body {
                         for section in sections.iter_mut() {
                             for field in &mut section.fields {
@@ -2656,7 +2709,8 @@ impl Editor {
             inspector::InspectorCommand::ExtrudeEdge => self.begin_modeling(ModelingTool::ExtrudeEdge),
             inspector::InspectorCommand::MoveVertex => self.begin_modeling(ModelingTool::MoveVertex),
             inspector::InspectorCommand::SplitEdge => self.split_selected_edge(entity),
-            inspector::InspectorCommand::SubdivideFace => self.subdivide_selected_face(entity),
+            inspector::InspectorCommand::SubdivideFace => self.subdivide_selected_face(entity, 2),
+            inspector::InspectorCommand::SubdivideFace4 => self.subdivide_selected_face(entity, 4),
             inspector::InspectorCommand::CancelModeling => self.cancel_modeling(true),
             inspector::InspectorCommand::ApplyModeling => self.apply_modeling(),
             inspector::InspectorCommand::MirrorX => self.mirror_selected_block(entity, 0),
@@ -2685,11 +2739,13 @@ impl Editor {
             SelectionMode::Edge => {
                 self.selected_face = None;
                 self.selected_body_face = None;
+                self.selected_body_faces.clear();
                 self.selected_vertex = None;
             }
             SelectionMode::Vertex => {
                 self.selected_face = None;
                 self.selected_body_face = None;
+                self.selected_body_faces.clear();
                 self.selected_edge = None;
             }
             SelectionMode::Auto | SelectionMode::Face => {
@@ -2705,8 +2761,10 @@ impl Editor {
     fn clear_element_selection(&mut self) {
         let had = self.selected_face.take().is_some()
             || self.selected_body_face.take().is_some()
+            || !self.selected_body_faces.is_empty()
             || self.selected_edge.take().is_some()
             || self.selected_vertex.take().is_some();
+        self.selected_body_faces.clear();
         if had {
             self.inspector_force_realize = true;
         }
@@ -2756,6 +2814,9 @@ impl Editor {
         }
         if let Some((id, face)) = self.selected_body_face {
             if Some(id) == primary {
+                if self.selected_body_faces.len() > 1 {
+                    return format!(" · {} faces", self.selected_body_faces.len());
+                }
                 return format!(" · Face F:{face}");
             }
         }
@@ -2831,7 +2892,11 @@ impl Editor {
             return;
         }
         if record.body.is_some() {
-            self.append("This solid is a topological body. Extrude a face by moving its edges, or Reset Shape to return to the box.");
+            if tool == ModelingTool::Extrude {
+                self.begin_region_extrude(entity, &record, local.translation);
+            } else {
+                self.append("Inset and Bevel are not available once the solid has topology. Reset Shape returns to the box.");
+            }
             return;
         }
         let face = if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
@@ -2866,6 +2931,84 @@ impl Editor {
         unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
     }
 
+    /// Extrudes the selected faces of a stored body. Inset and Bevel stay refused.
+    fn begin_region_extrude(&mut self, entity: EntityUuid, record: &jarvig_core::BlockRecord, translation: Vec3) {
+        if record.analytic_features() {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        }
+        let Some(body) = record.body.clone() else {
+            self.append("Select a face first.");
+            return;
+        };
+        let mut faces = Vec::new();
+        if self.selected_body_face.is_none_or(|(id, _)| id == entity) {
+            for face in &self.selected_body_faces {
+                if *face != 0 && !faces.contains(face) {
+                    faces.push(*face);
+                }
+            }
+        }
+        if faces.is_empty() {
+            if let Some((_, face)) = self.selected_body_face.filter(|(id, face)| *id == entity && *face != 0) {
+                faces.push(face);
+            }
+        }
+        if faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        if faces.iter().any(|face| body.face_loop(*face).is_none()) {
+            self.append("That element is not on the solid.");
+            return;
+        }
+        let mut normal = [0.0; 3];
+        for face in &faces {
+            let Some(axis) = body.unit_normal(*face) else {
+                self.append("Those faces do not share a direction.");
+                return;
+            };
+            normal[0] += axis[0];
+            normal[1] += axis[1];
+            normal[2] += axis[2];
+        }
+        let span = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if span < 1.0e-6 {
+            self.append("Those faces do not share a direction.");
+            return;
+        }
+        normal = [normal[0] / span, normal[1] / span, normal[2] / span];
+        let probe = [normal[0] * 0.05, normal[1] * 0.05, normal[2] * 0.05];
+        if body.extrude_faces(&faces, probe).is_err() {
+            self.append("Those faces do not form one region.");
+            return;
+        }
+        let primary = self
+            .selected_body_face
+            .filter(|(id, face)| *id == entity && faces.contains(face))
+            .map(|(_, face)| face)
+            .unwrap_or(faces[0]);
+        self.history_begin("Extrude", &[entity]);
+        self.topology_session_body = Some(Some(body));
+        self.topology_delta = [0.0; 3];
+        self.region_faces = faces;
+        self.region_normal = normal;
+        self.modeling_session = Some(ModelingSession {
+            tool: ModelingTool::Extrude,
+            entity,
+            face: 0,
+            element: primary,
+            baseline_size: record.size_m,
+            baseline_inset: record.inset_m,
+            baseline_bevel: record.bevel_m,
+            baseline_local: translation,
+            amount: 0.0,
+        });
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
     fn commit_modeling_amount(&mut self, text: &str) {
         if self.modeling_session.is_none() {
             return;
@@ -2882,6 +3025,10 @@ impl Editor {
         let Some(session) = self.modeling_session else { return };
         let applied = clamp_modeling_amount(session, amount);
         if (applied - session.amount).abs() < 1.0e-9 {
+            return;
+        }
+        if region_extrude(session) {
+            self.preview_region_amount(session, applied);
             return;
         }
         let result = match session.tool {
@@ -2910,6 +3057,48 @@ impl Editor {
         self.rebuild_inspector();
     }
 
+    /// Extrudes `region_faces` from the session baseline. A rejected distance keeps the last valid body.
+    fn preview_region_amount(&mut self, session: ModelingSession, amount: f64) {
+        let Some(Some(baseline)) = self.topology_session_body.clone() else { return };
+        if amount.abs() < 1.0e-12 {
+            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                target: session.entity,
+                body: Some(baseline),
+                size_m: session.baseline_size,
+                translation: session.baseline_local,
+            });
+            if let Some(open) = self.modeling_session.as_mut() {
+                open.amount = 0.0;
+            }
+            self.rebuild_inspector();
+            return;
+        }
+        let delta = [
+            self.region_normal[0] * amount,
+            self.region_normal[1] * amount,
+            self.region_normal[2] * amount,
+        ];
+        let Ok(edit) = baseline.extrude_faces(&self.region_faces, delta) else {
+            self.realize_inspector_controls();
+            return;
+        };
+        let Ok(local_pose) = self.engine.world().entity_local_pose(session.entity) else { return };
+        let shift = local_pose.rotation.rotate(Vec3::new(edit.shift[0], edit.shift[1], edit.shift[2]));
+        let translation = Vec3::new(session.baseline_local.x + shift.x, session.baseline_local.y + shift.y, session.baseline_local.z + shift.z);
+        if self
+            .engine
+            .execute_authoring(AuthoringCommand::PreviewBlockBody { target: session.entity, body: edit.body, translation })
+            .is_err()
+        {
+            self.realize_inspector_controls();
+            return;
+        }
+        if let Some(open) = self.modeling_session.as_mut() {
+            open.amount = amount;
+        }
+        self.rebuild_inspector();
+    }
+
     fn apply_modeling(&mut self) {
         let Some(session) = self.modeling_session.take() else { return };
         self.face_drag.take();
@@ -2917,11 +3106,25 @@ impl Editor {
         let stored_body = self.topology_session_body.take();
         let delta = self.topology_delta;
         self.topology_delta = [0.0; 3];
+        let region_faces = std::mem::take(&mut self.region_faces);
+        let region_normal = self.region_normal;
+        self.region_normal = [0.0; 3];
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
         }
         let name = modeling_tool_name(session.tool);
         let result = match session.tool {
+            ModelingTool::Extrude if region_extrude(session) => {
+                if session.amount.abs() < 1.0e-12 {
+                    Ok(jarvig_core::AuthoringResult::Unchanged)
+                } else {
+                    let delta_m = [region_normal[0] * session.amount, region_normal[1] * session.amount, region_normal[2] * session.amount];
+                    self.engine.execute_authoring(AuthoringCommand::CommitBlockTopology {
+                        target: session.entity,
+                        op: BlockOp::ExtrudeFaces { faces: region_faces, delta_m },
+                    })
+                }
+            }
             ModelingTool::Extrude => self.engine.execute_authoring(AuthoringCommand::CommitBlockFace {
                 target: session.entity,
                 face: session.face,
@@ -2960,7 +3163,7 @@ impl Editor {
                 self.append(&format!("Applied {name}."));
             }
             Err(error) => {
-                if !self.history_cancel() && topology_tool(session.tool) {
+                if !self.history_cancel() && (topology_tool(session.tool) || region_extrude(session)) {
                     if let Some(body) = stored_body {
                         let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
                             target: session.entity,
@@ -2986,8 +3189,10 @@ impl Editor {
         self.gizmo_drag = None;
         let stored_body = self.topology_session_body.take();
         self.topology_delta = [0.0; 3];
+        self.region_faces.clear();
+        self.region_normal = [0.0; 3];
         if !self.history_cancel() {
-            if topology_tool(session.tool) {
+            if topology_tool(session.tool) || region_extrude(session) {
                 if let Some(body) = stored_body {
                     let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
                         target: session.entity,
@@ -3119,7 +3324,7 @@ impl Editor {
         }
     }
 
-    fn subdivide_selected_face(&mut self, entity: EntityUuid) {
+    fn subdivide_selected_face(&mut self, entity: EntityUuid, divisions: u32) {
         if self.session_active() || self.land_mode || self.character_workspace {
             self.append("Return to the level before modeling a solid.");
             return;
@@ -3156,7 +3361,7 @@ impl Editor {
             }
         }
         let opened = self.history_begin("Subdivide Face", &[entity]);
-        match self.engine.execute_authoring(AuthoringCommand::SubdivideBlockFace { target: entity, face, u: 2, v: 2 }) {
+        match self.engine.execute_authoring(AuthoringCommand::SubdivideBlockFace { target: entity, face, u: divisions, v: divisions }) {
             Ok(jarvig_core::AuthoringResult::Unchanged) => {
                 if opened {
                     self.history_commit();
@@ -3169,9 +3374,10 @@ impl Editor {
                 }
                 self.selected_face = None;
                 self.selected_body_face = Some((entity, face));
+                self.selected_body_faces = vec![face];
                 self.selected_edge = None;
                 self.selected_vertex = None;
-                self.append(&format!("Subdivided face F:{face} 2×2."));
+                self.append(&format!("Subdivided face F:{face} {divisions}×{divisions}."));
                 self.inspector_force_realize = true;
                 self.sync_outliner();
             }
@@ -4377,6 +4583,12 @@ impl Editor {
             self.step_bind_pose_shots();
         }
         self.submit_micro_request();
+        self.cage_draw_us = last_cage_draw_us();
+        self.solid_validate_us = jarvig_core::last_solid_validate_us();
+        self.mesh_rebuild_us = jarvig_core::last_block_rebuild_us();
+        if !self.self_test {
+            self.refresh_status();
+        }
         if !self.self_test && self.limit.is_some_and(|limit| self.frames >= limit) {
             unsafe {
                 KillTimer(self.frame, TIMER_FRAME);
@@ -4977,6 +5189,7 @@ impl Editor {
         mark_quality(ID_VIEW_JOINTS, self.character_workspace && self.show_joint_debug);
         mark_quality(ID_VIEW_ALL_JOINTS, self.character_workspace && self.show_all_joints);
         mark_quality(ID_VIEW_JOINT_LIMITS, self.character_workspace && self.show_joint_limits);
+        mark_quality(ID_VIEW_GRID, self.show_grid);
         mark_quality(ID_VIEW_MESHLETS, self.meshlet_debug);
         mark_quality(ID_VIEW_MESHLET_SHADE, self.meshlet_shade);
         mark_quality(ID_VIEW_MESHLET_FRUSTUM, self.meshlet_frustum);
@@ -5385,6 +5598,14 @@ impl Editor {
         } else {
             format!("{}  |  ", self.job_line)
         };
+        let workers = format!(
+            "cpu {}/{}+{}/{}  |  ",
+            self.jobs.busy_count(),
+            self.jobs.worker_count(),
+            self.einstein_jobs.busy_count(),
+            self.einstein_jobs.worker_count()
+        );
+        let solid = self.solid_timing_status();
         let micro = self.micro_status();
         let meshlets = self.meshlet_status();
         let scene = self.gpu_scene_status();
@@ -5394,7 +5615,7 @@ impl Editor {
             format!("{meshlets}{scene}  |  ")
         };
         self.set_status(&format!(
-            "{micro}{jobs}{meshlets}{progress}{play_state}{}  |  {view_name}  |  {speed}  |  {} {space}  |  Exposure: {exposure:+.1} EV  |  present={} dither={}  |  Env: {}  |  Probe: {}  |  Shadows: {shadows}{debug}{material_view}  |  {observed}  |  {}",
+            "{micro}{solid}{workers}{jobs}{meshlets}{progress}{play_state}{}  |  {view_name}  |  {speed}  |  {} {space}  |  Exposure: {exposure:+.1} EV  |  present={} dither={}  |  Env: {}  |  Probe: {}  |  Shadows: {shadows}{debug}{material_view}  |  {observed}  |  {}",
             self.status_base,
             self.object_tool.label(),
             self.presentation.label(),
@@ -5404,6 +5625,20 @@ impl Editor {
             self.probe_status()
         ));
         self.refresh_title();
+    }
+
+    fn solid_timing_status(&self) -> String {
+        let Some(entity) = self.selection.primary_entity() else { return String::new() };
+        let Some(record) = self.engine.world().authored_block(entity) else { return String::new() };
+        let (faces, edges, vertices) = record
+            .body
+            .as_ref()
+            .map(|body| (body.faces.len(), body.edges.len(), body.vertices.len()))
+            .unwrap_or((6, 12, 8));
+        format!(
+            "solid F{faces} E{edges} V{vertices} | face {}us edge {}us vert {}us | valid {}us rebuild {}us inspector {}us cage {}us  |  ",
+            self.face_pick_us, self.edge_pick_us, self.vertex_pick_us, self.solid_validate_us, self.mesh_rebuild_us, self.inspector_refresh_us, self.cage_draw_us
+        )
     }
 
     fn meshlet_status(&self) -> String {
@@ -7020,6 +7255,17 @@ impl Editor {
         self.modeling_session.is_none() && self.object_tool == chrome::ToolbarCommand::Rotate
     }
 
+    /// Subdivided cells are the click target. The object arrows stay in Object mode.
+    fn stored_faces_are_the_target(&self) -> bool {
+        if self.session_active() || self.modeling_session.is_some() {
+            return false;
+        }
+        if !matches!(self.selection_mode, SelectionMode::Auto | SelectionMode::Face) {
+            return false;
+        }
+        self.selection.primary_entity().is_some_and(|id| self.engine.world().authored_block(id).is_some_and(|record| record.body.is_some()))
+    }
+
     /// World point of the edge or vertex the translate gizmo should ride on.
     fn element_gizmo_point(&self) -> Option<Vec3> {
         let entity = self.selection.primary_entity()?;
@@ -7061,6 +7307,9 @@ impl Editor {
         }
         let topology = self.modeling_session.is_some_and(|session| topology_tool(session.tool));
         if self.modeling_session.is_some() && !topology {
+            return None;
+        }
+        if self.stored_faces_are_the_target() {
             return None;
         }
         if !topology && !matches!(self.object_tool, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) {
@@ -7123,8 +7372,15 @@ impl Editor {
                 return;
             }
         }
+        // A region extrude drags its arrow or one of the faces in the region. Other clicks wait until the session closes.
+        if self.modeling_session.is_some_and(|session| region_extrude(session) && self.selection.primary_entity() == Some(session.entity)) {
+            if !ctrl && !shift {
+                let _ = self.begin_region_drag(hwnd, x, y);
+            }
+            return;
+        }
         // The open modeling arrow and its face come before the transform gizmo.
-        if !ctrl && !shift && !self.modeling_session.is_some_and(|session| topology_tool(session.tool)) {
+        if !ctrl && !shift && !self.modeling_session.is_some_and(|session| topology_tool(session.tool) || region_extrude(session)) {
             if let Some(face) = self.operation_handle_at(x, y) {
                 if self.begin_face_drag(hwnd, face, x, y) {
                     return;
@@ -7189,13 +7445,16 @@ impl Editor {
                     .unwrap_or(hit.entity);
                 let item = selection::SelectionItem::Entity(entity);
                 self.apply_click_selection(item, ctrl, shift);
-                self.assign_picked_element(entity, hit.position, x, y);
+                self.assign_picked_element(entity, hit.position, x, y, ctrl, shift);
                 self.selection_change_us = started.elapsed().as_micros();
                 self.sync_selection_view();
             }
             None => {
                 self.pick_misses = self.pick_misses.saturating_add(1);
-                if !ctrl && !shift {
+                if self.try_body_pick(x, y, ctrl, shift) {
+                    self.selection_change_us = started.elapsed().as_micros();
+                    self.sync_selection_view();
+                } else if !ctrl && !shift {
                     self.selection.clear_from(selection::SelectionSource::Viewport);
                     self.clear_element_selection();
                     self.selection_change_us = started.elapsed().as_micros();
@@ -7215,12 +7474,12 @@ impl Editor {
         }
     }
 
-    fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64) {
+    fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64, ctrl: bool, shift: bool) {
         match self.selection_mode {
             SelectionMode::Object => self.clear_element_selection(),
             SelectionMode::Edge => self.assign_edge(entity, x, y),
             SelectionMode::Vertex => self.assign_vertex(entity, x, y),
-            SelectionMode::Auto | SelectionMode::Face => self.assign_face(entity, point, x, y),
+            SelectionMode::Auto | SelectionMode::Face => self.assign_face(entity, point, x, y, ctrl, shift),
         }
     }
 
@@ -7235,12 +7494,16 @@ impl Editor {
             return;
         };
         let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
-        if let Some(pick) = body.pick_edge(origin, direction, slack) {
+        let started = Instant::now();
+        let pick = body.pick_edge(origin, direction, slack);
+        self.note_element_pick(SelectionMode::Edge, elapsed_us(started));
+        if let Some(pick) = pick {
             self.note_edge(entity, pick.id);
         } else {
             self.selected_edge = None;
             self.selected_face = None;
             self.selected_body_face = None;
+            self.selected_body_faces.clear();
             self.selected_vertex = None;
             self.inspector_force_realize = true;
         }
@@ -7257,18 +7520,22 @@ impl Editor {
             return;
         };
         let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
-        if let Some(pick) = body.pick_vertex(origin, direction, slack) {
+        let started = Instant::now();
+        let pick = body.pick_vertex(origin, direction, slack);
+        self.note_element_pick(SelectionMode::Vertex, elapsed_us(started));
+        if let Some(pick) = pick {
             self.note_vertex(entity, pick.id);
         } else {
             self.selected_vertex = None;
             self.selected_face = None;
             self.selected_body_face = None;
+            self.selected_body_faces.clear();
             self.selected_edge = None;
             self.inspector_force_realize = true;
         }
     }
 
-    fn assign_face(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64) {
+    fn assign_face(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64, ctrl: bool, shift: bool) {
         let Some((pose, record)) = self.block_display(entity) else {
             self.clear_element_selection();
             return;
@@ -7276,10 +7543,11 @@ impl Editor {
         if record.body.is_some() {
             let Some(body) = record.body.as_ref() else { return };
             let Some((origin, direction, _)) = self.topology_ray(&pose, x, y) else { return };
-            if let Some(pick) = body.pick_face(origin, direction) {
-                self.note_body_face(entity, pick.id);
-            } else {
-                self.clear_element_selection();
+            let started = Instant::now();
+            let pick = body.pick_face(origin, direction);
+            self.note_element_pick(SelectionMode::Face, elapsed_us(started));
+            if let Some(pick) = pick {
+                self.note_body_face(entity, pick.id, ctrl, shift);
             }
             return;
         }
@@ -7364,6 +7632,9 @@ impl Editor {
 
     fn operation_handle_at(&self, x: f64, y: f64) -> Option<u8> {
         let session = self.modeling_session?;
+        if region_extrude(session) {
+            return None;
+        }
         let (entity, pose, size) = self.face_target()?;
         if entity != session.entity {
             return None;
@@ -7404,26 +7675,106 @@ impl Editor {
     fn note_selected_face(&mut self, entity: EntityUuid, face: u8) {
         let next = Some((entity, face));
         self.selected_body_face = None;
+        self.selected_body_faces.clear();
         self.selected_edge = None;
         self.selected_vertex = None;
         if self.selected_face == next {
             return;
         }
         self.selected_face = next;
-        self.inspector_force_realize = true;
         self.rebuild_inspector();
     }
 
-    fn note_body_face(&mut self, entity: EntityUuid, face: u32) {
-        let next = Some((entity, face));
+    fn note_element_pick(&mut self, mode: SelectionMode, microseconds: u32) {
+        self.face_pick_us = 0;
+        self.edge_pick_us = 0;
+        self.vertex_pick_us = 0;
+        match mode {
+            SelectionMode::Edge => self.edge_pick_us = microseconds,
+            SelectionMode::Vertex => self.vertex_pick_us = microseconds,
+            SelectionMode::Auto | SelectionMode::Face => self.face_pick_us = microseconds,
+            SelectionMode::Object => {}
+        }
+    }
+
+    /// The shaded mesh missed. The stored face, edge, or vertex under the cursor still selects.
+    fn try_body_pick(&mut self, x: f64, y: f64, ctrl: bool, shift: bool) -> bool {
+        if !matches!(self.selection_mode, SelectionMode::Auto | SelectionMode::Face | SelectionMode::Edge | SelectionMode::Vertex) {
+            return false;
+        }
+        let outline = self.engine.world().entity_outline();
+        let mut best: Option<(EntityUuid, u32, f64)> = None;
+        let mut kind = SelectionMode::Face;
+        let mut spent = 0u32;
+        for row in outline {
+            let Some((pose, record)) = self.block_display(row.uuid) else { continue };
+            let Some(body) = record.body.as_ref() else { continue };
+            let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { continue };
+            let started = Instant::now();
+            let pick = match self.selection_mode {
+                SelectionMode::Edge => body.pick_edge(origin, direction, slack),
+                SelectionMode::Vertex => body.pick_vertex(origin, direction, slack),
+                SelectionMode::Auto | SelectionMode::Face => body.pick_face(origin, direction),
+                SelectionMode::Object => None,
+            };
+            spent = spent.saturating_add(elapsed_us(started));
+            let Some(pick) = pick else { continue };
+            kind = match self.selection_mode {
+                SelectionMode::Edge => SelectionMode::Edge,
+                SelectionMode::Vertex => SelectionMode::Vertex,
+                _ => SelectionMode::Face,
+            };
+            let replace = best.is_none_or(|(_, _, ray_t)| pick.ray_t < ray_t);
+            if replace {
+                best = Some((row.uuid, pick.id, pick.ray_t));
+            }
+        }
+        let Some((entity, id, _)) = best else { return false };
+        self.note_element_pick(kind, spent);
+        if self.selection.primary_entity() != Some(entity) {
+            self.apply_click_selection(selection::SelectionItem::Entity(entity), ctrl, shift);
+        }
+        match kind {
+            SelectionMode::Edge => self.note_edge(entity, id),
+            SelectionMode::Vertex => self.note_vertex(entity, id),
+            _ => self.note_body_face(entity, id, ctrl, shift),
+        }
+        true
+    }
+
+    fn note_body_face(&mut self, entity: EntityUuid, face: u32, ctrl: bool, shift: bool) {
         self.selected_face = None;
         self.selected_edge = None;
         self.selected_vertex = None;
-        if self.selected_body_face == next {
+        let foreign = self.selected_body_face.is_some_and(|(id, _)| id != entity);
+        if foreign || (!ctrl && !shift) {
+            let unchanged = self.selected_body_face == Some((entity, face)) && self.selected_body_faces.as_slice() == [face];
+            self.selected_body_face = Some((entity, face));
+            self.selected_body_faces = vec![face];
+            if unchanged {
+                return;
+            }
+            self.rebuild_inspector();
             return;
         }
-        self.selected_body_face = next;
-        self.inspector_force_realize = true;
+        if self.selected_body_faces.is_empty() {
+            if let Some((_, existing)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+                self.selected_body_faces.push(existing);
+            }
+        }
+        if ctrl {
+            if let Some(index) = self.selected_body_faces.iter().position(|id| *id == face) {
+                self.selected_body_faces.remove(index);
+            } else {
+                self.selected_body_faces.push(face);
+            }
+            self.selected_body_face = self.selected_body_faces.last().copied().map(|id| (entity, id));
+        } else if !self.selected_body_faces.contains(&face) {
+            self.selected_body_faces.push(face);
+            self.selected_body_face = Some((entity, face));
+        } else {
+            self.selected_body_face = Some((entity, face));
+        }
         self.rebuild_inspector();
     }
 
@@ -7431,12 +7782,12 @@ impl Editor {
         let next = Some((entity, edge));
         self.selected_face = None;
         self.selected_body_face = None;
+        self.selected_body_faces.clear();
         self.selected_vertex = None;
         if self.selected_edge == next {
             return;
         }
         self.selected_edge = next;
-        self.inspector_force_realize = true;
         self.rebuild_inspector();
     }
 
@@ -7444,18 +7795,57 @@ impl Editor {
         let next = Some((entity, vertex));
         self.selected_face = None;
         self.selected_body_face = None;
+        self.selected_body_faces.clear();
         self.selected_edge = None;
         if self.selected_vertex == next {
             return;
         }
         self.selected_vertex = next;
-        self.inspector_force_realize = true;
         self.rebuild_inspector();
+    }
+
+    fn begin_region_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if !region_extrude(session) || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let Some((pose, record)) = self.block_display(session.entity) else { return false };
+        let Some(body) = record.body.clone().or_else(|| record.display_body()) else { return false };
+        let Some(center_local) = region_center(&body, &self.region_faces) else { return false };
+        let center = self.world_of(&pose, center_local);
+        let arrow = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
+        let Some(ray) = self.viewport_ray(x, y) else { return false };
+        let Some(length) = self.gizmo_length(center) else { return false };
+        let on_arrow = gizmo::hit_operation_handle(ray.origin, ray.direction, center, arrow, length);
+        let on_region = self
+            .topology_ray(&pose, x, y)
+            .and_then(|(origin, direction, _)| body.pick_face(origin, direction))
+            .is_some_and(|pick| self.region_faces.contains(&pick.id));
+        if !on_arrow && !on_region {
+            return false;
+        }
+        let plane_normal = gizmo::axis_drag_plane(arrow, ray.direction);
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, center, plane_normal) else { return false };
+        self.face_drag = Some(FaceDrag {
+            entity: session.entity,
+            face: 0,
+            baseline_size: session.baseline_size,
+            baseline_inset: session.baseline_inset,
+            baseline_bevel: session.baseline_bevel,
+            baseline_local: session.baseline_local,
+            plane_point: center,
+            world_normal: arrow,
+            plane_normal,
+            start_hit: hit,
+            amount_origin: session.amount,
+        });
+        self.begin_capture(hwnd, CaptureKind::Face);
+        true
     }
 
     fn begin_face_drag(&mut self, hwnd: HWND, face: u8, x: f64, y: f64) -> bool {
         let Some(session) = self.modeling_session else { return false };
-        if session.face != face || self.selection.primary_entity() != Some(session.entity) {
+        if region_extrude(session) || session.face != face || self.selection.primary_entity() != Some(session.entity) {
             return false;
         }
         let entity = session.entity;
@@ -7532,13 +7922,24 @@ impl Editor {
 
     fn restore_face_drag(&mut self) {
         let Some(drag) = self.face_drag.take() else { return };
-        let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
-            target: drag.entity,
-            size_m: drag.baseline_size,
-            inset_m: drag.baseline_inset,
-            bevel_m: drag.baseline_bevel,
-            translation: drag.baseline_local,
-        });
+        if self.modeling_session.is_some_and(region_extrude) {
+            if let Some(Some(body)) = self.topology_session_body.clone() {
+                let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                    target: drag.entity,
+                    body: Some(body),
+                    size_m: drag.baseline_size,
+                    translation: drag.baseline_local,
+                });
+            }
+        } else {
+            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
+                target: drag.entity,
+                size_m: drag.baseline_size,
+                inset_m: drag.baseline_inset,
+                bevel_m: drag.baseline_bevel,
+                translation: drag.baseline_local,
+            });
+        }
         if let Some(session) = self.modeling_session.as_mut() {
             if session.entity == drag.entity {
                 session.amount = modeling_start_amount(session);
@@ -7730,11 +8131,19 @@ impl Editor {
             if let Some((pose, record)) = self.block_display(entity) {
                 if let Some(body) = record.display_body() {
                     if let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) {
+                        let started = Instant::now();
                         match self.selection_mode {
-                            SelectionMode::Edge => edge = body.pick_edge(origin, direction, slack).map(|pick| pick.id),
-                            SelectionMode::Vertex => vertex = body.pick_vertex(origin, direction, slack).map(|pick| pick.id),
+                            SelectionMode::Edge => {
+                                edge = body.pick_edge(origin, direction, slack).map(|pick| pick.id);
+                                self.note_element_pick(SelectionMode::Edge, elapsed_us(started));
+                            }
+                            SelectionMode::Vertex => {
+                                vertex = body.pick_vertex(origin, direction, slack).map(|pick| pick.id);
+                                self.note_element_pick(SelectionMode::Vertex, elapsed_us(started));
+                            }
                             SelectionMode::Auto | SelectionMode::Face if record.body.is_some() => {
                                 face = body.pick_face(origin, direction).map(|pick| pick.id);
+                                self.note_element_pick(SelectionMode::Face, elapsed_us(started));
                             }
                             _ => {}
                         }
@@ -7754,8 +8163,12 @@ impl Editor {
     }
 
     fn update_face_hover(&mut self, x: f64, y: f64) {
-        let hover = if self.face_drag.is_some() {
+        let hover = if self.modeling_session.is_some_and(region_extrude) {
+            None
+        } else if self.face_drag.is_some() {
             self.face_drag.as_ref().map(|drag| drag.face)
+        } else if self.modeling_session.is_some_and(|session| topology_tool(session.tool) || region_extrude(session)) {
+            None
         } else if self.modeling_session.is_some_and(|session| !topology_tool(session.tool)) {
             self.operation_handle_at(x, y)
         } else if matches!(self.selection_mode, SelectionMode::Object | SelectionMode::Edge | SelectionMode::Vertex) {
@@ -8052,7 +8465,7 @@ impl Editor {
             stats.map(|stats| stats.meshlets_rejected).unwrap_or(0),
         );
         format!(
-            "{coverage}base tris {} | micro tris +{} | patches {} | below {} | exact {} | lod {} | occ {} | off {} | budg {} | anchor {} | mat {} | near {:.2} px | miss {} | {} | samples {} | verts {} | gen {} us | upload {} us | queue {} us | publish {} us | reuse {} | cancelled {} | stale {} | fallback {} | seed {} | elig {} = det {} + below {} + exact {} + def {} + unsup {} | unclass {} | req {} ready {} pub {} | ",
+            "{coverage}base tris {} | micro tris +{} | patches {} | below {} | exact {} | lod {} | occ {} | off {} | budg {} | anchor {} | mat {} | near {:.2} px | miss {} | {} | samples {} | verts {} | classify {} us | queue {} us | gen {} us | host {} us | upload {} us | publish {} us | reuse {} | cancelled {} | stale {} | fallback {} | seed {} | elig {} = det {} + below {} + exact {} + def {} + unsup {} | unclass {} | req {} ready {} pub {} | ",
             grouped(base),
             grouped(triangles),
             patches,
@@ -8069,9 +8482,11 @@ impl Editor {
             self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready"),
             samples,
             vertices,
-            generation,
-            upload,
+            stats.map(|stats| stats.micro_classify_us).unwrap_or(0),
             stats.map(|stats| stats.micro_queue_wait_us).unwrap_or(0),
+            generation,
+            stats.map(|stats| stats.micro_host_wait_us).unwrap_or(0),
+            upload,
             stats.map(|stats| stats.micro_publish_us).unwrap_or(0),
             stats.map(|stats| stats.micro_reused).unwrap_or(0),
             stats.map(|stats| stats.micro_cancelled).unwrap_or(0),
@@ -8115,7 +8530,7 @@ impl Editor {
     fn micro_operation_stage(&self) -> String {
         if let Some(job) = &self.micro_job {
             if !job.finished {
-                if let Some(snap) = self.jobs.snapshots().iter().find(|snap| snap.id == job.id) {
+                if let Some(snap) = self.einstein_jobs.snapshots().iter().find(|snap| snap.id == job.id) {
                     return snap.stage.clone();
                 }
                 return "Queued".into();
@@ -8880,15 +9295,17 @@ impl Editor {
         };
         let leg = if self.transition_index < self.transition_forward { "out" } else { "back" };
         println!(
-            "RFC0002_TRANSITION_FRAME {leg} distance={:.3} projected={:.3} base={} micro={} verts={} gen_us={} upload_us={} queue_us={} publish_us={} reuse={} cancelled={} stale={} partial={} fingerprint={:x} leaves={}",
+            "RFC0002_TRANSITION_FRAME {leg} distance={:.3} projected={:.3} base={} micro={} verts={} classify_us={} gen_us={} upload_us={} queue_us={} host_us={} publish_us={} reuse={} cancelled={} stale={} partial={} fingerprint={:x} leaves={}",
             row.distance,
             row.projected_px,
             row.base_triangles,
             row.micro_triangles,
             row.vertices,
+            stats.map(|stats| stats.micro_classify_us).unwrap_or(0),
             row.generation_us,
             row.upload_us,
             stats.map(|stats| stats.micro_queue_wait_us).unwrap_or(0),
+            stats.map(|stats| stats.micro_host_wait_us).unwrap_or(0),
             stats.map(|stats| stats.micro_publish_us).unwrap_or(0),
             row.reused,
             stats.map(|stats| stats.micro_cancelled).unwrap_or(0),
@@ -10593,7 +11010,7 @@ impl Editor {
         let Some(request) = self.renderer.as_mut().and_then(|renderer| renderer.take_micro_request()) else { return };
         if let Some(previous) = self.micro_job.as_ref() {
             if !previous.finished && !previous.cancel_noted {
-                self.jobs.cancel(previous.id);
+                self.einstein_jobs.cancel(previous.id);
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.note_micro_cancelled();
                 }
@@ -10609,7 +11026,7 @@ impl Editor {
         let tan_half = request.tan_half;
         let budget = request.budget;
         let provider = request.provider;
-        let id = self.jobs.submit(
+        let id = self.einstein_jobs.submit(
             jarvig_core::JobDesc {
                 name: "Build Einstein Surface".into(),
                 asset: None,
@@ -10624,7 +11041,7 @@ impl Editor {
                 }
                 ctx.report(0.2, "Building");
                 let mesh = jarvig_core::build_procedural_microtriangles_cancellable(&anchors, seed, true, height, tan_half, &budget, provider, &|| ctx.cancel_requested())?;
-                Ok(MicroJobProduct { epoch, key, mesh, queue_wait_us, skipped })
+                Ok(MicroJobProduct { epoch, key, mesh, queue_wait_us, skipped, finished_at: Instant::now() })
             },
         );
         self.micro_job = Some(MicroJob { id, epoch, finished: false, cancel_noted: false });
@@ -10633,7 +11050,7 @@ impl Editor {
     fn poll_micro_job(&mut self) {
         let Some(id) = self.micro_job.as_ref().map(|job| job.id) else { return };
         let wanted = self.renderer.as_ref().map(|renderer| renderer.micro_wanted_epoch()).unwrap_or(0);
-        let snap = self.jobs.snapshots().into_iter().find(|snap| snap.id == id);
+        let snap = self.einstein_jobs.snapshots().into_iter().find(|snap| snap.id == id);
         let Some(snap) = snap else { return };
         if snap.state.finished() {
             if self.micro_job.as_ref().is_some_and(|job| job.finished) {
@@ -10644,14 +11061,16 @@ impl Editor {
                 job.finished = true;
             }
             match snap.state {
-                jarvig_core::JobState::Completed => match self.jobs.take_result::<MicroJobProduct>(id) {
+                jarvig_core::JobState::Completed => match self.einstein_jobs.take_result::<MicroJobProduct>(id) {
                     Some(Ok(product)) => {
                         let epoch = product.epoch;
+                        let host_wait_us = elapsed_us(product.finished_at);
                         let accepted = self.renderer.as_mut().is_some_and(|renderer| {
+                            renderer.note_micro_host_wait(host_wait_us);
                             renderer.accept_micro_build(product.epoch, product.key, product.mesh, product.queue_wait_us, product.skipped)
                         });
                         if accepted {
-                            self.jobs.note(id, 0.85, "Uploading");
+                            self.einstein_jobs.note(id, 0.85, "Uploading");
                         } else if let Some(renderer) = self.renderer.as_mut() {
                             renderer.abandon_micro_build(epoch);
                         }
@@ -10673,7 +11092,7 @@ impl Editor {
                 },
                 jarvig_core::JobState::Cancelled => {
                     let epoch = self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0);
-                    let _ = self.jobs.take_result::<MicroJobProduct>(id);
+                    let _ = self.einstein_jobs.take_result::<MicroJobProduct>(id);
                     if let Some(renderer) = self.renderer.as_mut() {
                         renderer.abandon_micro_build(epoch);
                     }
@@ -10681,7 +11100,7 @@ impl Editor {
                 jarvig_core::JobState::Failed => {
                     let epoch = self.micro_job.as_ref().map(|job| job.epoch).unwrap_or(0);
                     let error = snap.error.unwrap_or_else(|| "unknown".into());
-                    let _ = self.jobs.take_result::<MicroJobProduct>(id);
+                    let _ = self.einstein_jobs.take_result::<MicroJobProduct>(id);
                     if let Some(renderer) = self.renderer.as_mut() {
                         renderer.abandon_micro_build(epoch);
                     }
@@ -10694,7 +11113,7 @@ impl Editor {
         }
         let cancel = self.micro_job.as_ref().is_some_and(|job| !job.cancel_noted && job.epoch != wanted);
         if cancel {
-            self.jobs.cancel(id);
+            self.einstein_jobs.cancel(id);
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.note_micro_cancelled();
             }
@@ -10707,9 +11126,9 @@ impl Editor {
     fn note_micro_job_stage(&mut self, id: jarvig_core::JobId) {
         let stage = self.renderer.as_ref().map(|renderer| renderer.micro_stage()).unwrap_or("Ready");
         if stage == "Uploading" {
-            self.jobs.note(id, 0.85, "Uploading");
+            self.einstein_jobs.note(id, 0.85, "Uploading");
         } else if stage == "Ready" {
-            self.jobs.note(id, 1.0, "Ready");
+            self.einstein_jobs.note(id, 1.0, "Ready");
         }
     }
 
@@ -10718,12 +11137,11 @@ impl Editor {
         self.poll_registry_job();
         self.poll_micro_job();
         let snaps = self.jobs.snapshots();
-        let micro_id = self.micro_job.as_ref().map(|job| job.id);
         let registry_id = self.registry_job;
         let land_id = self.land_chunk_job;
         for snap in &snaps {
             let tracked = self.parent_job.as_ref().map(|job| job.id) == Some(snap.id);
-            if snap.state.finished() && !tracked && Some(snap.id) != micro_id && Some(snap.id) != registry_id && Some(snap.id) != land_id {
+            if snap.state.finished() && !tracked && Some(snap.id) != registry_id && Some(snap.id) != land_id {
                 let _ = self.jobs.take_result::<jarvig_core::ParentGeometry>(snap.id);
             }
         }
@@ -12140,32 +12558,35 @@ impl Editor {
     }
 
     fn show_background_jobs(&mut self) {
-        let snaps = self.jobs.snapshots();
-        if snaps.is_empty() {
+        let general = self.jobs.snapshots();
+        let einstein = self.einstein_jobs.snapshots();
+        if general.is_empty() && einstein.is_empty() {
             self.append("Background jobs: none.");
             return;
         }
         self.append("Background jobs:");
-        for snap in snaps {
-            let seconds = snap.elapsed_ms / 1000;
-            self.append(&format!(
-                "  {} {} {} {:.0}% {} {:02}:{:02}{}",
-                snap.id.0,
-                snap.name,
-                snap.state.label(),
-                snap.progress * 100.0,
-                snap.stage,
-                seconds / 60,
-                seconds % 60,
-                snap.error.as_ref().map(|error| format!(" {error}")).unwrap_or_default()
-            ));
+        for (pool, snaps) in [("general", general), ("einstein", einstein)] {
+            for snap in snaps {
+                let seconds = snap.elapsed_ms / 1000;
+                self.append(&format!(
+                    "  {pool} {} {} {} {:.0}% {} {:02}:{:02}{}",
+                    snap.id.0,
+                    snap.name,
+                    snap.state.label(),
+                    snap.progress * 100.0,
+                    snap.stage,
+                    seconds / 60,
+                    seconds % 60,
+                    snap.error.as_ref().map(|error| format!(" {error}")).unwrap_or_default()
+                ));
+            }
         }
     }
 
     fn cancel_background_job(&mut self) {
         if let Some(job) = self.micro_job.as_ref() {
             if !job.finished {
-                self.jobs.cancel(job.id);
+                self.einstein_jobs.cancel(job.id);
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.note_micro_cancelled();
                 }
@@ -12870,7 +13291,9 @@ impl Editor {
                 self.gizmo_drag.as_ref().map(|drag| drag.handle),
             ));
         }
+        let cage_started = Instant::now();
         self.push_solid_overlay(&mut vertices, camera.position);
+        CAGE_DRAW_US.with(|slot| slot.set(elapsed_us(cage_started)));
         let segments = self.visible_joint_segments();
         if !segments.is_empty() {
             vertices.extend(gizmo::joint_debug_vertices(&segments, camera.position));
@@ -12906,6 +13329,21 @@ impl Editor {
                 }
                 return;
             }
+            if region_extrude(session) {
+                let geometry = record.as_ref().and_then(|record| record.body.clone()).or_else(|| self.session_geometry(&session));
+                if let Some(geometry) = geometry {
+                    self.draw_body_edges(vertices, camera, &pose, length, &geometry, None, None, false);
+                    for face in &self.region_faces {
+                        self.draw_face_loop(vertices, camera, &pose, length, &geometry, *face, false);
+                    }
+                    if let Some(local) = region_center(&geometry, &self.region_faces) {
+                        let center = self.world_of(&pose, local);
+                        let direction = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
+                        vertices.extend(gizmo::region_arrow_vertices(center, direction, camera, length, self.face_drag.is_some()));
+                    }
+                }
+                return;
+            }
             let hot = self.face_hover.filter(|face| *face == session.face);
             vertices.extend(gizmo::face_outline_vertices(pose.translation, pose.rotation, size, camera, length, &[session.face], hot));
             vertices.extend(gizmo::operation_handle_vertices(
@@ -12922,7 +13360,15 @@ impl Editor {
         }
         match self.selection_mode {
             SelectionMode::Object => {
-                vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                if self.show_grid {
+                    if let Some(body) = body.as_ref() {
+                        self.draw_body_edges(vertices, camera, &pose, length, body, None, None, false);
+                    } else {
+                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                    }
+                } else {
+                    vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                }
             }
             SelectionMode::Edge => {
                 if let Some(body) = body.as_ref() {
@@ -12943,53 +13389,86 @@ impl Editor {
             }
             SelectionMode::Auto | SelectionMode::Face => {
                 let stored = record.as_ref().is_some_and(|record| record.body.is_some());
-                if stored {
+                let cage = self.selection_mode == SelectionMode::Face || stored || self.show_grid;
+                if cage {
                     if let Some(body) = body.as_ref() {
-                        let mut faces = Vec::new();
-                        if let Some(face) = self.body_face_hover {
-                            faces.push(face);
-                        }
-                        if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
-                            if !faces.contains(&face) {
-                                faces.push(face);
-                            }
-                        } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
-                            let face = u32::from(face) + 1;
-                            if !faces.contains(&face) {
-                                faces.push(face);
-                            }
-                        }
-                        if faces.is_empty() {
-                            vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                        self.draw_body_edges(vertices, camera, &pose, length, body, None, None, false);
+                        if stored {
+                            self.push_body_face_highlights(vertices, camera, &pose, length, body, entity);
                         } else {
-                            for face in faces {
-                                let hot = self.body_face_hover == Some(face);
-                                self.draw_face_loop(vertices, camera, &pose, length, body, face, hot);
-                            }
+                            self.push_analytic_face_highlights(vertices, camera, &pose, size, length, entity);
                         }
+                    } else {
+                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
+                        self.push_analytic_face_highlights(vertices, camera, &pose, size, length, entity);
                     }
                 } else {
                     let face_selected = self.selected_face.is_some_and(|(id, _)| id == entity);
-                    if !face_selected && self.selection_mode != SelectionMode::Face {
+                    if !face_selected {
                         vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
                     }
-                    if self.selection_mode == SelectionMode::Face && !face_selected {
-                        vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
-                    }
-                    let mut faces = Vec::new();
-                    if let Some(face) = self.face_hover {
-                        faces.push(face);
-                    }
-                    if let Some((id, face)) = self.selected_face {
-                        if id == entity && !faces.contains(&face) {
-                            faces.push(face);
-                        }
-                    }
-                    if !faces.is_empty() {
-                        vertices.extend(gizmo::face_outline_vertices(pose.translation, pose.rotation, size, camera, length, &faces, self.face_hover));
-                    }
+                    self.push_analytic_face_highlights(vertices, camera, &pose, size, length, entity);
                 }
             }
+        }
+    }
+
+    fn push_body_face_highlights(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        body: &SolidBody,
+        entity: EntityUuid,
+    ) {
+        let mut faces = Vec::new();
+        if let Some(face) = self.body_face_hover {
+            faces.push(face);
+        }
+        for face in &self.selected_body_faces {
+            if !faces.contains(face) {
+                faces.push(*face);
+            }
+        }
+        if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        } else if self.selected_body_faces.is_empty() {
+            if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
+                let face = u32::from(face) + 1;
+                if !faces.contains(&face) {
+                    faces.push(face);
+                }
+            }
+        }
+        for face in faces {
+            let hot = self.body_face_hover == Some(face);
+            self.draw_face_loop(vertices, camera, pose, length, body, face, hot);
+        }
+    }
+
+    fn push_analytic_face_highlights(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        size: [f64; 3],
+        length: f64,
+        entity: EntityUuid,
+    ) {
+        let mut faces = Vec::new();
+        if let Some(face) = self.face_hover {
+            faces.push(face);
+        }
+        if let Some((id, face)) = self.selected_face {
+            if id == entity && !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+        if !faces.is_empty() {
+            vertices.extend(gizmo::face_outline_vertices(pose.translation, pose.rotation, size, camera, length, &faces, self.face_hover));
         }
     }
 
@@ -13004,14 +13483,9 @@ impl Editor {
         hover: Option<u32>,
         faint: bool,
     ) {
-        let mut drawn = 0u32;
         for (id, start, end) in body.edge_segments() {
             let hot = selected == Some(id);
             let hovered = hover == Some(id);
-            if drawn >= 256 && !hot && !hovered {
-                continue;
-            }
-            drawn += 1;
             let (radius, color) = if hot {
                 (length * 0.022, [0.95, 0.45, 0.38, 1.0])
             } else if hovered {
@@ -13035,14 +13509,9 @@ impl Editor {
         selected: Option<u32>,
         hover: Option<u32>,
     ) {
-        let mut drawn = 0u32;
         for vertex in &body.vertices {
             let hot = selected == Some(vertex.id);
             let hovered = hover == Some(vertex.id);
-            if drawn >= 256 && !hot && !hovered {
-                continue;
-            }
-            drawn += 1;
             let (radius, color) = if hot {
                 (length * 0.018, [0.95, 0.45, 0.38, 1.0])
             } else if hovered {
@@ -14626,6 +15095,15 @@ impl Editor {
                 self.refresh_status();
             }
             ID_VIEW_INSPECTOR => self.toggle_panel(INSPECTOR),
+            ID_VIEW_GRID => {
+                self.show_grid = !self.show_grid;
+                self.sync_view_menu();
+                self.append(if self.show_grid {
+                    "Topology grid is on. Each line is an edge of the solid."
+                } else {
+                    "Topology grid is off. Face, Edge, and Vertex modes still draw it."
+                });
+            }
             ID_VIEW_CONTENT => self.toggle_panel(CONTENT),
             ID_VIEW_OUTPUT => self.toggle_panel(OUTPUT),
             ID_VIEW_RESET => self.reset_from_menu(),
@@ -14825,7 +15303,7 @@ impl Editor {
             for control in &self.inspector_controls {
                 SendMessageW(control.hwnd, WM_SETFONT, self.ui_font as WPARAM, 1);
             }
-            InvalidateRect(self.toolbar, std::ptr::null(), 1);
+            InvalidateRect(self.toolbar, std::ptr::null(), 0);
         }
     }
 
@@ -14835,20 +15313,31 @@ impl Editor {
             let hdc = BeginPaint(hwnd, &mut paint);
             if !hdc.is_null() {
                 let (width, height) = client_size(hwnd);
-                self.toolbar_icons.paint(
-                    hdc,
-                    width as i32,
-                    height as i32,
-                    self.dpi,
-                    self.toolbar_hot,
-                    self.object_tool,
-                    self.transform_space == gizmo::TransformSpace::Local,
-                    self.play_toolbar(),
-                    self.ui_font,
-                    self.editor_mode(),
-                    self.modeling_tools_visible(),
-                    self.modeling_toolbar_command(),
-                );
+                let width = width as i32;
+                let height = height as i32;
+                let memory = CreateCompatibleDC(hdc);
+                let bitmap = CreateCompatibleBitmap(hdc, width.max(1), height.max(1));
+                if !memory.is_null() && !bitmap.is_null() {
+                    let previous = SelectObject(memory, bitmap as _);
+                    self.toolbar_icons.paint(
+                        memory,
+                        width,
+                        height,
+                        self.dpi,
+                        self.toolbar_hot,
+                        self.object_tool,
+                        self.transform_space == gizmo::TransformSpace::Local,
+                        self.play_toolbar(),
+                        self.ui_font,
+                        self.editor_mode(),
+                        self.modeling_tools_visible(),
+                        self.modeling_toolbar_command(),
+                    );
+                    BitBlt(hdc, 0, 0, width.max(1), height.max(1), memory, 0, 0, SRCCOPY);
+                    SelectObject(memory, previous);
+                    DeleteObject(bitmap as _);
+                    DeleteDC(memory);
+                }
             }
             EndPaint(hwnd, &paint);
         }
@@ -14872,7 +15361,7 @@ impl Editor {
             chrome::ToolbarCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
             chrome::ToolbarCommand::Subdivide => {
                 if let Some(entity) = self.selection.primary_entity() {
-                    self.subdivide_selected_face(entity);
+                    self.subdivide_selected_face(entity, 2);
                 } else {
                     self.append("Select a parametric solid first.");
                 }
@@ -14977,12 +15466,39 @@ fn modeling_start_amount(session: &ModelingSession) -> f64 {
     }
 }
 
+/// Mean of the unique vertices on the named faces, in the solid's local frame.
+fn region_center(body: &SolidBody, faces: &[u32]) -> Option<[f64; 3]> {
+    let mut seen = Vec::new();
+    let mut sum = [0.0; 3];
+    let mut count = 0.0;
+    for face in faces {
+        let loop_ = body.face_loop(*face)?;
+        for vertex in loop_ {
+            if seen.contains(vertex) {
+                continue;
+            }
+            seen.push(*vertex);
+            let position = body.vertex_position(*vertex)?;
+            sum[0] += position[0];
+            sum[1] += position[1];
+            sum[2] += position[2];
+            count += 1.0;
+        }
+    }
+    if count == 0.0 {
+        None
+    } else {
+        Some([sum[0] / count, sum[1] / count, sum[2] / count])
+    }
+}
+
 /// Extrude reports the distance the face actually moved. Bevel and inset stay inside the solid.
 fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
     if !amount.is_finite() {
         return session.amount;
     }
     match session.tool {
+        ModelingTool::Extrude if session.element != 0 => amount,
         ModelingTool::Extrude => {
             let axis = (session.face / 2) as usize;
             let grown = (session.baseline_size[axis] + amount).clamp(jarvig_core::BLOCK_MIN_EXTENT_M, jarvig_core::BLOCK_MAX_EXTENT_M);
@@ -14993,12 +15509,19 @@ fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
     }
 }
 
-fn modeling_view(session: ModelingSession) -> inspector::ModelingView {
+fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::ModelingView {
     let limit = jarvig_core::feature_limit(session.baseline_size);
     match session.tool {
         ModelingTool::Extrude => inspector::ModelingView {
             title: "Extrude",
-            face: face_name(session.face).to_string(),
+            face: if region_extrude(session) {
+                match region_faces {
+                    [id] => format!("F:{id}"),
+                    faces => format!("{} faces", faces.len()),
+                }
+            } else {
+                face_name(session.face).to_string()
+            },
             amount_label: "Amount",
             amount: session.amount,
             minimum: -1000.0,
@@ -16242,6 +16765,7 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU, HMENU), St
     append(view, ID_VIEW_JOINT_LIMITS, "Show Joint Limits");
     append(view, ID_VIEW_MESH_PARTS, "Mesh Parts");
     append(view, ID_VIEW_INSPECTOR, "Inspector");
+    append(view, ID_VIEW_GRID, "Show Grid");
     append(view, ID_VIEW_CONTENT, "Content Browser");
     append(view, ID_VIEW_OUTPUT, "Output Log");
     append(view, ID_VIEW_RESET, "Reset Layout");

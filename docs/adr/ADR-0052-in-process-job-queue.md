@@ -39,4 +39,4 @@ Nothing.
 
 ## Superseded By
 
-Nothing.
+ADR-0071, for Einstein surface builds only. The rest of this decision stays.
