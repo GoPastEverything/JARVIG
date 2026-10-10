@@ -23,7 +23,7 @@
 <p><strong>Edit &gt; Undo</strong> is Ctrl+Z. <strong>Edit &gt; Redo</strong> is Ctrl+Y or Ctrl+Shift+Z. The menu names the entry. Undo and Redo are not toolbar buttons.</p>
 <p>The stack holds 64 transactions and drops the oldest. One user intent is one entry: a gizmo drag from press to release, a numeric field from focus to commit, a sculpt stroke, a committed modeling Apply, Create Block, duplicate, delete, mirror, align, snap, reset shape, a material change, a terrain stroke, Place Mesh, and Place Prefab.</p>
 <p>Cancel records nothing. Loading a level clears the stacks. Play does not record ticks, and undo refuses during Play. There is no Cut, Copy, or Paste.</p>
-<p>The block also keeps a feature log of at most 24 edits. That log is not this undo stack. Undo puts the solid back. The log is the record of Apply. <a href="modeling.html">Blocks</a> separates the two.</p>
+<p>A stored body also keeps a feature log of at most 24 edits. That log is not this undo stack. Undo puts the solid back. The log is the record of Apply. An authored block saves the seed and the later operations instead, and the file has no body. <a href="modeling.html">Blocks</a> separates the two.</p>
 <h2 id="what-the-panels-show">What the panels show</h2>
 <p>The outliner is the entity list. Suffixes include Mesh, Light, Probe, World, and Spawn. In Land it also lists the terrain tools. In Character it lists joints.</p>
 <p>The inspector edits the selected entity through engine commands. During Play it is read-only.</p>

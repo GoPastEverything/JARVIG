@@ -65,7 +65,7 @@ The stack holds 64 transactions and drops the oldest. One user intent is one ent
 
 Cancel records nothing. Loading a level clears the stacks. Play does not record ticks, and undo refuses during Play. There is no Cut, Copy, or Paste.
 
-The block also keeps a feature log of at most 24 edits. That log is not this undo stack. Undo puts the solid back. The log is the record of Apply. [Blocks](modeling.md) separates the two.
+A stored body also keeps a feature log of at most 24 edits. That log is not this undo stack. Undo puts the solid back. The log is the record of Apply. An authored block saves the seed and the later operations instead, and the file has no body. [Blocks](modeling.md) separates the two.
 
 ## What the panels show
 

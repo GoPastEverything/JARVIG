@@ -13,7 +13,7 @@ Parametric solid
   -> GPU
 ```
 
-The saved component is `ParametricBlock`. The level writes format version 6 only when a block is present. The file stores full extents in meters, one material slot, and the entity transform. A solid that is not plain also stores per-face inset, one bevel, and a history log. It does not store triangles, meshlets, or Einstein patches. The runtime mesh is rebuilt from that record. Object scale stays (1, 1, 1). Size is not a frame scale.
+The saved component is `ParametricBlock`. The level writes format version 6 only when a block is present. The file stores full extents in meters, one material slot, and the entity transform. A solid that is not plain also stores per-face inset, one bevel, and a history log. It does not store triangles, meshlets, or Einstein patches. The runtime mesh is rebuilt from that record. Object scale stays (1, 1, 1). Size is not a frame scale. Create > Block writes an authored seed and does not store a body. That tape is the section below. Inset, bevel, and the history log in this paragraph belong to a stored body.
 
 Collision is the analytic oriented box in the entity frame: half extents are `size / 2`. Play's free-fly pawn is kept outside that box by a small radius. There is no physics solver. This is not JRV-0090.
 
