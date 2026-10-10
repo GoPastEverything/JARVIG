@@ -253,6 +253,198 @@ pub fn inspector_summary(selection: &SelectionService, name_of: impl Fn(EntityUu
     }
 }
 
+/// One solid's faces, edges, or vertices. A modeling command receives this whole set.
+///
+/// A plain click replaces the set. Ctrl toggles one element, and Ctrl wins over Shift.
+/// Shift adds. A different solid, or a different element kind, replaces the set.
+/// Order is click order. The primary is the last element the click named, which can
+/// stay in place when Shift names an element that is already selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionSet {
+    entity: Option<EntityUuid>,
+    kind: Option<ElementKind>,
+    ids: Vec<u32>,
+    primary: Option<u32>,
+}
+
+/// The element a solid click names. This is not an entity, and not a triangle index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementKind {
+    Face,
+    Edge,
+    Vertex,
+}
+
+impl Default for SelectionSet {
+    fn default() -> Self {
+        Self { entity: None, kind: None, ids: Vec::new(), primary: None }
+    }
+}
+
+impl SelectionSet {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn entity(&self) -> Option<EntityUuid> {
+        self.entity
+    }
+
+    pub fn kind(&self) -> Option<ElementKind> {
+        self.kind
+    }
+
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn primary(&self) -> Option<u32> {
+        self.primary.filter(|id| self.ids.contains(id))
+    }
+
+    /// Replaces the set in the given order. Zero and duplicates are dropped. An empty list clears it.
+    ///
+    /// This is not a click and not an undo entry. The caller does not write the solid.
+    pub fn replace_ids(&mut self, entity: EntityUuid, kind: ElementKind, ids: &[u32]) -> bool {
+        let mut next = Vec::new();
+        for id in ids {
+            if *id == 0 || next.contains(id) {
+                continue;
+            }
+            next.push(*id);
+        }
+        if next.is_empty() {
+            let changed = !self.is_empty();
+            self.clear();
+            return changed;
+        }
+        let primary = next.last().copied();
+        let unchanged = self.entity == Some(entity) && self.kind == Some(kind) && self.ids == next && self.primary == primary;
+        self.entity = Some(entity);
+        self.kind = Some(kind);
+        self.ids = next;
+        self.primary = primary;
+        !unchanged
+    }
+
+    /// `true` when the set changed. A repeated plain click on the same element is unchanged.
+    pub fn click(&mut self, entity: EntityUuid, kind: ElementKind, id: u32, ctrl: bool, shift: bool) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let same_target = self.entity == Some(entity) && self.kind == Some(kind);
+        if !same_target || (!ctrl && !shift) {
+            let unchanged = same_target && self.ids.as_slice() == [id] && self.primary == Some(id);
+            self.entity = Some(entity);
+            self.kind = Some(kind);
+            self.ids = vec![id];
+            self.primary = Some(id);
+            return !unchanged;
+        }
+        if ctrl {
+            if let Some(index) = self.ids.iter().position(|stored| *stored == id) {
+                self.ids.remove(index);
+                self.primary = self.ids.last().copied();
+                if self.ids.is_empty() {
+                    self.clear();
+                }
+            } else {
+                self.ids.push(id);
+                self.primary = Some(id);
+            }
+            return true;
+        }
+        let mut changed = false;
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
+            changed = true;
+        }
+        if self.primary != Some(id) {
+            self.primary = Some(id);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Box selection uses the same replace, toggle, and add rules as a click.
+    ///
+    /// A different solid or element kind replaces the set, including when Ctrl or Shift is held.
+    /// Zero is dropped. An empty hit list on a plain drag clears the set. Ctrl or Shift with no hits leaves it.
+    pub fn apply_box(&mut self, entity: EntityUuid, kind: ElementKind, hits: &[u32], ctrl: bool, shift: bool) -> bool {
+        let mut unique = Vec::new();
+        for id in hits {
+            if *id != 0 && !unique.contains(id) {
+                unique.push(*id);
+            }
+        }
+        let same_target = self.entity == Some(entity) && self.kind == Some(kind);
+        if !same_target || (!ctrl && !shift) {
+            return self.replace_ids(entity, kind, &unique);
+        }
+        if unique.is_empty() {
+            return false;
+        }
+        if ctrl {
+            for id in unique {
+                if let Some(index) = self.ids.iter().position(|stored| *stored == id) {
+                    self.ids.remove(index);
+                } else {
+                    self.ids.push(id);
+                }
+            }
+            self.primary = self.ids.last().copied();
+            if self.ids.is_empty() {
+                self.clear();
+            }
+            return true;
+        }
+        let mut changed = false;
+        for id in &unique {
+            if !self.ids.contains(id) {
+                self.ids.push(*id);
+                changed = true;
+            }
+        }
+        let primary = unique.last().copied();
+        if self.primary != primary {
+            self.primary = primary;
+            changed = true;
+        }
+        changed
+    }
+
+    /// One element prints its id. Several print the count, so one id is not the selection.
+    pub fn label(&self) -> Option<String> {
+        let kind = self.kind?;
+        let count = self.ids.len();
+        if count == 0 {
+            return None;
+        }
+        if count == 1 {
+            let id = self.primary()?;
+            return Some(match kind {
+                ElementKind::Face => format!("F:{id}"),
+                ElementKind::Edge => format!("E:{id}"),
+                ElementKind::Vertex => format!("V:{id}"),
+            });
+        }
+        let word = match kind {
+            ElementKind::Face => "Faces",
+            ElementKind::Edge => "Edges",
+            ElementKind::Vertex => "Vertices",
+        };
+        Some(format!("{count} {word} selected"))
+    }
+}
+
 pub fn status_selection(selection: &SelectionService, name_of: impl Fn(EntityUuid) -> String) -> String {
     match selection.items() {
         [] => "No selection".to_string(),
@@ -393,5 +585,90 @@ mod tests {
         assert!(selection.is_empty());
         assert_eq!(inspector_summary(&selection, |_| "x".into()), "No selection.");
         assert_eq!(status_selection(&selection, |_| "x".into()), "No selection");
+    }
+
+    fn solid() -> EntityUuid {
+        EntityId::new()
+    }
+
+    #[test]
+    fn ctrl_selects_two_disconnected_edges_and_a_plain_click_replaces_them() {
+        let mut set = SelectionSet::default();
+        let entity = solid();
+        // Canonical box edges 16 (vertices 6–8) and 13 (vertices 1–3) share no vertex.
+        assert!(set.click(entity, ElementKind::Edge, 16, false, false));
+        assert!(set.click(entity, ElementKind::Edge, 13, true, false));
+        assert_eq!(set.ids(), &[16, 13]);
+        assert_eq!(set.primary(), Some(13));
+        assert_eq!(set.label().as_deref(), Some("2 Edges selected"));
+        assert!(set.click(entity, ElementKind::Edge, 13, true, true));
+        assert_eq!(set.ids(), &[16]);
+        assert_eq!(set.label().as_deref(), Some("E:16"));
+        assert!(!set.click(entity, ElementKind::Edge, 16, false, false));
+        set.clear();
+        assert!(set.is_empty());
+        assert!(set.label().is_none());
+    }
+
+    #[test]
+    fn ctrl_selects_two_edges_that_share_a_corner() {
+        let mut set = SelectionSet::default();
+        let entity = solid();
+        // Canonical box edges 16 (6–8) and 12 (7–8) meet at vertex 8.
+        set.click(entity, ElementKind::Edge, 16, false, false);
+        set.click(entity, ElementKind::Edge, 12, true, false);
+        assert_eq!(set.ids(), &[16, 12]);
+        assert_eq!(set.kind(), Some(ElementKind::Edge));
+        assert_eq!(set.label().as_deref(), Some("2 Edges selected"));
+        let other = solid();
+        set.click(other, ElementKind::Edge, 12, true, false);
+        assert_eq!(set.entity(), Some(other));
+        assert_eq!(set.ids(), &[12]);
+    }
+
+    #[test]
+    fn ctrl_toggles_faces_and_vertices_and_a_kind_change_replaces_the_set() {
+        let mut set = SelectionSet::default();
+        let entity = solid();
+        set.click(entity, ElementKind::Face, 3, false, false);
+        set.click(entity, ElementKind::Face, 7, true, false);
+        set.click(entity, ElementKind::Face, 8, false, true);
+        assert_eq!(set.ids(), &[3, 7, 8]);
+        assert_eq!(set.label().as_deref(), Some("3 Faces selected"));
+        set.click(entity, ElementKind::Vertex, 4, true, false);
+        assert_eq!(set.kind(), Some(ElementKind::Vertex));
+        assert_eq!(set.ids(), &[4]);
+        set.click(entity, ElementKind::Vertex, 4, true, false);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn replace_ids_keeps_click_order_and_the_count_label() {
+        let mut set = SelectionSet::default();
+        let entity = solid();
+        assert!(set.replace_ids(entity, ElementKind::Edge, &[16, 12, 15]));
+        assert_eq!(set.ids(), &[16, 12, 15]);
+        assert_eq!(set.primary(), Some(15));
+        assert_eq!(set.label().as_deref(), Some("3 Edges selected"));
+        assert!(set.replace_ids(entity, ElementKind::Edge, &[16, 16, 0, 12]));
+        assert_eq!(set.ids(), &[16, 12]);
+        assert_eq!(set.label().as_deref(), Some("2 Edges selected"));
+        assert!(!set.replace_ids(entity, ElementKind::Edge, &[16, 12]));
+        assert!(set.replace_ids(entity, ElementKind::Edge, &[]));
+        assert!(set.is_empty());
+        assert!(set.apply_box(entity, ElementKind::Face, &[3, 0, 5, 3], false, false));
+        assert_eq!(set.ids(), &[3, 5]);
+        assert_eq!(set.primary(), Some(5));
+        assert!(set.apply_box(entity, ElementKind::Face, &[3], true, true));
+        assert_eq!(set.ids(), &[5]);
+        assert!(set.apply_box(entity, ElementKind::Face, &[1], false, true));
+        assert_eq!(set.ids(), &[5, 1]);
+        assert_eq!(set.primary(), Some(1));
+        let other = solid();
+        assert!(set.apply_box(other, ElementKind::Face, &[4], true, true));
+        assert_eq!(set.entity(), Some(other));
+        assert_eq!(set.ids(), &[4]);
+        assert!(!set.apply_box(other, ElementKind::Face, &[0], true, false));
+        assert_eq!(set.ids(), &[4]);
     }
 }

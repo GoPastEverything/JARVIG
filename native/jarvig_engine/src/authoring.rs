@@ -34,6 +34,8 @@ pub enum AuthoringCommand {
     CreateTerrain { local: jarvig_core::Vec3, record: jarvig_core::TerrainRecord },
     /// One parametric block. `local` is scene-local meters. Size stays on the solid, not entity scale.
     CreateBlock { local: jarvig_core::Vec3 },
+    /// Same evaluated solid as [`Self::CreateBlock`], at the plane's width, minimum thickness, and depth.
+    CreatePlane { local: jarvig_core::Vec3 },
     /// Absolute face push from a drag baseline. History is [`Self::CommitBlockFace`].
     PushBlockFace {
         target: EntityId,
@@ -52,6 +54,8 @@ pub enum AuthoringCommand {
     RestoreBlockBody { target: EntityId, body: Option<jarvig_core::SolidBody>, size_m: [f64; 3], translation: jarvig_core::Vec3 },
     /// Midpoint of one edge. One undo entry.
     SplitBlockEdge { target: EntityId, edge: u32 },
+    /// One extrude on an authored seed. The body stays absent. The entity shifts with the recenter.
+    ExtrudeAuthoredFaces { target: EntityId, faces: Vec<u32>, delta_m: [f64; 3] },
     /// One quad becomes a grid of quads. One undo entry.
     SubdivideBlockFace { target: EntityId, face: u32, u: u32, v: u32 },
     /// Live bevel. History is [`Self::CommitBlockBevel`].
@@ -113,6 +117,14 @@ impl EngineSession {
         self.authoring_failures
     }
 
+    fn finish_created_solid(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
+        if self.runtime.profile().renders() {
+            let master = self.current_material_master().map_err(|_| AuthoringError::InvalidOperation)?;
+            self.bind_entity_material(id, master).map_err(|_| AuthoringError::InvalidOperation)?;
+        }
+        Ok(AuthoringResult::Created(id))
+    }
+
     fn dispatch_authoring(&mut self, command: AuthoringCommand) -> Result<AuthoringResult, AuthoringError> {
         match command {
             AuthoringCommand::DuplicateEntity { target } => {
@@ -165,19 +177,16 @@ impl EngineSession {
             AuthoringCommand::CommitBlockTopology { target, op } => self.world.commit_block_topology(target, op),
             AuthoringCommand::RestoreBlockBody { target, body, size_m, translation } => self.world.restore_block_body(target, body, size_m, translation),
             AuthoringCommand::SplitBlockEdge { target, edge } => self.world.split_block_edge(target, edge),
+            AuthoringCommand::ExtrudeAuthoredFaces { target, faces, delta_m } => self.world.extrude_authored_faces(target, &faces, delta_m),
             AuthoringCommand::SubdivideBlockFace { target, face, u, v } => self.world.subdivide_block_face(target, face, u, v),
             AuthoringCommand::CreateBlock { local } => {
-                let master = if self.runtime.profile().renders() {
-                    Some(self.current_material_master().map_err(|_| AuthoringError::InvalidOperation)?)
-                } else {
-                    None
-                };
-                let record = jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).map_err(|_| AuthoringError::InvalidValue)?;
+                let record = jarvig_core::BlockRecord::authored_seed([2.0, 2.0, 2.0]).map_err(|_| AuthoringError::InvalidValue)?;
                 let id = self.world.create_block(local, record)?;
-                if let Some(master) = master {
-                    self.bind_entity_material(id, master).map_err(|_| AuthoringError::InvalidOperation)?;
-                }
-                Ok(AuthoringResult::Created(id))
+                self.finish_created_solid(id)
+            }
+            AuthoringCommand::CreatePlane { local } => {
+                let id = self.world.create_plane(local)?;
+                self.finish_created_solid(id)
             }
             AuthoringCommand::StampTerrain { target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes } => {
                 self.world.stamp_terrain(target, brush, local_x, local_z, radius, delta, layer, falloff, flatten_to, rebuild_meshes)?;

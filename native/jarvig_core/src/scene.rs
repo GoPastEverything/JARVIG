@@ -198,6 +198,11 @@ fn translation_matches(left: Vec3, right: Vec3) -> bool {
     (left.x - right.x).abs() < 1.0e-9 && (left.y - right.y).abs() < 1.0e-9 && (left.z - right.z).abs() < 1.0e-9
 }
 
+/// The persistent face token already recorded for `face`. This does not invent a name.
+fn authored_face_token(record: &crate::BlockRecord, face: u32) -> Result<String, AuthoringError> {
+    crate::preferred_face_token(&crate::semantic_face_names(record, face)).ok_or(AuthoringError::InvalidOperation)
+}
+
 fn translation_plus_shift(pose: HighPrecisionPose, shift: [f64; 3]) -> Vec3 {
     let delta = pose.rotation.rotate(Vec3::new(shift[0], shift[1], shift[2]));
     Vec3::new(pose.translation.x + delta.x, pose.translation.y + delta.y, pose.translation.z + delta.z)
@@ -216,6 +221,18 @@ fn topology_error(error: crate::topology::TopologyError) -> AuthoringError {
         crate::topology::TopologyError::Missing | crate::topology::TopologyError::Degenerate => AuthoringError::InvalidValue,
         crate::topology::TopologyError::NotQuad | crate::topology::TopologyError::Torn => AuthoringError::InvalidOperation,
     }
+}
+
+fn face_material_error(_error: crate::FaceMaterialError) -> AuthoringError {
+    AuthoringError::InvalidValue
+}
+
+fn surface_group_error(_error: crate::SurfaceGroupError) -> AuthoringError {
+    AuthoringError::InvalidValue
+}
+
+fn group_names_of(named: &[(u32, Vec<String>)], face: u32) -> Vec<String> {
+    named.iter().find(|(id, _)| *id == face).map(|(_, names)| names.clone()).unwrap_or_default()
 }
 
 fn block_size_axis(field: crate::FieldId) -> Option<usize> {
@@ -249,8 +266,35 @@ fn block_inset_face(field: crate::FieldId) -> Option<u8> {
 }
 
 fn block_mesh(record: &crate::BlockRecord) -> crate::Mesh {
-    if let Some(body) = &record.body {
-        return crate::mesh_from_body(body);
+    if record.body.is_none() && record.has_authored_seed() {
+        if let crate::semantic_shadow::IntentAuthorityCandidate::Reconstructable(body) = crate::intent_authority_candidate(record) {
+            // The constructor box keeps the welded 12-triangle cube. A changed replay builds from that body.
+            let constructor = crate::topology::SolidBody::from_box(record.size_m).ok();
+            if constructor.as_ref() != Some(&body) {
+                let painted = body.faces.iter().any(|face| {
+                    record.face_materials.iter().any(|entry| entry.face == Some(face.id) && entry.slot != 0)
+                });
+                if painted {
+                    return crate::mesh::mesh_from_body_slots(&body, |face| {
+                        record.face_materials.iter().find(|entry| entry.face == Some(face)).map(|entry| entry.slot).unwrap_or(0)
+                    });
+                }
+                return crate::mesh_from_body(&body);
+            }
+        }
+    }
+    if let Some(body) = record.material_body() {
+        let painted = body.faces.iter().any(|face| {
+            record.face_materials.iter().any(|entry| entry.face == Some(face.id) && entry.slot != 0)
+        });
+        if painted {
+            return crate::mesh::mesh_from_body_slots(&body, |face| {
+                record.face_materials.iter().find(|entry| entry.face == Some(face)).map(|entry| entry.slot).unwrap_or(0)
+            });
+        }
+        if record.body.is_some() {
+            return crate::mesh_from_body(&body);
+        }
     }
     let size = [record.size_m[0] as f32, record.size_m[1] as f32, record.size_m[2] as f32];
     let inset = [
@@ -405,6 +449,13 @@ pub struct SceneWorld {
     next_probe: u64,
     next_camera: u64,
     next_joint: u64,
+    /// New faces from the last topology edit that were not joined to a surface group.
+    surface_group_ambiguous: u32,
+    /// Outliner folders, membership, and locks. Not a spatial parent.
+    organization: crate::SceneOrganization,
+    /// Runtime only. Not a level field. Default off. An eligible solid with no stored body is
+    /// realized at spawn, and capture omits that body. Product load leaves the file as parsed.
+    intent_authority_experiment: bool,
 }
 
 /// Joint limits and rest pose. The live pose stays on the entity frame.
@@ -655,6 +706,9 @@ impl SceneWorld {
             next_probe: 0,
             next_camera: 0,
             next_joint: 0,
+            surface_group_ambiguous: 0,
+            organization: crate::SceneOrganization::default(),
+            intent_authority_experiment: false,
         };
         let near = world.insert_object(near_mesh, shared.near_object, Vec3::new(1.0, 1.0, 1.0));
         let far = world.insert_object(far_mesh, shared.far_object, Vec3::new(1.0, 1.0, 1.0));
@@ -1069,7 +1123,8 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             let _ = self.set_entity_name(id, &record.name);
             return Ok(false);
         }
-        let previous_material = self.authored_block(id).map(|block| block.material).or_else(|| self.authored_mesh(id).map(|mesh| mesh.7));
+        let previous_block = self.authored_block(id);
+        let previous_material = previous_block.as_ref().map(|block| block.material.clone()).or_else(|| self.authored_mesh(id).map(|mesh| mesh.7));
         let live_kind = self.payload_kind(id);
         let wanted_kind = payload_kind_of(record);
         if live_kind != wanted_kind {
@@ -1097,7 +1152,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
                 crate::ComponentRecord::Transform { .. } | crate::ComponentRecord::WorldSettings => {}
                 crate::ComponentRecord::ParametricBlock(block) => {
                     self.replace_block_record(id, block.clone())?;
-                    rebound = previous_material.as_ref() != Some(&block.material);
+                    rebound = previous_block.as_ref().is_none_or(|prior| {
+                        prior.material != block.material || prior.materials != block.materials || prior.face_materials != block.face_materials
+                    });
                 }
                 crate::ComponentRecord::Terrain(terrain) => {
                     let _ = self.set_authored_terrain(id, terrain.clone());
@@ -1613,12 +1670,91 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         Ok(AuthoringResult::Applied)
     }
 
+    pub fn organization(&self) -> &crate::SceneOrganization {
+        &self.organization
+    }
+
+    pub fn scene_folder_of(&self, id: EntityId) -> Option<u32> {
+        self.organization.folder_of(id)
+    }
+
+    pub fn entity_locked(&self, id: EntityId) -> bool {
+        self.organization.is_locked(id)
+    }
+
+    pub fn create_scene_folder(&mut self, name: &str, parent: Option<u32>) -> Result<u32, crate::OrganizationError> {
+        let id = self.organization.create_folder(name, parent)?;
+        self.revise();
+        Ok(id)
+    }
+
+    pub fn rename_scene_folder(&mut self, id: u32, name: &str) -> Result<AuthoringResult, crate::OrganizationError> {
+        if !self.organization.rename_folder(id, name)? {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    pub fn delete_scene_folder(&mut self, id: u32) -> Result<(), crate::OrganizationError> {
+        self.organization.delete_folder(id)?;
+        self.revise();
+        Ok(())
+    }
+
+    /// Moves an entity with no spatial parent. The world pose and the body stay.
+    pub fn move_entity_to_folder(&mut self, id: EntityId, folder: Option<u32>) -> Result<AuthoringResult, crate::OrganizationError> {
+        self.entities.find(id).map_err(|_| crate::OrganizationError::NotFound)?;
+        if self.entity_parent(id).ok().flatten().is_some() {
+            return Err(crate::OrganizationError::SpatialParent);
+        }
+        if !self.organization.set_member(id, folder)? {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    pub fn set_entity_locked(&mut self, id: EntityId, locked: bool) -> Result<AuthoringResult, crate::OrganizationError> {
+        self.entities.find(id).map_err(|_| crate::OrganizationError::NotFound)?;
+        if !self.organization.set_locked(id, locked) {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    fn refuse_if_locked(&self, id: EntityId) -> Result<(), AuthoringError> {
+        if self.organization.is_locked(id) {
+            Err(AuthoringError::InvalidOperation)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn install_organization(&mut self, organization: crate::SceneOrganization) {
+        let live: Vec<EntityId> = self.entity_outline().iter().map(|row| row.uuid).collect();
+        self.organization = organization.retained(&live);
+    }
+
+    /// Puts a previous organization back. Entities, poses, bodies, materials, and surface groups stay.
+    pub fn restore_scene_organization(&mut self, organization: crate::SceneOrganization) {
+        let live: Vec<EntityId> = self.entity_outline().iter().map(|row| row.uuid).collect();
+        let next = organization.retained(&live);
+        if next == self.organization {
+            return;
+        }
+        self.organization = next;
+        self.revise();
+    }
+
     /// Local frame translation in meters. Binary64. Not a GPU matrix.
     /// A joint clamps this through the same limits as a rotation edit.
     pub fn set_entity_local_translation(&mut self, id: EntityId, translation: Vec3) -> Result<AuthoringResult, AuthoringError> {
         if !translation.x.is_finite() || !translation.y.is_finite() || !translation.z.is_finite() {
             return Err(AuthoringError::InvalidValue);
         }
+        self.refuse_if_locked(id)?;
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
         let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
@@ -1628,6 +1764,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     /// Local quaternion. Finite and normalizable. A joint clamps it before the write.
     pub fn set_entity_local_rotation(&mut self, id: EntityId, rotation: Quat) -> Result<AuthoringResult, AuthoringError> {
         let rotation = unit_quaternion(rotation)?;
+        self.refuse_if_locked(id)?;
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let frame = self.frame_of(handle).map_err(|_| AuthoringError::InvalidOperation)?;
         let pose = self.frames.local_pose(frame).map_err(|_| AuthoringError::InvalidOperation)?;
@@ -1842,7 +1979,8 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     fn destroy_authored_handle(&mut self, handle: EntityHandle) -> Result<EntityId, AuthoringError> {
-        self.entities.uuid(handle).map_err(|_| AuthoringError::NotFound)?;
+        let existing = self.entities.uuid(handle).map_err(|_| AuthoringError::NotFound)?;
+        self.refuse_if_locked(existing)?;
         if self.is_world_settings(handle) {
             return Err(AuthoringError::ProtectedEntity);
         }
@@ -1876,6 +2014,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.player_starts.retain(|start| start.handle != handle);
         self.anchors.retain(|(anchor, _)| *anchor != handle);
         let uuid = self.entities.retire(handle).map_err(|_| AuthoringError::NotFound)?;
+        self.organization.forget(uuid);
         self.revise();
         Ok(uuid)
     }
@@ -2392,6 +2531,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         Ok(AuthoringResult::Applied)
     }
 
+    pub fn authored_visible(&self, id: EntityId) -> Option<bool> {
+        let handle = self.entities.find(id).ok()?;
+        self.objects.iter().find(|object| object.handle == handle).map(|object| object.visible)
+    }
+
     pub fn set_authored_visible(&mut self, id: EntityId, visible: bool) -> Result<AuthoringResult, AuthoringError> {
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let object = self.objects.iter_mut().find(|object| object.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
@@ -2432,6 +2576,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if !scale.x.is_finite() || !scale.y.is_finite() || !scale.z.is_finite() || scale.x == 0.0 || scale.y == 0.0 || scale.z == 0.0 {
             return Err(AuthoringError::InvalidValue);
         }
+        self.refuse_if_locked(id)?;
         let handle = self.entities.find(id).map_err(|_| AuthoringError::NotFound)?;
         let object = self.objects.iter_mut().find(|object| object.handle == handle).ok_or(AuthoringError::InvalidOperation)?;
         if object.scale == scale {
@@ -2452,6 +2597,15 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             }
         }
         slots
+    }
+
+    /// Slots that currently have a material instance. A mesh rebuild can leave a slot that the mesh no longer uses.
+    pub fn bound_material_slots(&self, object: ObjectId) -> Vec<u32> {
+        self.objects
+            .iter()
+            .find(|candidate| candidate.id == object)
+            .map(|object| object.bindings.iter().map(|binding| binding.slot).collect())
+            .unwrap_or_default()
     }
 
     pub fn place_imported_mesh(&mut self, id: crate::AssetId, name: &str, material: crate::MaterialAssetRef) -> Result<EntityId, AuthoringError> {
@@ -2877,6 +3031,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             next_probe: 0,
             next_camera: 0,
             next_joint: 0,
+            surface_group_ambiguous: 0,
+            organization: crate::SceneOrganization::default(),
+            intent_authority_experiment: false,
         }
     }
 
@@ -3050,6 +3207,23 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         std::mem::take(&mut self.retired_meshes)
     }
 
+    /// Remove a mesh no object or terrain chunk uses, and queue its GPU buffers for eviction.
+    /// A mesh that is still the stored mesh of an object is left in place. This does not revise the world.
+    pub fn retire_unreferenced_mesh(&mut self, mesh: MeshId) -> bool {
+        if self.objects.iter().any(|object| object.mesh == mesh) {
+            return false;
+        }
+        if self.terrains.iter().any(|terrain| terrain.chunks.iter().any(|chunk| chunk.mesh == mesh)) {
+            return false;
+        }
+        self.forget_derived_meshlets(mesh);
+        let removed = self.meshes.remove(mesh);
+        if removed && !self.retired_meshes.contains(&mesh) {
+            self.retired_meshes.push(mesh);
+        }
+        removed
+    }
+
     fn retire_unused_mesh(&mut self, mesh: MeshId) {
         if self.objects.iter().any(|object| object.mesh == mesh) {
             return;
@@ -3124,6 +3298,151 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.blocks.iter().find(|block| block.handle == handle).map(|block| block.record.clone())
     }
 
+    pub fn intent_authority_experiment(&self) -> bool {
+        self.intent_authority_experiment
+    }
+
+    /// Runtime only. Not written into the level file. Set this before entities are spawned.
+    pub fn set_intent_authority_experiment(&mut self, enabled: bool) {
+        self.intent_authority_experiment = enabled;
+    }
+
+    /// Load report for one parametric solid. `file_body_present` is the body key in the parsed
+    /// file, before spawn installs a realization. The live record is not changed.
+    pub fn intent_load_report(&self, id: EntityId, name: &str, file_body_present: bool) -> Option<String> {
+        let experiment_on = self.intent_authority_experiment;
+        let record = self.authored_block(id)?;
+        let mesh_id = self.object_mesh(id);
+        let meshlets = mesh_id.and_then(|mesh| self.derived_meshlets(mesh));
+        let meshlets_generated = meshlets.is_some_and(|set| !set.meshlets.is_empty());
+        let hierarchy_generated = meshlets.is_some_and(|set| {
+            let records: Vec<_> = set.meshlets.iter().map(crate::GpuMeshletRecord::from_meshlet).collect();
+            let hierarchy = crate::build_cluster_hierarchy(&records);
+            !records.is_empty() && hierarchy.nodes.len() >= records.len()
+        });
+        let (exact_solid, detail_requested) = if let Some(set) = meshlets.filter(|set| !set.meshlets.is_empty()) {
+            let clusters = vec![
+                crate::DetailCluster { flag: 1, projected_px: 5.0, compatible: true, has_anchor: true, exact: true };
+                set.meshlets.len()
+            ];
+            let reasons = crate::select_detail_clusters(&clusters, 256);
+            let exact = reasons.iter().all(|reason| *reason == crate::DetailReject::Exact) && clusters.iter().all(|cluster| !crate::cluster_requires_detail(cluster));
+            let requested = reasons.iter().any(|reason| *reason == crate::DetailReject::Selected);
+            (exact, requested)
+        } else {
+            (false, false)
+        };
+        let facts = crate::semantic_shadow::IntentAuthorityLoadFacts {
+            name: name.to_string(),
+            experiment_on,
+            file_body_present,
+            intent_present: !record.intent.is_empty(),
+            loaded_body_present: record.body.is_some(),
+            eligible: crate::semantic_shadow::intent_authority_eligibility(&record) == crate::semantic_shadow::IntentAuthorityEligibility::Eligible,
+            body_valid: record.body.as_ref().is_some_and(|body| body.validate().is_ok()),
+            mesh_generated: mesh_id.is_some(),
+            meshlets_generated,
+            hierarchy_generated,
+            exact_solid,
+            detail_requested,
+        };
+        Some(crate::semantic_shadow::format_intent_authority_load(&facts))
+    }
+
+    /// Drop the evaluated body and the disposable products of one live eligible solid.
+    ///
+    /// The intent tape, material, name, and pose stay. The mesh is removed from the library,
+    /// so a later `meshes().get` does not return it. Meshlets for that mesh are forgotten.
+    /// The cluster hierarchy is built from those meshlets, so it goes with them. Exact solids
+    /// have no Einstein patch set on the record. This does not read a file and does not spawn
+    /// another world. The experiment switch defaults off; with it off, nothing is changed.
+    /// An ineligible solid, including a divergent stored body, is left as it was.
+    pub fn discard_live_block_realization(&mut self, id: EntityId) -> Result<(), AuthoringError> {
+        if !self.intent_authority_experiment {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let index = self.block_index(id)?;
+        if crate::semantic_shadow::intent_authority_eligibility(&self.blocks[index].record) != crate::semantic_shadow::IntentAuthorityEligibility::Eligible {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        self.blocks[index].record.body = None;
+        let handle = self.blocks[index].handle;
+        if let Some(mesh) = self.objects.iter().find(|object| object.handle == handle).map(|object| object.mesh) {
+            self.forget_derived_meshlets(mesh);
+            let shared = self.objects.iter().any(|object| object.handle != handle && object.mesh == mesh)
+                || self.terrains.iter().any(|terrain| terrain.chunks.iter().any(|chunk| chunk.mesh == mesh));
+            if !shared {
+                self.meshes.remove(mesh);
+                if !self.retired_meshes.contains(&mesh) {
+                    self.retired_meshes.push(mesh);
+                }
+            }
+        }
+        self.revise();
+        Ok(())
+    }
+
+    /// Rebuild one live solid from its intent tape and install a new mesh, meshlets, and hierarchy.
+    ///
+    /// The candidate is given a copy whose body is `None`, so it cannot read a stored body.
+    /// Eligibility still refuses a divergent body that has not been discarded. A refused tape
+    /// writes nothing. The experiment switch defaults off. This does not reload the level.
+    pub fn rerealize_live_block_from_intent(&mut self, id: EntityId) -> Result<(), AuthoringError> {
+        if !self.intent_authority_experiment {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let index = self.block_index(id)?;
+        if crate::semantic_shadow::intent_authority_eligibility(&self.blocks[index].record) != crate::semantic_shadow::IntentAuthorityEligibility::Eligible {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let mut bare = self.blocks[index].record.clone();
+        bare.body = None;
+        let body = match crate::semantic_shadow::intent_authority_candidate(&bare) {
+            crate::semantic_shadow::IntentAuthorityCandidate::Reconstructable(body) => body,
+            crate::semantic_shadow::IntentAuthorityCandidate::Refused(_) => return Err(AuthoringError::InvalidOperation),
+        };
+        if body.validate().is_err() {
+            return Err(AuthoringError::InvalidValue);
+        }
+        self.blocks[index].record.body = Some(body);
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(())
+    }
+
+    /// Split one edge that already has a semantic name. The command is the ordinary split.
+    /// An edge with no recorded name is skipped, so the tape does not gain a gap.
+    pub fn split_one_block_edge(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
+        let record = self.authored_block(id).ok_or(AuthoringError::NotFound)?;
+        let body = record.body.clone().ok_or(AuthoringError::InvalidOperation)?;
+        for edge in body.edges.iter().map(|edge| edge.id) {
+            let op = crate::BlockOp::SplitEdge { edge };
+            let Some(names) = crate::semantic_shadow::captured_semantics(&record, &op) else { continue };
+            if names.iter().any(|group| group.is_empty()) || body.split_edge(edge).is_err() {
+                continue;
+            }
+            if self.split_block_edge(id, edge) == Ok(AuthoringResult::Applied) {
+                return Ok(AuthoringResult::Applied);
+            }
+        }
+        Err(AuthoringError::InvalidOperation)
+    }
+
+    /// New faces the last topology edit did not join to a surface group.
+    pub fn surface_group_ambiguous(&self) -> u32 {
+        self.surface_group_ambiguous
+    }
+
+    /// Semantic names of the solid's edges, taken from the record before a preview replaces the body.
+    pub fn surface_edge_names(&self, id: EntityId) -> Vec<(u32, Vec<String>)> {
+        let Some(record) = self.authored_block(id) else { return Vec::new() };
+        let Some(body) = record.material_body() else { return Vec::new() };
+        body.edges
+            .iter()
+            .map(|edge| (edge.id, crate::semantic_shadow::element_provenance_names(&record, crate::ElementKind::Edge, edge.id)))
+            .collect()
+    }
+
     /// Replaces the saved solid, including its log. Does not append an operation.
     pub fn replace_block_record(&mut self, id: EntityId, record: crate::BlockRecord) -> Result<AuthoringResult, AuthoringError> {
         record.validate().map_err(|_| AuthoringError::InvalidValue)?;
@@ -3132,7 +3451,12 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if current == &record {
             return Ok(AuthoringResult::Unchanged);
         }
-        let mesh_changed = current.size_m != record.size_m || current.inset_m != record.inset_m || current.bevel_m != record.bevel_m || current.body != record.body;
+        let mesh_changed = current.size_m != record.size_m
+            || current.inset_m != record.inset_m
+            || current.bevel_m != record.bevel_m
+            || current.body != record.body
+            || current.intent != record.intent
+            || current.face_materials != record.face_materials;
         self.blocks[index].record = record;
         if mesh_changed {
             self.rebuild_block_mesh(index)?;
@@ -3168,12 +3492,36 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
 
     /// One parametric block. `local` is scene-local meters. Size is the solid, not entity scale.
     pub fn create_block(&mut self, local: Vec3, record: crate::BlockRecord) -> Result<EntityId, AuthoringError> {
+        let name = if self.blocks.is_empty() { "Block".to_string() } else { format!("Block {}", self.blocks.len() + 1) };
+        self.create_named_solid(local, name, record)
+    }
+
+    /// Same solid as [`Self::create_block`], with the plane's width, minimum thickness, and depth.
+    pub fn create_plane(&mut self, local: Vec3) -> Result<EntityId, AuthoringError> {
+        let record = crate::BlockRecord::plane(crate::PLANE_WIDTH_M, crate::PLANE_DEPTH_M).map_err(|_| AuthoringError::InvalidValue)?;
+        self.create_named_solid(local, self.counted_solid_name("Plane"), record)
+    }
+
+    fn counted_solid_name(&self, stem: &str) -> String {
+        let prefix = format!("{stem} ");
+        let count = self
+            .blocks
+            .iter()
+            .filter(|block| self.entities.name(block.handle).ok().is_some_and(|name| name == stem || name.starts_with(&prefix)))
+            .count();
+        if count == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem} {}", count + 1)
+        }
+    }
+
+    fn create_named_solid(&mut self, local: Vec3, name: String, record: crate::BlockRecord) -> Result<EntityId, AuthoringError> {
         if !local.x.is_finite() || !local.y.is_finite() || !local.z.is_finite() {
             return Err(AuthoringError::InvalidValue);
         }
         record.validate().map_err(|_| AuthoringError::InvalidValue)?;
         let handle = self.entities.create();
-        let name = if self.blocks.is_empty() { "Block".to_string() } else { format!("Block {}", self.blocks.len() + 1) };
         self.entities.set_name(handle, &name).map_err(|_| AuthoringError::InvalidOperation)?;
         let frame = self.frames.add(Some(self.scene), HighPrecisionPose::at(local.x, local.y, local.z)).map_err(|_| AuthoringError::InvalidOperation)?;
         self.install_block(handle, frame, record)?;
@@ -3181,6 +3529,10 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         self.entities.uuid(handle).map_err(|_| AuthoringError::NotFound)
     }
 
+    /// Install a solid loaded from a level. A stored body stays the solid. When the
+    /// intent-authority experiment is on, an eligible tape with no body is realized before the
+    /// mesh is built. The switch defaults off. An ineligible record is unchanged. [`Self::create_block`]
+    /// does not realize.
     pub fn spawn_saved_block(
         &mut self,
         id: EntityId,
@@ -3189,6 +3541,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         local: HighPrecisionPose,
         record: crate::BlockRecord,
     ) -> Result<(), AuthoringError> {
+        let record = if self.intent_authority_experiment {
+            crate::semantic_shadow::realize_eligible_body_on_load(record)
+        } else {
+            record
+        };
         record.validate().map_err(|_| AuthoringError::InvalidValue)?;
         let parent_handle = self.parent_handle(parent)?;
         let handle = self.entities.insert(id, parent_handle).map_err(|_| AuthoringError::InvalidOperation)?;
@@ -3227,6 +3584,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if self.blocks[index].record.body.is_some() {
             return self.scale_block_body(id, axis, meters);
         }
+        self.refuse_authored_seed(index)?;
         self.blocks[index].record.size_m[axis] = meters;
         self.blocks[index].record.clamp_features();
         let size = self.blocks[index].record.size_m;
@@ -3247,6 +3605,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     ) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let local = self.entity_local_pose(id)?;
         let pushed = crate::push_face(baseline_size, baseline_local, local.rotation, face, outward_m).ok_or(AuthoringError::InvalidValue)?;
         let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - pushed.size_m[axis]).abs() < 1.0e-9);
@@ -3266,6 +3625,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     pub fn commit_block_face(&mut self, id: EntityId, face: u8, baseline_size: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let axis = (face / 2) as usize;
         if face > 5 || axis > 2 {
             return Err(AuthoringError::InvalidValue);
@@ -3285,6 +3645,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
@@ -3303,6 +3664,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
@@ -3322,6 +3684,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.bevel_m - meters).abs() < 1.0e-9 {
@@ -3340,6 +3703,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let limit = crate::feature_limit(self.blocks[index].record.size_m);
         let meters = meters.clamp(0.0, limit);
         if (self.blocks[index].record.inset_m[face as usize] - meters).abs() < 1.0e-9 {
@@ -3355,6 +3719,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     pub fn commit_block_bevel(&mut self, id: EntityId, baseline_m: f64) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let current = self.blocks[index].record.bevel_m;
         if (current - baseline_m).abs() < 1.0e-9 {
             return Ok(AuthoringResult::Unchanged);
@@ -3371,6 +3736,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let current = self.blocks[index].record.inset_m[face as usize];
         if (current - baseline_m).abs() < 1.0e-9 {
             return Ok(AuthoringResult::Unchanged);
@@ -3381,15 +3747,40 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     /// Size returns to 2 m and the feature parameters clear. The entity stays where it is.
+    ///
+    /// Extra material slots stay. Every face assignment becomes an orphan, so a fresh cube does
+    /// not inherit the old face ids.
     pub fn reset_block_shape(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
-        let material = self.blocks[index].record.material.clone();
-        let plain = self.blocks[index].record.size_m == [2.0, 2.0, 2.0] && self.blocks[index].record.is_plain();
-        if plain {
+        self.refuse_authored_seed(index)?;
+        let current = &self.blocks[index].record;
+        let groups_clear = current.surface_groups.iter().all(|group| group.members.iter().all(|member| member.face.is_none()));
+        let already_standard = current.size_m == [2.0, 2.0, 2.0]
+            && current.is_plain()
+            && current.face_materials.iter().all(|entry| entry.face.is_none())
+            && groups_clear;
+        if already_standard {
             return Ok(AuthoringResult::Unchanged);
+        }
+        let material = current.material.clone();
+        let materials = current.materials.clone();
+        let mut face_materials = current.face_materials.clone();
+        for entry in &mut face_materials {
+            entry.face = None;
+        }
+        let next_surface_group = current.next_surface_group;
+        let mut surface_groups = current.surface_groups.clone();
+        for group in &mut surface_groups {
+            for member in &mut group.members {
+                member.face = None;
+            }
         }
         let mut record = crate::BlockRecord::standard([2.0, 2.0, 2.0]).map_err(|_| AuthoringError::InvalidValue)?;
         record.material = material;
+        record.materials = materials;
+        record.face_materials = face_materials;
+        record.surface_groups = surface_groups;
+        record.next_surface_group = next_surface_group;
         self.blocks[index].record = record;
         self.rebuild_block_mesh(index)?;
         self.revise();
@@ -3401,6 +3792,8 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         if axis > 2 {
             return Err(AuthoringError::InvalidValue);
         }
+        let index = self.block_index(id)?;
+        self.refuse_authored_seed(index)?;
         let source = self.authored_block(id).ok_or(AuthoringError::InvalidOperation)?;
         let local = self.entity_local_pose(id)?;
         let created = self.duplicate_authored(id)?;
@@ -3448,6 +3841,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         }
         let index = self.block_index(id)?;
         self.refuse_body(index)?;
+        self.refuse_authored_seed(index)?;
         let local = self.entity_local_pose(id)?;
         let record = &self.blocks[index].record;
         let same_size = (0..3).all(|axis| (record.size_m[axis] - size_m[axis]).abs() < 1.0e-9);
@@ -3489,6 +3883,7 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
         body.validate().map_err(topology_error)?;
         let size = finite_body_size(&body)?;
         let index = self.block_index(id)?;
+        self.refuse_authored_seed(index)?;
         let local = self.entity_local_pose(id)?;
         let same_body = self.blocks[index].record.body.as_ref() == Some(&body);
         let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - size[axis]).abs() < 1.0e-9);
@@ -3513,10 +3908,14 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        self.refuse_authored_seed(index)?;
         if self.blocks[index].record.body.is_none() {
             return Err(AuthoringError::InvalidOperation);
         }
-        self.blocks[index].record.push_op(op);
+        let semantic = crate::semantic_shadow::captured_semantics(&self.blocks[index].record, &op);
+        self.blocks[index].record.push_op_with_semantics(op, semantic);
+        crate::semantic_shadow::stamp_face_provenance(&mut self.blocks[index].record);
+        crate::semantic_shadow::stamp_surface_groups(&mut self.blocks[index].record);
         self.revise();
         Ok(AuthoringResult::Applied)
     }
@@ -3543,6 +3942,9 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             return Err(AuthoringError::InvalidValue);
         }
         let index = self.block_index(id)?;
+        if self.blocks[index].record.has_authored_seed() && body.is_some() {
+            return Err(AuthoringError::InvalidOperation);
+        }
         let local = self.entity_local_pose(id)?;
         let same_body = self.blocks[index].record.body == body;
         let same_size = (0..3).all(|axis| (self.blocks[index].record.size_m[axis] - size_m[axis]).abs() < 1.0e-9);
@@ -3559,28 +3961,305 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     }
 
     /// Inserts the midpoint of one edge and records it.
+    /// An authored seed appends a split to the tape and does not store the body.
     pub fn split_block_edge(&mut self, id: EntityId, edge: u32) -> Result<AuthoringResult, AuthoringError> {
-        self.store_topology_edit(id, |body| body.split_edge(edge), crate::BlockOp::SplitEdge { edge })
+        let index = self.block_index(id)?;
+        if self.blocks[index].record.has_authored_seed() && self.blocks[index].record.body.is_none() {
+            return self.split_authored_edge(id, edge);
+        }
+        self.store_topology_edit(id, |body| body.split_edge_traced(edge), crate::BlockOp::SplitEdge { edge })
+    }
+
+    /// One split on the authored tape. A rounded edge is refused and the record stays.
+    fn split_authored_edge(&mut self, id: EntityId, edge: u32) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let record = self.blocks[index].record.clone();
+        if crate::authored_split_conflict(&record, edge).is_some() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let body = match crate::intent_authority_candidate(&record) {
+            crate::IntentAuthorityCandidate::Reconstructable(body) => body,
+            crate::IntentAuthorityCandidate::Refused(_) => return Err(AuthoringError::InvalidOperation),
+        };
+        if body.edge_endpoints(edge).is_none() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let bindings = crate::semantic_edge_bindings(&record).map_err(|_| AuthoringError::InvalidOperation)?;
+        let token = crate::persistent_edge_token(&body, &bindings, edge).map_err(|_| AuthoringError::InvalidOperation)?;
+        let entry = crate::IntentEntry { groups: Some(vec![vec![token]]), payload: crate::IntentPayload::Split };
+        let next = crate::commit_class_c_intent(&record, entry).map_err(|_| AuthoringError::InvalidOperation)?;
+        if next.body.is_some() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        self.replace_block_record(id, next)
     }
 
     /// Replaces one quad with a grid and records it.
     pub fn subdivide_block_face(&mut self, id: EntityId, face: u32, u: u32, v: u32) -> Result<AuthoringResult, AuthoringError> {
-        self.store_topology_edit(id, |body| body.subdivide_face(face, u, v), crate::BlockOp::SubdivideFace { face, u, v })
+        self.store_topology_edit(id, |body| body.subdivide_face_traced(face, u, v), crate::BlockOp::SubdivideFace { face, u, v })
     }
 
     /// Moves the named faces and adds a wall on each boundary edge. Records the edit.
+    /// An authored seed does not use this. [`Self::extrude_authored_faces`] appends the tape.
     pub fn extrude_block_faces(&mut self, id: EntityId, faces: &[u32], delta: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
         let owned = faces.to_vec();
         let logged = owned.clone();
         self.store_topology_edit(
             id,
-            move |body| body.extrude_faces(&owned, delta),
+            move |body| body.extrude_faces_traced(&owned, delta),
             crate::BlockOp::ExtrudeFaces { faces: logged, delta_m: delta },
         )
     }
 
+    /// Appends one extrude on an authored seed. The body stays absent.
+    ///
+    /// Each face is stored as its recorded semantic token. A face with no token writes nothing.
+    /// The entity translation takes the same recenter shift a stored-body extrude applies.
+    /// A zero or non-finite delta writes nothing.
+    pub fn extrude_authored_faces(&mut self, id: EntityId, faces: &[u32], delta: [f64; 3]) -> Result<AuthoringResult, AuthoringError> {
+        if faces.is_empty() || delta.iter().any(|axis| !axis.is_finite()) {
+            return Err(AuthoringError::InvalidValue);
+        }
+        let index = self.block_index(id)?;
+        let record = self.blocks[index].record.clone();
+        if !record.has_authored_seed() || record.body.is_some() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let body = match crate::intent_authority_candidate(&record) {
+            crate::IntentAuthorityCandidate::Reconstructable(body) => body,
+            crate::IntentAuthorityCandidate::Refused(_) => return Err(AuthoringError::InvalidOperation),
+        };
+        let mut groups = Vec::with_capacity(faces.len());
+        for face in faces {
+            if body.face_loop(*face).is_none() {
+                return Err(AuthoringError::InvalidOperation);
+            }
+            groups.push(vec![authored_face_token(&record, *face)?]);
+        }
+        let (edit, _) = body.extrude_faces_traced(faces, delta).map_err(topology_error)?;
+        let entry = crate::IntentEntry { groups: Some(groups), payload: crate::IntentPayload::Extrude { delta_m: delta } };
+        let next = crate::commit_class_c_intent(&record, entry).map_err(|_| AuthoringError::InvalidOperation)?;
+        if next.body.is_some() {
+            return Err(AuthoringError::InvalidOperation);
+        }
+        let shift = edit.shift;
+        self.replace_block_record(id, next)?;
+        let local = self.entity_local_pose(id)?;
+        self.write_block_translation(id, translation_plus_shift(local, shift))?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Paints live faces with one slot. An unknown id writes nothing. Empty input changes nothing.
+    pub fn assign_block_faces(&mut self, id: EntityId, faces: &[u32], slot: u32) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let named = faces
+            .iter()
+            .map(|face| (*face, crate::semantic_shadow::face_provenance_names(&self.blocks[index].record, *face)))
+            .collect::<Vec<_>>();
+        let changed = self.blocks[index]
+            .record
+            .assign_faces(faces, slot, |face| named.iter().find(|(id, _)| *id == face).map(|(_, names)| names.clone()).unwrap_or_default())
+            .map_err(face_material_error)?;
+        if !changed {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        crate::semantic_shadow::stamp_face_provenance(&mut self.blocks[index].record);
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Copies slot 0 into the next slot. The new slot is not assigned to a face.
+    pub fn add_block_material_slot(&mut self, id: EntityId) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        self.blocks[index].record.add_material_slot().map_err(face_material_error)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Copies the shared slot onto a new slot and paints only `faces`.
+    ///
+    /// Mixed faces copy slot 0. An unknown id or a full slot list writes nothing.
+    /// An empty list changes nothing. This does not append the intent tape.
+    pub fn make_block_faces_unique(&mut self, id: EntityId, faces: &[u32]) -> Result<AuthoringResult, AuthoringError> {
+        if faces.is_empty() {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let index = self.block_index(id)?;
+        let named = faces
+            .iter()
+            .map(|face| (*face, crate::semantic_shadow::face_provenance_names(&self.blocks[index].record, *face)))
+            .collect::<Vec<_>>();
+        let added = self.blocks[index]
+            .record
+            .make_faces_unique(faces, |face| named.iter().find(|(id, _)| *id == face).map(|(_, names)| names.clone()).unwrap_or_default())
+            .map_err(face_material_error)?;
+        if added.is_none() {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        crate::semantic_shadow::stamp_face_provenance(&mut self.blocks[index].record);
+        self.rebuild_block_mesh(index)?;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Edits one slot's base color, roughness, and metallic. The mesh is not rebuilt.
+    pub fn set_block_material_factors(
+        &mut self,
+        id: EntityId,
+        slot: u32,
+        base_color: [f32; 3],
+        roughness: f32,
+        metallic: f32,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let changed = self.blocks[index].record.set_material_factors(slot, base_color, roughness, metallic).map_err(face_material_error)?;
+        if !changed {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        if slot == 0 {
+            let material = self.blocks[index].record.material.clone();
+            let handle = self.blocks[index].handle;
+            if let Some(object) = self.objects.iter_mut().find(|object| object.handle == handle) {
+                object.authored_material = Some(material);
+            }
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Replaces the face map for a preview. Does not orphan ids the current body does not have yet.
+    pub fn stage_block_face_materials(&mut self, id: EntityId, assignments: Vec<crate::FaceMaterialAssignment>) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        if self.blocks[index].record.face_materials == assignments {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let mut trial = self.blocks[index].record.clone();
+        trial.face_materials = assignments;
+        trial.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        self.blocks[index].record.face_materials = trial.face_materials;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    /// Names the selected faces as one group. A shared slot is copied first.
+    ///
+    /// This does not append the intent tape and does not write a body.
+    pub fn create_block_surface_group(&mut self, id: EntityId, name: &str, faces: &[u32]) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let named = self.group_face_names(index, faces);
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        self.blocks[index]
+            .record
+            .create_surface_group(name, faces, |face| group_names_of(&named, face))
+            .map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, true)
+    }
+
+    /// Changes the visible name. The id stays.
+    pub fn rename_block_surface_group(&mut self, id: EntityId, group: u32, name: &str) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        let changed = self.blocks[index].record.rename_surface_group(group, name).map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, changed)
+    }
+
+    /// Puts the selected faces in `group` and paints them with that group's slot.
+    pub fn add_block_surface_group_faces(&mut self, id: EntityId, group: u32, faces: &[u32]) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let named = self.group_face_names(index, faces);
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        let changed = self.blocks[index]
+            .record
+            .add_surface_group_faces(group, faces, |face| group_names_of(&named, face))
+            .map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, changed)
+    }
+
+    /// Drops the selected faces from the group. Geometry and the painted slot stay.
+    pub fn remove_block_surface_group_faces(&mut self, id: EntityId, group: u32, faces: &[u32]) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        let changed = self.blocks[index].record.remove_surface_group_faces(group, faces).map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, changed)
+    }
+
+    /// Points the group at `slot` and paints every resolved member. Unresolved members stay.
+    pub fn set_block_surface_group_slot(&mut self, id: EntityId, group: u32, slot: u32) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let faces = self.blocks[index].record.resolved_group_faces(group);
+        let named = self.group_face_names(index, &faces);
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        let changed = self.blocks[index]
+            .record
+            .set_surface_group_slot(group, slot, |face| group_names_of(&named, face))
+            .map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, changed)
+    }
+
+    /// Removes the group. Faces, slots, and geometry stay. The id is not reused.
+    pub fn delete_block_surface_group(&mut self, id: EntityId, group: u32) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        let before_faces = self.blocks[index].record.face_materials.clone();
+        let before_materials = self.blocks[index].record.materials.clone();
+        let changed = self.blocks[index].record.delete_surface_group(group).map_err(surface_group_error)?;
+        self.finish_surface_group(index, before_faces, before_materials, changed)
+    }
+
+    /// Replaces the group list for a preview. Does not orphan ids the current body does not have yet.
+    pub fn stage_block_surface_groups(&mut self, id: EntityId, groups: Vec<crate::SurfaceGroup>) -> Result<AuthoringResult, AuthoringError> {
+        let index = self.block_index(id)?;
+        if self.blocks[index].record.surface_groups == groups {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        let mut trial = self.blocks[index].record.clone();
+        trial.surface_groups = groups;
+        trial.validate().map_err(|_| AuthoringError::InvalidValue)?;
+        self.blocks[index].record.surface_groups = trial.surface_groups;
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
+    fn group_face_names(&self, index: usize, faces: &[u32]) -> Vec<(u32, Vec<String>)> {
+        faces.iter().map(|face| (*face, self.blocks[index].record.recorded_face_names(*face))).collect()
+    }
+
+    fn finish_surface_group(
+        &mut self,
+        index: usize,
+        before_faces: Vec<crate::FaceMaterialAssignment>,
+        before_materials: Vec<crate::MaterialAssetRef>,
+        changed: bool,
+    ) -> Result<AuthoringResult, AuthoringError> {
+        if !changed {
+            return Ok(AuthoringResult::Unchanged);
+        }
+        crate::semantic_shadow::stamp_face_provenance(&mut self.blocks[index].record);
+        crate::semantic_shadow::stamp_surface_groups(&mut self.blocks[index].record);
+        if self.blocks[index].record.face_materials != before_faces || self.blocks[index].record.materials != before_materials {
+            self.rebuild_block_mesh(index)?;
+        }
+        self.revise();
+        Ok(AuthoringResult::Applied)
+    }
+
     fn refuse_body(&self, index: usize) -> Result<(), AuthoringError> {
         if self.blocks[index].record.body.is_some() {
+            Err(AuthoringError::InvalidOperation)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// An authored seed keeps its construction on the tape. These mutators stay for a stored body.
+    fn refuse_authored_seed(&self, index: usize) -> Result<(), AuthoringError> {
+        if self.blocks[index].record.has_authored_seed() {
             Err(AuthoringError::InvalidOperation)
         } else {
             Ok(())
@@ -3609,10 +4288,11 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
     fn store_topology_edit(
         &mut self,
         id: EntityId,
-        edit_of: impl FnOnce(&crate::topology::SolidBody) -> Result<crate::topology::TopologyEdit, crate::topology::TopologyError>,
+        edit_of: impl FnOnce(&crate::topology::SolidBody) -> Result<(crate::topology::TopologyEdit, crate::topology::TopologyLineage), crate::topology::TopologyError>,
         op: crate::BlockOp,
     ) -> Result<AuthoringResult, AuthoringError> {
         let index = self.block_index(id)?;
+        self.refuse_authored_seed(index)?;
         if self.blocks[index].record.analytic_features() {
             return Err(AuthoringError::InvalidOperation);
         }
@@ -3620,12 +4300,30 @@ fn light_kind_for(type_id: crate::TypeId) -> Option<LightKind> {
             Some(body) => body.clone(),
             None => crate::topology::SolidBody::from_box(self.blocks[index].record.size_m).map_err(topology_error)?,
         };
-        let edit = edit_of(&source).map_err(topology_error)?;
+        let semantic = crate::semantic_shadow::captured_semantics(&self.blocks[index].record, &op);
+        let (edit, lineage) = edit_of(&source).map_err(topology_error)?;
         finite_body_size(&edit.body)?;
+        let baseline = self.blocks[index].record.face_materials.clone();
+        let projected = crate::BlockRecord::project_face_materials(&source, &edit.body, &lineage, &baseline);
+        let edge_names: Vec<(u32, Vec<String>)> = {
+            let record = &self.blocks[index].record;
+            source
+                .edges
+                .iter()
+                .map(|edge| (edge.id, crate::semantic_shadow::element_provenance_names(record, crate::ElementKind::Edge, edge.id)))
+                .collect()
+        };
+        let baseline_groups = self.blocks[index].record.surface_groups.clone();
+        let projected_groups = crate::BlockRecord::project_surface_groups(&source, &edit.body, &lineage, &baseline_groups, &edge_names);
+        self.surface_group_ambiguous = projected_groups.ambiguous;
+        self.blocks[index].record.face_materials = projected.assignments;
+        self.blocks[index].record.surface_groups = projected_groups.groups;
         self.blocks[index].record.body = Some(edit.body);
         self.blocks[index].record.size_m = edit.size_m;
         self.blocks[index].record.clamp_features();
-        self.blocks[index].record.push_op(op);
+        self.blocks[index].record.push_op_with_semantics(op, semantic);
+        crate::semantic_shadow::stamp_face_provenance(&mut self.blocks[index].record);
+        crate::semantic_shadow::stamp_surface_groups(&mut self.blocks[index].record);
         self.rebuild_block_mesh(index)?;
         let local = self.entity_local_pose(id)?;
         self.write_block_translation(id, translation_plus_shift(local, edit.shift))?;
@@ -4601,6 +5299,16 @@ impl RenderInstance {
 impl RenderSceneSnapshot {
     pub fn instances(&self) -> &[RenderInstance] {
         &self.instances
+    }
+
+    /// Draw one extracted instance with a different library mesh.
+    /// The world object is not in this snapshot, so its stored mesh stays as it was.
+    pub fn rebind_instance_mesh(&mut self, entity: EntityId, mesh: MeshId) -> bool {
+        let Some(instance) = self.instances.iter_mut().find(|instance| instance.entity == entity) else {
+            return false;
+        };
+        instance.mesh = mesh;
+        true
     }
 
     pub fn instance_count(&self) -> usize {
@@ -5723,5 +6431,476 @@ mod tests {
         world.apply_mementos(&[crate::EntityMemento::Present(present)]).unwrap();
         assert_eq!(world.remember_entity(id).unwrap().uuid, id);
         assert!(world.authored_block(id).unwrap().history.is_empty());
+    }
+
+    #[test]
+    fn a_two_edge_bevel_saves_one_operation_and_reloads_the_same_body() {
+        let document = crate::empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let source = crate::SolidBody::from_box([2.0, 2.0, 2.0]).unwrap();
+        let pose = world.entity_local_pose(id).unwrap();
+        world.preview_block_body(id, source.clone(), pose.translation).unwrap();
+        let cut = source.bevel_edges(&[16, 12], 0.2).unwrap();
+        let shifted = Vec3::new(
+            pose.translation.x + cut.edit.shift[0],
+            pose.translation.y + cut.edit.shift[1],
+            pose.translation.z + cut.edit.shift[2],
+        );
+        world.preview_block_body(id, cut.edit.body.clone(), shifted).unwrap();
+        world
+            .commit_block_topology(id, crate::BlockOp::BevelEdges { edges: vec![16, 12], distance_m: cut.width_m })
+            .unwrap();
+        let record = world.authored_block(id).unwrap();
+        let bevels: Vec<_> = record.history.iter().filter(|op| matches!(op, crate::BlockOp::BevelEdges { .. })).collect();
+        assert_eq!(bevels.len(), 1);
+        match bevels[0] {
+            crate::BlockOp::BevelEdges { edges, distance_m } => {
+                assert_eq!(edges, &vec![16, 12]);
+                assert!((distance_m - 0.2).abs() < 1.0e-9);
+            }
+            _ => unreachable!(),
+        }
+        let groups = record
+            .intent
+            .iter()
+            .find(|entry| matches!(entry.payload, crate::IntentPayload::Bevel { .. }))
+            .and_then(|entry| entry.groups.clone())
+            .expect("one bevel stores both semantic groups");
+        assert_eq!(groups, vec![vec!["E:seed-edge/7".to_string()], vec!["E:seed-edge/3".to_string()]]);
+        let saved = crate::LevelDocument::capture(&world, document.level_uuid, "Corner").unwrap();
+        let loaded = crate::parse_level(&saved.to_json()).unwrap().instantiate().unwrap();
+        let again = loaded.entity_outline().into_iter().find_map(|row| loaded.authored_block(row.uuid)).expect("the solid reloaded");
+        assert_eq!(again.body, record.body);
+        assert_eq!(again.intent, record.intent);
+        again.body.unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn painted_faces_save_reload_and_leave_an_unpainted_cube_as_one_submesh() {
+        let document = crate::empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let plain = world.meshes().get(world.object_mesh(id).unwrap()).unwrap();
+        assert_eq!(plain.submeshes().len(), 1);
+        assert_eq!(plain.index_count(), 36);
+        assert_eq!(plain.submeshes()[0].material_slot, 0);
+        assert_eq!(crate::build_meshlets(plain).meshlets.len(), 12);
+        let plain_saved = crate::LevelDocument::capture(&world, document.level_uuid, "Plain").unwrap();
+        let plain_text = plain_saved.to_json();
+        assert!(!plain_text.contains("face_materials"));
+        assert!(!plain_text.contains("\"materials\""));
+
+        let intent = world.authored_block(id).unwrap().intent.len();
+        assert_eq!(world.add_block_material_slot(id).unwrap(), crate::AuthoringResult::Applied);
+        assert_eq!(world.assign_block_faces(id, &[1, 3], 1).unwrap(), crate::AuthoringResult::Applied);
+        let record = world.authored_block(id).unwrap();
+        assert!(record.body.is_none());
+        assert_eq!(record.intent.len(), intent);
+        assert_eq!(record.faces_on_slot(1), vec![1, 3]);
+        assert_eq!(record.faces_on_slot(0), vec![2, 4, 5, 6]);
+        assert!(record.face_materials.iter().any(|entry| entry.face == Some(1) && entry.provenance == vec!["F:seed/0".to_string()]));
+        assert!(record.face_materials.iter().any(|entry| entry.face == Some(3) && entry.provenance == vec!["F:seed/2".to_string()]));
+        let mesh = world.meshes().get(world.object_mesh(id).unwrap()).unwrap();
+        assert_eq!(mesh.index_count(), 36);
+        assert_eq!(mesh.submeshes().len(), 2);
+        assert_eq!(mesh.submeshes()[0].material_slot, 0);
+        assert_eq!(mesh.submeshes()[0].first_index, 0);
+        assert_eq!(mesh.submeshes()[0].index_count, 24);
+        assert_eq!(mesh.submeshes()[1].material_slot, 1);
+        assert_eq!(mesh.submeshes()[1].first_index, 24);
+        assert_eq!(mesh.submeshes()[1].index_count, 12);
+        let center = Vec3::new(0.0, 1.0, -4.0);
+        let ejected = world.separate_from_blocks(center);
+        assert!((ejected.x - 1.3).abs() < 1.0e-6 && (ejected.y - 1.0).abs() < 1.0e-6 && (ejected.z + 4.0).abs() < 1.0e-6, "{ejected:?}");
+
+        let saved = crate::LevelDocument::capture(&world, document.level_uuid, "Painted").unwrap();
+        let loaded = crate::parse_level(&saved.to_json()).unwrap().instantiate().unwrap();
+        let loaded_id = loaded.entity_outline().into_iter().find(|row| loaded.authored_block(row.uuid).is_some()).unwrap().uuid;
+        let again = loaded.authored_block(loaded_id).unwrap();
+        assert!(again.body.is_none());
+        assert_eq!(again.face_materials, record.face_materials);
+        assert_eq!(again.materials.len(), 1);
+        assert_eq!(again.faces_on_slot(1), vec![1, 3]);
+        assert_eq!(again.faces_on_slot(0), vec![2, 4, 5, 6]);
+        let loaded_mesh = loaded.meshes().get(loaded.object_mesh(loaded_id).unwrap()).unwrap();
+        assert_eq!(loaded_mesh.submeshes().len(), 2);
+        assert_eq!(loaded_mesh.index_count(), 36);
+    }
+
+    #[test]
+    fn painted_topology_inherits_and_reset_keeps_the_orphan() {
+        let document = crate::empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.add_block_material_slot(id).unwrap();
+        world.assign_block_faces(id, &[3], 1).unwrap();
+        assert_eq!(world.subdivide_block_face(id, 3, 2, 2).unwrap(), crate::AuthoringResult::Applied);
+        let divided = world.authored_block(id).unwrap();
+        let body = divided.body.clone().unwrap();
+        body.validate().unwrap();
+        for face in &body.faces {
+            let slot = divided.bound_slot(face.id);
+            if face.id == 3 || face.id > 6 {
+                assert_eq!(slot, 1, "face {}", face.id);
+            } else {
+                assert_eq!(slot, 0, "face {}", face.id);
+            }
+        }
+
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.add_block_material_slot(id).unwrap();
+        world.assign_block_faces(id, &[3], 1).unwrap();
+        assert_eq!(world.extrude_block_faces(id, &[3], [0.0, 0.25, 0.0]).unwrap(), crate::AuthoringResult::Applied);
+        let extruded = world.authored_block(id).unwrap();
+        let body = extruded.body.clone().unwrap();
+        body.validate().unwrap();
+        for face in &body.faces {
+            let slot = extruded.bound_slot(face.id);
+            let cap_or_wall = face.id == 3 || face.id > 6;
+            assert_eq!(slot, u32::from(cap_or_wall), "face {}", face.id);
+        }
+
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.add_block_material_slot(id).unwrap();
+        world.add_block_material_slot(id).unwrap();
+        world.assign_block_faces(id, &[1], 1).unwrap();
+        world.assign_block_faces(id, &[5], 2).unwrap();
+        let record = world.authored_block(id).unwrap();
+        let source = record.material_body().unwrap();
+        let (cut, lineage) = source.bevel_edges_traced(&[16], 0.05).unwrap();
+        let projected = crate::BlockRecord::project_face_materials(&source, &cut.edit.body, &lineage, &record.face_materials);
+        assert!(projected.defaulted > 0);
+        cut.edit.body.validate().unwrap();
+        let mut next = record.clone();
+        next.body = Some(cut.edit.body.clone());
+        next.size_m = cut.edit.size_m;
+        next.face_materials = projected.assignments;
+        world.replace_block_record(id, next).unwrap();
+        let beveled = world.authored_block(id).unwrap();
+        beveled.body.as_ref().unwrap().validate().unwrap();
+        assert_eq!(beveled.bound_slot(1), 1);
+        assert_eq!(beveled.bound_slot(5), 2);
+        let original = source.faces.iter().map(|face| face.id).collect::<Vec<_>>();
+        for face in &beveled.body.as_ref().unwrap().faces {
+            if !original.contains(&face.id) {
+                assert_eq!(beveled.bound_slot(face.id), 0, "new face {}", face.id);
+            }
+        }
+
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.add_block_material_slot(id).unwrap();
+        world.assign_block_faces(id, &[3], 1).unwrap();
+        let painted = world.authored_block(id).unwrap();
+        assert!(painted.face_materials.iter().any(|entry| entry.face == Some(3) && entry.provenance == vec!["F:seed/2".to_string()]));
+        assert_eq!(world.reset_block_shape(id).unwrap(), crate::AuthoringResult::Applied);
+        let reset = world.authored_block(id).unwrap();
+        assert!(reset.body.is_none());
+        assert_eq!(reset.materials.len(), 1);
+        assert_eq!(reset.face_materials.len(), 1);
+        assert_eq!(reset.face_materials[0].face, None);
+        assert_eq!(reset.face_materials[0].slot, 1);
+        assert_eq!(reset.face_materials[0].provenance, vec!["F:seed/2".to_string()]);
+        assert_eq!(reset.bound_slot(3), 0);
+        assert!(reset.faces_on_slot(1).is_empty());
+        assert_eq!(world.reset_block_shape(id).unwrap(), crate::AuthoringResult::Unchanged);
+    }
+
+    #[test]
+    fn upper_rim_stays_selectable_after_subdivide_and_reload() {
+        let document = crate::empty_world_level();
+        let mut control = document.instantiate().unwrap();
+        let control_id = control.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        control.make_block_faces_unique(control_id, &[3, 5]).unwrap();
+        control.subdivide_block_face(control_id, 3, 2, 2).unwrap();
+        let control_mesh = control.meshes().get(control.object_mesh(control_id).unwrap()).unwrap();
+        let control_indices = control_mesh.index_count();
+        let control_submeshes = control_mesh.submeshes().len();
+
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let plain = crate::LevelDocument::capture(&world, document.level_uuid, "Plain").unwrap().to_json();
+        assert!(!plain.contains("surface_groups"));
+        assert!(!plain.contains("next_surface_group"));
+        let before_intent = world.authored_block(id).unwrap().intent.clone();
+        assert!(world.authored_block(id).unwrap().body.is_none());
+        assert_eq!(world.create_block_surface_group(id, "Upper Rim", &[3, 5]).unwrap(), crate::AuthoringResult::Applied);
+        let created = world.authored_block(id).unwrap();
+        assert_eq!(created.intent, before_intent);
+        assert!(created.body.is_none());
+        let group_id = created.surface_groups[0].id;
+        let slot = created.surface_groups[0].slot;
+        assert_eq!(world.set_block_material_factors(id, slot, [0.15, 0.35, 0.8], 0.4, 0.2).unwrap(), crate::AuthoringResult::Applied);
+        let selected = world.authored_block(id).unwrap().resolved_group_faces(group_id);
+        assert_eq!(selected, vec![3, 5]);
+        assert_eq!(world.subdivide_block_face(id, 3, 2, 2).unwrap(), crate::AuthoringResult::Applied);
+        assert_eq!(world.surface_group_ambiguous(), 0);
+        let divided = world.authored_block(id).unwrap();
+        let body = divided.body.clone().unwrap();
+        body.validate().unwrap();
+        let members = divided.resolved_group_faces(group_id);
+        assert!(members.contains(&3) && members.contains(&5));
+        for face in &body.faces {
+            if face.id == 3 || face.id == 5 || face.id > 6 {
+                assert!(members.contains(&face.id), "face {}", face.id);
+            } else {
+                assert!(!members.contains(&face.id), "face {}", face.id);
+            }
+        }
+        let group = divided.surface_group(group_id).unwrap();
+        assert_eq!(group.name, "Upper Rim");
+        assert!(group.members.iter().any(|member| member.face == Some(3) && member.provenance.iter().any(|token| token == "F:seed/2")));
+        assert!(group.members.iter().any(|member| {
+            member.face.is_some_and(|face| face > 6) && member.provenance.iter().any(|token| token.contains("F:cell(F:seed/2,"))
+        }));
+        assert_ne!(divided.intent, before_intent);
+        assert!(divided.intent.iter().any(|entry| matches!(entry.payload, crate::IntentPayload::Subdivide { .. })));
+        assert_eq!(divided.material_slot(slot).unwrap().base_color, [0.15, 0.35, 0.8, 1.0]);
+        let mesh = world.meshes().get(world.object_mesh(id).unwrap()).unwrap();
+        assert_eq!(mesh.index_count(), control_indices);
+        assert_eq!(mesh.submeshes().len(), control_submeshes);
+        assert_eq!(mesh.submeshes().len(), 2);
+
+        let saved = crate::LevelDocument::capture(&world, document.level_uuid, "Upper Rim").unwrap();
+        let text = saved.to_json();
+        assert!(text.contains("surface_groups"));
+        assert!(text.contains("Upper Rim"));
+        let loaded = crate::parse_level(&text).unwrap().instantiate().unwrap();
+        let loaded_id = loaded.entity_outline().into_iter().find(|row| loaded.authored_block(row.uuid).is_some()).unwrap().uuid;
+        let again = loaded.authored_block(loaded_id).unwrap();
+        assert_eq!(again.surface_groups[0].id, group_id);
+        assert_eq!(again.surface_groups[0].name, "Upper Rim");
+        assert_eq!(again.resolved_group_faces(group_id), members);
+        let again_body = again.body.clone().unwrap();
+        for face in again.resolved_group_faces(group_id) {
+            assert!(again_body.faces.iter().any(|stored| stored.id == face));
+        }
+        assert_eq!(again.material_slot(slot).unwrap().base_color, [0.15, 0.35, 0.8, 1.0]);
+        let loaded_mesh = loaded.meshes().get(loaded.object_mesh(loaded_id).unwrap()).unwrap();
+        assert_eq!(loaded_mesh.index_count(), control_indices);
+        assert_eq!(loaded_mesh.submeshes().len(), 2);
+    }
+
+    #[test]
+    fn a_surface_group_reset_orphans_members_and_a_second_reset_is_unchanged() {
+        let document = crate::empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.create_block_surface_group(id, "Upper Rim", &[3, 5]).unwrap();
+        let grouped = world.authored_block(id).unwrap();
+        assert_eq!(grouped.bound_slot(3), 1);
+        assert_eq!(world.reset_block_shape(id).unwrap(), crate::AuthoringResult::Applied);
+        let reset = world.authored_block(id).unwrap();
+        assert!(reset.body.is_none());
+        assert_eq!(reset.surface_groups.len(), 1);
+        assert_eq!(reset.surface_groups[0].name, "Upper Rim");
+        assert_eq!(reset.next_surface_group, grouped.next_surface_group);
+        assert!(reset.surface_groups[0].members.iter().all(|member| member.face.is_none()));
+        assert!(reset.surface_groups[0].members.iter().any(|member| member.provenance.iter().any(|token| token == "F:seed/2")));
+        assert_eq!(reset.bound_slot(3), 0);
+        assert_eq!(reset.materials.len(), 1);
+        assert_eq!(world.reset_block_shape(id).unwrap(), crate::AuthoringResult::Unchanged);
+        world.delete_block_surface_group(id, reset.surface_groups[0].id).unwrap();
+        let deleted = world.authored_block(id).unwrap();
+        assert!(deleted.surface_groups.is_empty());
+        assert_eq!(deleted.next_surface_group, grouped.next_surface_group);
+        assert_eq!(deleted.materials.len(), 1);
+        assert!(deleted.body.is_none());
+    }
+
+    fn stored_body(world: &SceneWorld, id: EntityId) -> crate::SolidBody {
+        world.authored_block(id).unwrap().body.clone().unwrap()
+    }
+
+    fn solid_volume(body: &crate::SolidBody) -> f64 {
+        let mut sum = 0.0;
+        for face in &body.faces {
+            let Some(positions) = body.face_positions(face.id) else { continue };
+            if positions.len() < 3 {
+                continue;
+            }
+            for index in 1..positions.len() - 1 {
+                let (a, b, c) = (positions[0], positions[index], positions[index + 1]);
+                let triple = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+                sum += triple;
+            }
+        }
+        sum.abs() / 6.0
+    }
+
+    fn commit_edges(world: &mut SceneWorld, id: EntityId, edges: &[u32], distance: f64) -> crate::BevelCut {
+        let body = stored_body(world, id);
+        let pose = world.entity_local_pose(id).unwrap();
+        let cut = body.bevel_edges(edges, distance).unwrap();
+        let shifted = Vec3::new(
+            pose.translation.x + cut.edit.shift[0],
+            pose.translation.y + cut.edit.shift[1],
+            pose.translation.z + cut.edit.shift[2],
+        );
+        world.preview_block_body(id, cut.edit.body.clone(), shifted).unwrap();
+        world
+            .commit_block_topology(id, crate::BlockOp::BevelEdges { edges: cut.edges.clone(), distance_m: cut.width_m })
+            .unwrap();
+        cut
+    }
+
+    #[test]
+    fn a_loop_on_an_edited_solid_bevels_once_and_reloads() {
+        let document = crate::empty_world_level();
+        let mut world = document.instantiate().unwrap();
+        let id = world.create_block(Vec3::new(0.0, 1.0, -4.0), crate::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        world.subdivide_block_face(id, 3, 2, 2).unwrap();
+        let body = stored_body(&world, id);
+        let tops: Vec<u32> = body
+            .faces
+            .iter()
+            .filter(|face| body.unit_normal(face.id).is_some_and(|normal| normal[1] > 0.9))
+            .map(|face| face.id)
+            .collect();
+        let (left, right) = tops
+            .iter()
+            .copied()
+            .find_map(|face| {
+                tops.iter().copied().find(|other| {
+                    *other != face
+                        && body.edges.iter().any(|edge| {
+                            let faces = body.faces_of_edge(edge.id);
+                            faces.contains(&face) && faces.contains(other)
+                        })
+                }).map(|other| (face, other))
+            })
+            .unwrap();
+        let normal = body.unit_normal(left).unwrap();
+        world.extrude_block_faces(id, &[left, right], [normal[0] * 0.25, normal[1] * 0.25, normal[2] * 0.25]).unwrap();
+        assert!(stored_body(&world, id).face_loop(1).is_some());
+        let side = 1u32;
+        let side_normal = stored_body(&world, id).unit_normal(side).unwrap();
+        world
+            .extrude_block_faces(id, &[side], [side_normal[0] * 0.2, side_normal[1] * 0.2, side_normal[2] * 0.2])
+            .unwrap();
+        let split_edge = stored_body(&world, id).edges.iter().map(|edge| edge.id).find(|edge| *edge > 20).unwrap();
+        world.split_block_edge(id, split_edge).unwrap();
+        let mut singles = 0;
+        let candidates: Vec<u32> = stored_body(&world, id).edges.iter().map(|edge| edge.id).collect();
+        for edge in candidates {
+            let body = stored_body(&world, id);
+            if body.bevel_edges(&[edge], 0.05).is_err() {
+                continue;
+            }
+            commit_edges(&mut world, id, &[edge], 0.05);
+            singles += 1;
+            if singles == 2 {
+                break;
+            }
+        }
+        assert!(singles >= 1, "the edited solid still has an edge that bevels");
+        let caps: Vec<u32> = stored_body(&world, id)
+            .faces
+            .iter()
+            .filter(|face| stored_body(&world, id).unit_normal(face.id).is_some_and(|normal| normal[1] > 0.9))
+            .map(|face| face.id)
+            .collect();
+        let mut extruded = false;
+        for face in caps {
+            let body = stored_body(&world, id);
+            let Some(normal) = body.unit_normal(face) else { continue };
+            let delta = [normal[0] * 0.15, normal[1] * 0.15, normal[2] * 0.15];
+            if body.extrude_faces(&[face], delta).is_ok() && world.extrude_block_faces(id, &[face], delta).is_ok() {
+                extruded = true;
+                break;
+            }
+        }
+        assert!(extruded);
+        let later = stored_body(&world, id).edges.iter().map(|edge| edge.id).filter(|edge| *edge > 20).take(2).collect::<Vec<_>>();
+        for edge in later {
+            let _ = world.split_block_edge(id, edge);
+        }
+        let mut loop_edges = None;
+        for _ in 0..2 {
+            let body = stored_body(&world, id);
+            for edge in body.edges.iter().map(|edge| edge.id).collect::<Vec<_>>() {
+                let walk = body.edge_loop(&[edge]);
+                if walk.ids.len() < 2 {
+                    continue;
+                }
+                if body.bevel_edges(&walk.ids, 0.05).is_ok() {
+                    loop_edges = Some(walk.ids);
+                    break;
+                }
+            }
+            if loop_edges.is_some() {
+                break;
+            }
+            for face in [1, 2, 4, 5, 6] {
+                let _ = world.subdivide_block_face(id, face, 2, 2);
+            }
+        }
+        let loop_edges = loop_edges.expect("the edited solid has a loop that bevels");
+        let before_ids: Vec<u32> = stored_body(&world, id).edges.iter().map(|edge| edge.id).collect();
+        let bevels_before = world.authored_block(id).unwrap().history.iter().filter(|op| matches!(op, crate::BlockOp::BevelEdges { .. })).count();
+        let cut = commit_edges(&mut world, id, &loop_edges, 0.05);
+        let record = world.authored_block(id).unwrap();
+        let bevels: Vec<_> = record.history.iter().filter(|op| matches!(op, crate::BlockOp::BevelEdges { .. })).collect();
+        assert_eq!(bevels.len(), bevels_before + 1);
+        match record.history.iter().rev().find(|op| matches!(op, crate::BlockOp::BevelEdges { .. })) {
+            Some(crate::BlockOp::BevelEdges { edges, distance_m }) => {
+                assert_eq!(edges, &cut.edges);
+                assert!((*distance_m - cut.width_m).abs() < 1.0e-9);
+            }
+            _ => panic!("the loop bevel is one history entry"),
+        }
+        let beveled = stored_body(&world, id);
+        beveled.validate().unwrap();
+        let ring = beveled
+            .edges
+            .iter()
+            .map(|edge| edge.id)
+            .filter(|edge| !before_ids.contains(edge))
+            .find_map(|edge| {
+                let walk = beveled.edge_ring(&[edge]);
+                (walk.ids.len() >= 2).then_some(walk)
+            })
+            .or_else(|| {
+                beveled.edges.iter().map(|edge| edge.id).find_map(|edge| {
+                    let walk = beveled.edge_ring(&[edge]);
+                    (walk.ids.len() >= 2).then_some(walk)
+                })
+            })
+            .expect("later topology still has a ring");
+        assert!(ring.ids.iter().all(|edge| beveled.edge_endpoints(*edge).is_some()));
+        let mut edited_again = false;
+        for edge in &ring.ids {
+            if world.split_block_edge(id, *edge).is_ok() {
+                edited_again = true;
+                break;
+            }
+        }
+        assert!(edited_again);
+        let final_body = stored_body(&world, id);
+        final_body.validate().unwrap();
+        let volume = solid_volume(&final_body);
+        let bounds = final_body.aabb_size();
+        let saved = crate::LevelDocument::capture(&world, document.level_uuid, "Edited").unwrap();
+        let mut loaded = crate::parse_level(&saved.to_json()).unwrap().instantiate().unwrap();
+        let again = loaded.entity_outline().into_iter().find_map(|row| loaded.authored_block(row.uuid)).unwrap();
+        let loaded_body = again.body.clone().unwrap();
+        assert_eq!(loaded_body, final_body);
+        assert_eq!(loaded_body.aabb_size(), bounds);
+        assert!((solid_volume(&loaded_body) - volume).abs() < 1.0e-8);
+        loaded_body.validate().unwrap();
+        let sample = loaded_body.edges[0].id;
+        let reloaded_loop = loaded_body.edge_loop(&[sample]);
+        assert!(reloaded_loop.ids.iter().all(|edge| loaded_body.edges.iter().any(|stored| stored.id == *edge)));
+        let reloaded_ring = loaded_body.edge_ring(&[sample]);
+        assert!(reloaded_ring.ids.iter().all(|edge| loaded_body.edge_endpoints(*edge).is_some()));
+        let face = loaded_body.faces[0].id;
+        assert!(!loaded_body.connected_faces(&[face]).ids.is_empty());
+        let fresh = loaded_body.edges.iter().map(|edge| edge.id).find(|edge| *edge > 20).unwrap();
+        let loaded_id = loaded.entity_outline().into_iter().find(|row| loaded.authored_block(row.uuid).is_some()).unwrap().uuid;
+        loaded.split_block_edge(loaded_id, fresh).unwrap();
+        loaded.authored_block(loaded_id).unwrap().body.unwrap().validate().unwrap();
     }
 }

@@ -15,6 +15,11 @@ mod clock;
 mod input;
 mod parametric;
 mod topology;
+mod topology_select;
+mod intent_shadow;
+#[cfg(test)]
+mod intent_shadow_validation;
+mod semantic_shadow;
 mod play;
 mod settings;
 mod entity;
@@ -33,6 +38,13 @@ mod meshlet_parents;
 mod leaf_coverage;
 mod detail_provider;
 mod microgeometry;
+mod view_realization;
+mod observation;
+mod direct_realization;
+mod intent_observation;
+mod analytic_intent;
+mod authored_intent;
+mod round_intent;
 mod pick;
 mod registry;
 mod player;
@@ -43,6 +55,7 @@ mod quality;
 mod reflect;
 mod runtime;
 mod scene;
+mod organization;
 mod shadow;
 mod space;
 mod terrain;
@@ -173,10 +186,62 @@ pub use joint::{apply_joint_property, clamp_joint_pose, joint_debug_lines, Joint
 pub use parametric::{
     align_translation_to_ground, default_block_material, editor_reference_segments, face_center, face_from_local_point, face_name, face_normal, face_tangent,
     feature_limit, finite_size, keep_outside_blocks, keep_outside_box, mirrored_translation, nearest_face_handle, push_face, scene_origin_world_x, snap_dimension,
-    snap_translation, swap_insets, BlockOp, BlockRecord, BlockSolid, FacePush, ReferenceSegment, BLOCK_DIMENSION_SNAP_M, BLOCK_EXTRUDE_STEP_M, BLOCK_HISTORY_LIMIT,
-    BLOCK_INSET_STEP_M, BLOCK_MAX_EXTENT_M, BLOCK_MIN_EXTENT_M, BLOCK_POSITION_SNAP_M, FLY_COLLISION_RADIUS_M, REFERENCE_GRID_Y_M,
+    snap_translation, swap_insets, BlockOp, BlockRecord, BlockSolid, ConcreteElement, DerivedRenderGeometry, FacePush, GeometryStep, IntentEntry, IntentPayload, ReferenceSegment,
+    SemanticStepId, BLOCK_DIMENSION_SNAP_M, BLOCK_EXTRUDE_STEP_M, BLOCK_HISTORY_LIMIT, BLOCK_MATERIAL_SLOT_LIMIT,
+    FaceMaterialAssignment, FaceMaterialError, ProjectedFaceMaterials, ProjectedSurfaceGroups, SurfaceGroup, SurfaceGroupCover, SurfaceGroupError,
+    SurfaceMember, SURFACE_GROUP_NAME_LIMIT,
+    BLOCK_INSET_STEP_M, BLOCK_MAX_EXTENT_M, BLOCK_MIN_EXTENT_M, BLOCK_POSITION_SNAP_M, FLY_COLLISION_RADIUS_M, PLANE_DEPTH_M, PLANE_WIDTH_M, REFERENCE_GRID_Y_M,
 };
-pub use topology::{last_solid_validate_us, SolidBody, SolidEdge, SolidFace, SolidVertex, TopologyEdit, TopologyError, TopologyPick, SUBDIVIDE_MAX};
+pub use intent_shadow::{evaluate_intent_shadow, IntentShadowReport, IntentShadowStatus};
+pub use semantic_shadow::{
+    authored_extrude_record, authored_split_conflict, class_c_cache_extent, commit_authored_round, commit_class_c_intent, format_intent_live_rerealize, intent_authority_candidate, intent_authority_diagnostic, intent_authority_eligibility,
+    preferred_face_token, replay_round, replay_rounds, semantic_edge_bindings, semantic_edge_names, semantic_face_names, semantic_vertex_names, semantic_shadow_diagnostic, IntentAuthorityCandidate, IntentAuthorityEligibility, IntentLiveRerealizeFacts,
+};
+pub use round_intent::{
+    arc_divisions, cache_extent, curve_proof_dir, dragged_round_radius, feature_id, fillet_crown_step, fillet_scaled, format_round_product, maximum_round_radius, observation_camera,
+    assess_round_set, cache_extent_many, curve_catalog, fillet_for_chain, logical_edge_chain, observe_resolved_fillet, observe_resolved_fillets, persistent_edge_token, pick_curve_elements, pick_segment, planar_face_keeps_point, presentation_camera, round_surface_at, visible_authored_face,
+    realize_round_corner, realize_round_observation, realize_round_solid, round_cage_segment, round_curve_id, round_edge_closes, round_entry, round_entry_set, round_group_tokens,
+    round_wire_mesh, select_round_token, sharp_corner_mesh, validate_fillet, write_authored_curve_project, Fillet, ReplayedRound, RoundAssessment, RoundFeature,
+    RoundCamera, CurveElement, CurveKind,
+    RoundProduct, CURVE_CLOSE_MULTIPLE,
+    CURVE_CLOSE_WIDTH, CURVE_EDITED_RADIUS_M, CURVE_ERROR_PX, CURVE_ERROR_SLACK_PX, CURVE_FAR_MULTIPLE, CURVE_FAR_WIDTH, CURVE_FOV, CURVE_N_CAP, CURVE_PRESENT_CLOSE_M,
+    CURVE_PRESENT_CLOSE_WIDTH, CURVE_PRESENT_FAR_M, CURVE_PRESENT_FAR_WIDTH, CURVE_PRESENT_HEIGHT, CURVE_PRESENT_LATERAL, CURVE_PRESENT_NEAR_M, CURVE_RADIUS_M, CURVE_VERTEX_STRIDE,
+    CURVE_VIEW_HEIGHT,
+};
+pub use view_realization::{
+    authoritative_body_hash, camera_in_solid_local, format_view_realization_pair, RealizationCamera, RealizationTicket, ViewRealizationControl, ViewRealizationFacts, ViewRealizationHost,
+    ViewRealizationRequest, REALIZATION_ALGORITHM_VERSION, REALIZATION_POSE_BUCKET_M,
+};
+pub use direct_realization::{
+    classify_patch, close_observation, far_observation, format_direct_product, predicate_max_px, realize_direct, AnalyticObject, DirectCamera, DirectProduct,
+    DirectTriangleRecord, DirectUploadProof, PatchAdmission, ScalarPredicate, SurfaceAccount, DIRECT_REALIZATION_ALGORITHM_VERSION, SURFACE_A, SURFACE_B,
+};
+pub use analytic_intent::{
+    analytic_authority_hash, analytic_proof_dir, close_analytic_camera, far_analytic_camera, format_analytic_product, realize_saved_chart, replace_surface_radius,
+    write_analytic_intent_project, AnalyticAccount, AnalyticAdmission, AnalyticCamera, AnalyticProduct, AnalyticTraceRecord, ANALYTIC_CHART, ANALYTIC_INTENT_ALGORITHM_VERSION,
+    EDITED_RADIUS_M, NOT_AUTHORITY_3C, NOT_AUTHORITY_EXPERIMENT4, NOT_AUTHORITY_EXPERIMENT4_EDIT, SURFACE_ONE, SURFACE_TWO,
+};
+pub use authored_intent::{
+    authored_authority_hash, authored_camera_a, authored_camera_b, authored_main_level, authored_planar_changed, authored_proof_dir, authored_rerun_dir, authored_size_bits, format_authored_product,
+    realize_authored_observation, write_authored_intent_project, AuthoredAdmission, AuthoredCamera, AuthoredFaceAccount, AuthoredProduct, AuthoredTrace,
+    AUTHORED_INTENT_ALGORITHM_VERSION, AUTHORED_MAIN_LEVEL_BYTES, EDITED_SIZE_BITS,
+};
+pub use intent_observation::{
+    authority_hash, close_intent_camera, far_intent_camera, format_intent_product, planar_geometry_changed, realize_intent_observation, size_edit_bits, size_edit_copy,
+    IntentAdmission, IntentObservationCamera, IntentObservationProduct, IntentPatchAccount, IntentPlanarAccount, IntentTraceRecord, INTENT_OBSERVATION_ALGORITHM_VERSION, PATCH_A,
+    PATCH_A_TRANSLATION, PATCH_B, PATCH_B_TRANSLATION,
+};
+pub use observation::{
+    format_observation_block, format_observation_gpu, frozen_observation_cameras, observation_eye_text, observation_forward_text, pack_observation_gpu, Admission, ConstructedTriangle,
+    FaceDecision, FaceGpuAccount, ObservationCamera, ObservationGpuPack, ObservationHost, ObservationIntegrity, ObservationProduct, ObservationRequest, ObservationTicket, ObservationUploadProof,
+    FROZEN_A_ADMITTED, FROZEN_A_EYE_TEXT, FROZEN_A_OMITTED, FROZEN_A_WIDTH, FROZEN_B_ADMITTED, FROZEN_B_EYE_TEXT, FROZEN_B_OMITTED, FROZEN_B_WIDTH, FROZEN_OBSERVATION_HEIGHT,
+    OBSERVATION_ALGORITHM_VERSION, OBSERVATION_SPECIMEN_FACE, OBSERVATION_VERTEX_STRIDE,
+};
+pub use topology::{
+    last_solid_validate_us, BevelCut, BirthRole, ElementBirth, ElementKind, SolidBody, SolidEdge, SolidFace, SolidVertex, TopologyEdit, TopologyError, TopologyLineage, TopologyPick,
+    SUBDIVIDE_MAX,
+};
+pub use topology_select::{ElementWalk, WalkNote};
 pub use player::{
     apply_player_start_property, compose_spawn_rotation, parse_player, parse_player_start_fields, player_start_lines, validate_relative_asset, PlayerDocument, PlayerStartRecord,
     PLAYER_FORMAT_VERSION, PLAYER_SCHEMA,
@@ -194,6 +259,7 @@ pub use project::{
     autosave_path, create_project_directories, load_level_file, load_project_file, parse_project, save_atomic, save_level_atomic,
     save_project_atomic, ProjectDocument, ProjectError, LIGHTING_LAB_PROJECT_UUID, PROJECT_FORMAT_VERSION, PROJECT_SCHEMA,
 };
+pub use organization::{OrganizationError, SceneFolder, SceneOrganization, FOLDER_NAME_LIMIT};
 pub use scene::{
     instance_gpu_transforms, last_block_rebuild_us, AuthoringCapabilities, CameraId, ComponentBinding, ComponentQueryHit, ComponentRole, EntityCapabilities, EntityFocus, EntityOwnership, ExtractedCamera, ExtractedGameCamera, FocusError, JointDebugSegment, JointId, LandDrawClass, MaterialSlotBinding, MementoEffect, ObjectId,
     RenderFrameId, RenderInstance, RenderInstanceId, RenderSceneSnapshot, SceneWorld, TerrainSurfaceMetrics,
@@ -209,6 +275,9 @@ pub use space::{
     FrameGraph, FrameId, SharedBootstrap,
     GpuTransforms, HighPrecisionPose, Mat4, Quat, ResolvedPose, SpaceError, Vec3, BOOTSTRAP_ROOT_M, DEPTH_CLEAR,
 };
+
+#[cfg(test)]
+mod authored_block;
 
 #[cfg(test)]
 mod boundary_tests {

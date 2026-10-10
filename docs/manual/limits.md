@@ -6,7 +6,8 @@ This is the honest edge of the build the manual describes. A later version can m
 
 - Create and open a project from the Hub, and save a level.
 - Fly the editor camera, select, move, and rotate.
-- Author parametric blocks, including extrude, inset, and bevel, with undo.
+- Author a block from Create > Block, round its edges, and extrude a flat face. The rounds stay. A fillet face and a corner patch can be selected. Extruding either is refused and the shape stays.
+- Extrude, inset, and bevel a solid that stores its own shape, with undo.
 - Import glTF or GLB, browse the asset registry, and drag a model into the level.
 - Create a flat heightfield and sculpt it in Land.
 - Open the joint pose on the sample characters.
@@ -22,9 +23,10 @@ This is the honest edge of the build the manual describes. A later version can m
 | Operating systems | The editor you run is Windows. |
 | Scale | The tool stays disabled. Size is the solid's extents. |
 | Mesh import | glTF 2.0 only. |
-| More primitives | Plane, Ramp, Cylinder, Sphere, and Wedge are unstarted. |
-| Booleans and sketch | Union, subtract, intersect, shell, split, fillet, and array are unstarted. |
-| Feature replay | Features shows the current parameters. It does not mute a step and rebuild. |
+| More primitives | Create > Plane is a closed sheet on a stored solid. Ramp, Cylinder, Sphere, and Wedge are unstarted. The toolbar has no Plane button. Sphere, Cylinder, Torus, Capsule, Cone, Revolve, and Sweep are not in this build. |
+| Booleans and sketch | Union, subtract, intersect, shell, and array are unstarted. Split of an authored edge is one tape entry. Round is the curve on an authored block. A stored body does not get Round. |
+| Separate | Designed and not implemented. A split piece stays in the same object. |
+| Feature replay | An authored block saves the seed and the later operations. The mesh is rebuilt from that tape, and the file has no body. The Features list on a stored body shows the current parameters. It does not mute a step and rebuild. |
 | Clipboard | Cut, Copy, and Paste are absent. |
 | Materials | A block or an imported mesh can take a material. Dropping a material or a texture on a slot does not assign it. |
 | New lights | Create does not spawn a light. Lighting Debug isolates lights that are already there. |

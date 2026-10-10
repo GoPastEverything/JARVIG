@@ -367,6 +367,7 @@ impl Renderer {
         self.shadow_draws_frame = 0;
         self.shadow_pass_ms = 0.0;
         if self.shadow_update_count > 0 && self.shadow_world_revision == snapshot.world_revision {
+            self.note_cached_shadow_casters(snapshot, meshes);
             return Ok(());
         }
         let started = std::time::Instant::now();
@@ -447,6 +448,7 @@ impl Renderer {
         )
         .map_err(RenderError::Space)?;
         if self.shadow.as_ref().expect("shadow").atlases.iter().any(|atlas| atlas.view == view && atlas.fingerprint == set.fingerprint) {
+            self.note_cached_shadow_casters(snapshot, meshes);
             return Ok(());
         }
         self.ensure_directional_atlas(view)?;
@@ -659,6 +661,19 @@ impl Renderer {
         self.encode_shadow_draws(snapshot, meshes, visible, color, depth, 0, 0, POINT_SHADOW_RESOLUTION, true, "JARVIG.Shadow.Point")
     }
 
+    /// The maps were not redrawn. The caster set is still the snapshot instance meshes.
+    fn note_cached_shadow_casters(&mut self, snapshot: &RenderSceneSnapshot, meshes: &MeshLibrary) {
+        let hidden: Vec<jarvig_core::EntityId> = self.entity_hidden.iter().copied().collect();
+        let visible = visible_ids(snapshot, meshes, &hidden);
+        for instance_index in visible {
+            let mesh = snapshot.instances()[instance_index].mesh;
+            if self.frame_draws.iter().any(|draw| draw.pass == "shadow-cached" && draw.mesh == mesh) {
+                continue;
+            }
+            self.frame_draws.push(super::FrameMeshDraw { pass: "shadow-cached", view: None, mesh });
+        }
+    }
+
     fn encode_shadow_draws(
         &mut self,
         snapshot: &RenderSceneSnapshot,
@@ -679,6 +694,7 @@ impl Renderer {
             let stride = position_stride(mesh)?;
             let pipeline = self.ensure_shadow_pipeline(stride)?;
             let group = self.shadow.as_ref().expect("shadow").casters[slot].group;
+            self.frame_draws.push(super::FrameMeshDraw { pass: "shadow", view: None, mesh: instance.mesh });
             prepared.push((instance.mesh, pipeline, group));
         }
         self.shadow_draws_frame = self.shadow_draws_frame.saturating_add(prepared.len() as u32);

@@ -45,10 +45,14 @@ pub enum InspectorCommand {
     InsetFace,
     /// Opens a bevel session. The chamfer is one amount for every edge.
     Bevel,
+    /// Opens a round session on one semantic edge. The radius is the authored fillet.
+    Round,
     /// Drops the open modeling preview and restores the solid.
     CancelModeling,
     /// Writes one history entry for the open modeling preview.
     ApplyModeling,
+    /// Writes the open round. Labeled Apply. Bevel and the other tools stay on Done.
+    ApplyRound,
     MirrorX,
     MirrorY,
     MirrorZ,
@@ -65,6 +69,18 @@ pub enum InspectorCommand {
     SelectionFace,
     SelectionEdge,
     SelectionVertex,
+    /// Edge loop through valence-4 vertices. A pole stops the walk.
+    SelectLoop,
+    /// Opposite edges across four-edge faces.
+    SelectRing,
+    /// The connected component of the current faces, edges, or vertices.
+    SelectConnected,
+    /// Boundary edges of the selected faces.
+    SelectBoundary,
+    /// One adjacency layer around the current set.
+    SelectGrow,
+    /// Drops the outer adjacency layer.
+    SelectShrink,
     /// Moves both ends of the selected edge. The surrounding faces stay attached.
     MoveEdge,
     /// Adds one edge and the wall that joins it to the selected edge.
@@ -77,6 +93,24 @@ pub enum InspectorCommand {
     SubdivideFace,
     /// Replaces the selected quad with a 4 by 4 grid of real faces.
     SubdivideFace4,
+    /// Copies slot 0 into a new slot. Does not assign it.
+    AddMaterialSlot,
+    /// Copies the selection's material into the next slot and assigns only those faces.
+    MakeUnique,
+    /// Replaces the face selection with every live face on the current slot.
+    SelectSlotFaces,
+    /// Names the selected faces as one surface group.
+    CreateSurfaceGroup,
+    /// Changes the visible name of the active group. The id stays.
+    RenameSurfaceGroup,
+    /// Puts the selected faces into the group named by the Groups list.
+    AddSurfaceGroupFaces,
+    /// Drops the selected faces from their group. Geometry stays.
+    RemoveSurfaceGroupFaces,
+    /// Replaces the face selection with the resolved faces of the named group.
+    SelectSurfaceGroup,
+    /// Removes the group record. Geometry and the painted slots stay.
+    DeleteSurfaceGroup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,6 +420,18 @@ fn attach_solid_tools(
         return;
     }
     let Some(record) = record else { return };
+    if record.has_authored_seed() {
+        for section in sections.iter_mut() {
+            for field in &mut section.fields {
+                if matches!(
+                    field.field,
+                    jarvig_core::FIELD_BLOCK_SIZE_X | jarvig_core::FIELD_BLOCK_SIZE_Y | jarvig_core::FIELD_BLOCK_SIZE_Z
+                ) {
+                    field.editable = false;
+                }
+            }
+        }
+    }
     let mode_edits = [
         ("Auto", InspectorCommand::SelectionAuto),
         ("Object", InspectorCommand::SelectionObject),
@@ -403,7 +449,14 @@ fn attach_solid_tools(
         title: "Select".into(),
         type_id: TYPE_PARAMETRIC_BLOCK,
         fields: Vec::new(),
-        commands: Vec::new(),
+        commands: vec![
+            InspectorCommand::SelectLoop,
+            InspectorCommand::SelectRing,
+            InspectorCommand::SelectConnected,
+            InspectorCommand::SelectBoundary,
+            InspectorCommand::SelectGrow,
+            InspectorCommand::SelectShrink,
+        ],
         feature_edits: mode_edits,
     });
     let mut feature_edits = Vec::new();
@@ -434,7 +487,13 @@ fn attach_solid_tools(
         InspectorCommand::SubdivideFace,
         InspectorCommand::SubdivideFace4,
     ];
-    let edge_tools = vec![InspectorCommand::MoveEdge, InspectorCommand::ExtrudeEdge, InspectorCommand::SplitEdge];
+    let edge_tools = vec![
+        InspectorCommand::MoveEdge,
+        InspectorCommand::ExtrudeEdge,
+        InspectorCommand::SplitEdge,
+        InspectorCommand::Bevel,
+        InspectorCommand::Round,
+    ];
     let mut object_tools = vec![InspectorCommand::Bevel, InspectorCommand::ResetShape];
     if capabilities.patternable {
         object_tools.extend([
@@ -472,11 +531,240 @@ fn attach_solid_tools(
         commands: Vec::new(),
         feature_edits: Vec::new(),
     });
+    sections.push(surface_section(record, &surface_faces(record, element)));
     order_solid_sections(sections);
 }
 
+fn surface_faces(record: &jarvig_core::BlockRecord, element: SolidElement) -> Vec<u32> {
+    match element {
+        SolidElement::BodyFace(id) if id != 0 => vec![id],
+        SolidElement::Face(index) if presented_body(record).is_some() => vec![u32::from(index) + 1],
+        _ => Vec::new(),
+    }
+}
+
+/// Replaces the Surface card from the whole face selection. An empty list edits slot 0.
+pub fn set_surface_material(model: &mut InspectorModel, record: &jarvig_core::BlockRecord, faces: &[u32]) {
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    sections.retain(|section| section.title != "Surface");
+    sections.push(surface_section(record, faces));
+    order_solid_sections(sections);
+}
+
+/// True when every live face on `slot` is in `faces`. An empty face list is the object card.
+pub fn selection_owns_material(record: &jarvig_core::BlockRecord, faces: &[u32], slot: u32) -> bool {
+    if faces.is_empty() {
+        return true;
+    }
+    let owners = record.faces_on_slot(slot);
+    !owners.is_empty() && owners.iter().all(|face| faces.contains(face))
+}
+
+/// Short name of a block material slot. Slot 0 is the object material.
+pub fn surface_slot_name(slot: u32) -> String {
+    if slot == 0 {
+        "Object Material".into()
+    } else {
+        format!("Face Material {slot}")
+    }
+}
+
+/// Inspector title, including the slot index.
+pub fn surface_slot_title(slot: u32) -> String {
+    format!("{} (Slot {slot})", surface_slot_name(slot))
+}
+
+fn surface_section(record: &jarvig_core::BlockRecord, faces: &[u32]) -> InspectorSection {
+    let mut used = Vec::new();
+    for face in faces {
+        let slot = record.bound_slot(*face);
+        if !used.contains(&slot) {
+            used.push(slot);
+        }
+    }
+    let shared = if faces.is_empty() {
+        Some(0)
+    } else if used.len() == 1 {
+        Some(used[0])
+    } else {
+        None
+    };
+    let note = if faces.is_empty() {
+        SURFACE_OBJECT_NOTE
+    } else if shared.is_none() {
+        SURFACE_MIXED_NOTE
+    } else if shared == Some(0) && selection_owns_material(record, faces, 0) {
+        SURFACE_WHOLE_NOTE
+    } else if shared.is_some_and(|slot| selection_owns_material(record, faces, slot)) {
+        SURFACE_OWN_NOTE
+    } else {
+        SURFACE_SHARED_NOTE
+    };
+    let mut fields = Vec::new();
+    if !faces.is_empty() {
+        let word = if faces.len() == 1 { "Face" } else { "Faces" };
+        fields.push(solid_note(SOLID_UI_SURFACE_COUNT, "Selection", format!("{} {word}", faces.len())));
+    }
+    fields.push(solid_note(
+        SOLID_UI_SURFACE_SLOT,
+        "Material",
+        shared.map(surface_slot_title).unwrap_or_else(|| "Mixed".into()),
+    ));
+    fields.push(solid_note(SOLID_UI_SURFACE_NOTE, "Notice", note.into()));
+    if let jarvig_core::SurfaceGroupCover::Covered(id) = record.surface_group_cover(faces) {
+        if let Some(slot) = shared {
+            if record.surface_group(id).is_some_and(|group| group.slot == slot) {
+                let resolved = record.resolved_group_faces(id);
+                if selection_owns_material(record, &resolved, slot) && !selection_owns_material(record, faces, slot) {
+                    fields.last_mut().map(|field| field.display = SURFACE_GROUP_OWN_NOTE.into());
+                } else if !selection_owns_material(record, &resolved, slot) {
+                    fields.last_mut().map(|field| field.display = SURFACE_GROUP_SHARED_NOTE.into());
+                }
+            }
+        }
+    }
+    if !faces.is_empty() {
+        let mut choices: Vec<String> = (0..record.slot_count()).map(surface_slot_name).collect();
+        let display = if let Some(slot) = shared { surface_slot_name(slot) } else { "Mixed".into() };
+        if shared.is_none() {
+            choices.insert(0, "Mixed".into());
+        }
+        fields.push(surface_choice(SOLID_UI_SURFACE_ASSIGN, "Assign Existing", &display, choices));
+    }
+    if let Some(slot) = shared {
+        if let Some(material) = record.material_slot(slot) {
+            fields.push(factor_field(SOLID_UI_COLOR_R, "R", material.base_color[0]));
+            fields.push(factor_field(SOLID_UI_COLOR_G, "G", material.base_color[1]));
+            fields.push(factor_field(SOLID_UI_COLOR_B, "B", material.base_color[2]));
+            fields.push(factor_field(SOLID_UI_ROUGHNESS, "Roughness", material.roughness));
+            fields.push(factor_field(SOLID_UI_METALLIC, "Metallic", material.metallic));
+        }
+    }
+    let mut commands = Vec::new();
+    if faces.is_empty() {
+        commands.push(InspectorCommand::SelectSlotFaces);
+        commands.push(InspectorCommand::AddMaterialSlot);
+    } else {
+        commands.push(InspectorCommand::MakeUnique);
+        if shared.is_some() {
+            commands.push(InspectorCommand::SelectSlotFaces);
+        }
+    }
+    let (group_display, group_choices) = group_pick(record, faces);
+    fields.push(solid_note(SOLID_UI_GROUP_MEMBERSHIP, "Group", group_membership_label(record, faces)));
+    fields.push(surface_name(SOLID_UI_GROUP_NAME, "Group Name", &group_name_display(record, faces)));
+    fields.push(surface_choice(SOLID_UI_GROUP_PICK, "Groups", &group_display, group_choices));
+    commands.push(InspectorCommand::CreateSurfaceGroup);
+    commands.push(InspectorCommand::RenameSurfaceGroup);
+    commands.push(InspectorCommand::AddSurfaceGroupFaces);
+    commands.push(InspectorCommand::RemoveSurfaceGroupFaces);
+    commands.push(InspectorCommand::SelectSurfaceGroup);
+    commands.push(InspectorCommand::DeleteSurfaceGroup);
+    InspectorSection {
+        title: "Surface".into(),
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        fields,
+        commands,
+        feature_edits: Vec::new(),
+    }
+}
+
+fn group_membership_label(record: &jarvig_core::BlockRecord, faces: &[u32]) -> String {
+    if faces.is_empty() {
+        return "None".into();
+    }
+    match record.surface_group_cover(faces) {
+        jarvig_core::SurfaceGroupCover::None => "None".into(),
+        jarvig_core::SurfaceGroupCover::Mixed => "Mixed".into(),
+        jarvig_core::SurfaceGroupCover::Covered(id) => {
+            let Some(group) = record.surface_group(id) else { return "None".into() };
+            if group.members.iter().any(|member| member.face.is_none()) {
+                format!("{} (unresolved)", group.name)
+            } else {
+                group.name.clone()
+            }
+        }
+    }
+}
+
+fn group_name_display(record: &jarvig_core::BlockRecord, faces: &[u32]) -> String {
+    match record.surface_group_cover(faces) {
+        jarvig_core::SurfaceGroupCover::Covered(id) => record.surface_group(id).map(|group| group.name.clone()).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn group_pick(record: &jarvig_core::BlockRecord, faces: &[u32]) -> (String, Vec<String>) {
+    let mut choices: Vec<String> = record.surface_groups.iter().map(|group| group.name.clone()).collect();
+    if choices.is_empty() {
+        return ("None".into(), vec!["None".into()]);
+    }
+    if let jarvig_core::SurfaceGroupCover::Covered(id) = record.surface_group_cover(faces) {
+        if let Some(group) = record.surface_group(id) {
+            return (group.name.clone(), choices);
+        }
+    }
+    if choices.len() == 1 {
+        let name = choices[0].clone();
+        return (name, choices);
+    }
+    choices.insert(0, "None".into());
+    ("None".into(), choices)
+}
+
+fn surface_name(field: FieldId, label: &str, display: &str) -> InspectorField {
+    let mut field = solid_note(field, label, display.into());
+    field.kind = ValueKind::String;
+    field.widget = WidgetKind::Text;
+    field.editable = true;
+    field
+}
+
+fn surface_choice(field: FieldId, label: &str, selected: &str, choices: Vec<String>) -> InspectorField {
+    InspectorField {
+        type_id: TYPE_PARAMETRIC_BLOCK,
+        field,
+        label: label.into(),
+        units: String::new(),
+        display: selected.into(),
+        components: Vec::new(),
+        editable: true,
+        kind: ValueKind::String,
+        widget: WidgetKind::Choice,
+        minimum: None,
+        maximum: None,
+        precision: 0,
+        step: 0.0,
+        choices,
+        asset_type: String::new(),
+    }
+}
+
+fn factor_field(field: FieldId, label: &str, value: f32) -> InspectorField {
+    let mut field = solid_note(field, label, format_fixed(f64::from(value), 3));
+    field.kind = ValueKind::Float64;
+    field.widget = WidgetKind::Number;
+    field.editable = true;
+    field.minimum = Some(0.0);
+    field.maximum = Some(1.0);
+    field.precision = 3;
+    field.step = 0.01;
+    field
+}
+
+/// Counts and measures for the inspector. An authored seed replays once here.
+/// Hover and the frame cache do not.
+fn presented_body(record: &jarvig_core::BlockRecord) -> Option<jarvig_core::SolidBody> {
+    if record.has_authored_seed() && record.body.is_none() {
+        if let jarvig_core::IntentAuthorityCandidate::Reconstructable(body) = jarvig_core::intent_authority_candidate(record) {
+            return Some(body);
+        }
+    }
+    record.display_body()
+}
+
 fn element_fields(record: &jarvig_core::BlockRecord, element: SolidElement) -> Vec<InspectorField> {
-    let body = record.display_body();
+    let body = presented_body(record);
     match element {
         SolidElement::Object => Vec::new(),
         SolidElement::Face(face) => {
@@ -487,7 +775,7 @@ fn element_fields(record: &jarvig_core::BlockRecord, element: SolidElement) -> V
         }
         SolidElement::BodyFace(0) => vec![solid_note(SOLID_UI_FACE, "Face", "None".into())],
         SolidElement::BodyFace(face) => {
-            let mut fields = vec![solid_note(SOLID_UI_FACE, "Face", format!("F:{face}"))];
+            let mut fields = vec![solid_note(SOLID_UI_FACE, "Face", face_identity_label(record, face))];
             if let Some(body) = &body {
                 if let Some(area) = body.face_area(face) {
                     fields.push(solid_note(SOLID_UI_AREA, "Area", format!("{area:.3} m²")));
@@ -500,19 +788,19 @@ fn element_fields(record: &jarvig_core::BlockRecord, element: SolidElement) -> V
         }
         SolidElement::Edge(0) => vec![solid_note(SOLID_UI_FACE, "Edge", "None".into())],
         SolidElement::Edge(edge) => {
-            let mut fields = vec![solid_note(SOLID_UI_FACE, "Edge", format!("E:{edge}"))];
+            let mut fields = vec![solid_note(SOLID_UI_FACE, "Edge", edge_identity_label(record, edge))];
             if let Some(length) = body.as_ref().and_then(|body| body.edge_length(edge)) {
                 fields.push(solid_note(SOLID_UI_LENGTH, "Length", format!("{length:.3} m")));
             }
             fields
         }
         SolidElement::Vertex(0) => vec![solid_note(SOLID_UI_FACE, "Vertex", "None".into())],
-        SolidElement::Vertex(vertex) => vec![solid_note(SOLID_UI_FACE, "Vertex", format!("V:{vertex}"))],
+        SolidElement::Vertex(vertex) => vec![solid_note(SOLID_UI_FACE, "Vertex", vertex_identity_label(record, vertex))],
     }
 }
 
 fn geometry_fields(record: &jarvig_core::BlockRecord) -> Vec<InspectorField> {
-    let (faces, edges, vertices) = if let Some(body) = record.display_body() {
+    let (faces, edges, vertices) = if let Some(body) = presented_body(record) {
         (body.faces.len().to_string(), body.edges.len().to_string(), body.vertices.len().to_string())
     } else {
         ("—".into(), "—".into(), "—".into())
@@ -545,6 +833,45 @@ fn history_fields(record: &jarvig_core::BlockRecord) -> Vec<InspectorField> {
         fields.push(solid_note(FieldId(260 + number as u32), &format!("{number:02}"), op.summary()));
     }
     fields
+}
+
+/// The inspector name of one face. An authored seed uses the replayed token.
+/// A stored body keeps the concrete id. A triangle index is not a name.
+pub(crate) fn face_identity_label(record: &jarvig_core::BlockRecord, face: u32) -> String {
+    if record.has_authored_seed() && record.body.is_none() {
+        if let Some(name) = jarvig_core::preferred_face_token(&jarvig_core::semantic_face_names(record, face)) {
+            return name;
+        }
+    }
+    format!("F:{face}")
+}
+
+/// The inspector name of one edge. An authored seed uses the persistent token.
+/// A stored body keeps the concrete id.
+pub(crate) fn edge_identity_label(record: &jarvig_core::BlockRecord, edge: u32) -> String {
+    if record.has_authored_seed() && record.body.is_none() {
+        if let Some(name) = jarvig_core::semantic_edge_names(record, edge).into_iter().find(|name| name.starts_with("E:fillet-")) {
+            return name;
+        }
+        if let jarvig_core::IntentAuthorityCandidate::Reconstructable(body) = jarvig_core::intent_authority_candidate(record) {
+            if let Ok(bindings) = jarvig_core::semantic_edge_bindings(record) {
+                if let Ok(token) = jarvig_core::persistent_edge_token(&body, &bindings, edge) {
+                    return token;
+                }
+            }
+        }
+    }
+    format!("E:{edge}")
+}
+
+/// The inspector name of one vertex. An authored seed uses the replayed token.
+pub(crate) fn vertex_identity_label(record: &jarvig_core::BlockRecord, vertex: u32) -> String {
+    if record.has_authored_seed() && record.body.is_none() {
+        if let Some(name) = jarvig_core::semantic_vertex_names(record, vertex).into_iter().next() {
+            return name;
+        }
+    }
+    format!("V:{vertex}")
 }
 
 fn analytic_face_area(size: [f64; 3], face: u8) -> f64 {
@@ -582,6 +909,7 @@ fn order_solid_sections(sections: &mut Vec<InspectorSection>) {
         "History" => 7,
         "Collision" => 8,
         "Material" => 9,
+        "Surface" => 10,
         "Advanced" => 30,
         "Components" => 31,
         _ => 20,
@@ -600,6 +928,18 @@ pub struct ModelingView {
     /// False for Move Edge, Extrude Edge, and Move Vertex. Those drags have no single distance.
     pub show_amount: bool,
     pub element_label: &'static str,
+    /// Round shows Circular. Other tools leave this empty.
+    pub profile: Option<&'static str>,
+    /// Round shows the observation note. Other tools leave this empty.
+    pub resolution: Option<&'static str>,
+    /// Round shows the radii the edge can close. Other tools leave this empty.
+    pub range: Option<String>,
+    /// How many persistent semantic edges the picked topology resolved to.
+    pub resolved: Option<String>,
+    /// Valid, Clamped, or Conflict.
+    pub readiness: Option<String>,
+    /// Why several picked edges became one semantic edge, or why Apply will refuse.
+    pub note: Option<String>,
 }
 
 /// Hides the tool shelf and opens the Active Tool card. Mode chips and history stay.
@@ -610,6 +950,7 @@ pub fn attach_modeling_session(model: &mut InspectorModel, view: &ModelingView) 
         section.feature_edits.retain(|(command, _, _)| mode_chip(*command) || feature_reopen(*command));
         section.fields.retain(|field| !matches!(field.field, SOLID_UI_FACE | SOLID_UI_AREA | SOLID_UI_NORMAL | SOLID_UI_LENGTH));
     }
+    sections.retain(|section| section.title != "Surface");
     sections.retain(|section| section.title != "Model" || !section.fields.is_empty() || !section.commands.is_empty());
     let mut fields = vec![
         solid_note(SOLID_UI_TOOL, "Tool", view.title.into()),
@@ -618,12 +959,35 @@ pub fn attach_modeling_session(model: &mut InspectorModel, view: &ModelingView) 
     if view.show_amount {
         fields.push(solid_amount(view));
     }
+    if let Some(profile) = view.profile {
+        fields.push(solid_note(SOLID_UI_PROFILE, "Profile", profile.into()));
+    }
+    if let Some(resolution) = view.resolution {
+        fields.push(solid_note(SOLID_UI_RESOLUTION, "Render Resolution", resolution.into()));
+    }
+    if let Some(range) = &view.range {
+        fields.push(solid_note(SOLID_UI_RANGE, "Valid Range", range.clone()));
+    }
+    if let Some(resolved) = &view.resolved {
+        fields.push(solid_note(SOLID_UI_RESOLVED, "Resolved semantic edges", resolved.clone()));
+    }
+    if let Some(readiness) = &view.readiness {
+        fields.push(solid_note(SOLID_UI_STATUS, "Status", readiness.clone()));
+    }
+    if let Some(note) = &view.note {
+        fields.push(solid_note(SOLID_UI_ROUND_NOTE, "Note", note.clone()));
+    }
+    let commands = if view.title == "Round" {
+        vec![InspectorCommand::CancelModeling, InspectorCommand::ApplyRound]
+    } else {
+        vec![InspectorCommand::CancelModeling, InspectorCommand::ApplyModeling]
+    };
     sections.retain(|section| section.title != "Active Tool");
     sections.push(InspectorSection {
         title: "Active Tool".into(),
         type_id: TYPE_PARAMETRIC_BLOCK,
         fields,
-        commands: vec![InspectorCommand::CancelModeling, InspectorCommand::ApplyModeling],
+        commands,
         feature_edits: Vec::new(),
     });
     order_solid_sections(sections);
@@ -635,6 +999,7 @@ fn modeling_start(command: InspectorCommand) -> bool {
         InspectorCommand::ExtrudeFace
             | InspectorCommand::InsetFace
             | InspectorCommand::Bevel
+            | InspectorCommand::Round
             | InspectorCommand::ResetShape
             | InspectorCommand::MoveEdge
             | InspectorCommand::ExtrudeEdge
@@ -690,6 +1055,14 @@ fn solid_note(field: FieldId, label: &str, display: String) -> InspectorField {
         step: 0.0,
         choices: Vec::new(),
         asset_type: String::new(),
+    }
+}
+
+/// Drops the single-element area, normal, and length when several elements are selected.
+pub fn hide_single_element_measures(model: &mut InspectorModel) {
+    let InspectorBody::Entity { sections } = &mut model.body else { return };
+    for section in sections.iter_mut() {
+        section.fields.retain(|field| !matches!(field.field, SOLID_UI_AREA | SOLID_UI_NORMAL | SOLID_UI_LENGTH));
     }
 }
 
@@ -1032,6 +1405,11 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
                         continue;
                     }
                 }
+                if section.title == "Surface" {
+                    y = push_surface(&mut items, section, y, options);
+                    y += 8;
+                    continue;
+                }
                 for field in &section.fields {
                     if field.field == FIELD_CAPTURE_STATE {
                         continue;
@@ -1052,10 +1430,129 @@ pub fn plan(model: &InspectorModel, options: &PlanOptions) -> Vec<PlannedControl
     items
 }
 
+fn surface_factor(field: FieldId) -> bool {
+    matches!(field, SOLID_UI_COLOR_R | SOLID_UI_COLOR_G | SOLID_UI_COLOR_B | SOLID_UI_ROUGHNESS | SOLID_UI_METALLIC)
+}
+
+fn surface_group_field(field: FieldId) -> bool {
+    matches!(field, SOLID_UI_GROUP_MEMBERSHIP | SOLID_UI_GROUP_NAME | SOLID_UI_GROUP_PICK)
+}
+
+fn surface_group_command(command: InspectorCommand) -> bool {
+    matches!(
+        command,
+        InspectorCommand::CreateSurfaceGroup
+            | InspectorCommand::RenameSurfaceGroup
+            | InspectorCommand::AddSurfaceGroupFaces
+            | InspectorCommand::RemoveSurfaceGroupFaces
+            | InspectorCommand::SelectSurfaceGroup
+            | InspectorCommand::DeleteSurfaceGroup
+    )
+}
+
+fn push_surface(items: &mut Vec<PlannedControl>, section: &InspectorSection, mut y: i32, options: &PlanOptions) -> i32 {
+    for field in &section.fields {
+        if surface_factor(field.field) || field.field == SOLID_UI_SURFACE_ASSIGN || surface_group_field(field.field) {
+            continue;
+        }
+        if field.field == SOLID_UI_SURFACE_NOTE {
+            let mut line = control(ControlClass::Label, InspectorBinding::Label, field.display.clone(), 12, y);
+            line.height = 48;
+            items.push(line);
+            y += 52;
+            continue;
+        }
+        y = push_field(items, field, y, options);
+    }
+    if options.show_commands {
+        for command in &section.commands {
+            if *command != InspectorCommand::MakeUnique {
+                continue;
+            }
+            let mut button = control(
+                ControlClass::Button,
+                InspectorBinding::Command { command: *command, type_id: section.type_id },
+                command_label(*command).into(),
+                12,
+                y,
+            );
+            button.face = ControlFace::Row;
+            button.height = 28;
+            items.push(button);
+            y += 32;
+        }
+    }
+    if let Some(field) = section.fields.iter().find(|field| field.field == SOLID_UI_SURFACE_ASSIGN) {
+        y = push_field(items, field, y, options);
+    }
+    for field in &section.fields {
+        if surface_factor(field.field) {
+            y = push_field(items, field, y, options);
+        }
+    }
+    if options.show_commands {
+        for command in &section.commands {
+            if *command == InspectorCommand::MakeUnique || surface_group_command(*command) {
+                continue;
+            }
+            let mut button = control(
+                ControlClass::Button,
+                InspectorBinding::Command { command: *command, type_id: section.type_id },
+                command_label(*command).into(),
+                12,
+                y,
+            );
+            button.face = ControlFace::Row;
+            button.height = 24;
+            items.push(button);
+            y += 28;
+        }
+    }
+    for field in &section.fields {
+        if surface_group_field(field.field) {
+            y = push_field(items, field, y, options);
+        }
+    }
+    if options.show_commands {
+        for command in &section.commands {
+            if !surface_group_command(*command) {
+                continue;
+            }
+            let mut button = control(
+                ControlClass::Button,
+                InspectorBinding::Command { command: *command, type_id: section.type_id },
+                command_label(*command).into(),
+                12,
+                y,
+            );
+            button.face = ControlFace::Row;
+            button.height = 24;
+            items.push(button);
+            y += 28;
+        }
+    }
+    y
+}
+
 fn push_shelf(items: &mut Vec<PlannedControl>, section: &InspectorSection, y: &mut i32) {
+    if section.title == "Select" {
+        let chips = section
+            .feature_edits
+            .iter()
+            .map(|(command, label, active)| (InspectorBinding::Command { command: *command, type_id: section.type_id }, label.clone(), *active))
+            .collect::<Vec<_>>();
+        let tools = section
+            .commands
+            .iter()
+            .filter(|command| !command_in_header(**command))
+            .map(|command| (InspectorBinding::Command { command: *command, type_id: section.type_id }, command_label(*command).to_string(), false))
+            .collect::<Vec<_>>();
+        push_chip_grid(items, y, &chips, ControlFace::Chip, 5, 28);
+        push_chip_grid(items, y, &tools, ControlFace::Chip, 3, 28);
+        return;
+    }
     let (face, columns, height) = match section.title.as_str() {
-        "Select" => (ControlFace::Chip, 5u8, 28i32),
-        "Model" => (ControlFace::Tile, 2, 56),
+        "Model" => (ControlFace::Tile, 2u8, 56i32),
         "Active Tool" => (ControlFace::Chip, 2, 28),
         _ => (ControlFace::Row, 0, 24),
     };
@@ -1101,6 +1598,28 @@ fn push_shelf(items: &mut Vec<PlannedControl>, section: &InspectorSection, y: &m
     }
 }
 
+fn push_chip_grid(items: &mut Vec<PlannedControl>, y: &mut i32, slots: &[(InspectorBinding, String, bool)], face: ControlFace, columns: u8, height: i32) {
+    if slots.is_empty() || columns == 0 {
+        return;
+    }
+    let width = columns as usize;
+    let count = slots.len();
+    for (index, (binding, text, active)) in slots.iter().enumerate() {
+        let column = (index % width) as u8;
+        let mut button = control(ControlClass::Button, binding.clone(), text.clone(), 8, *y);
+        button.stretch = false;
+        button.face = face;
+        button.row_columns = columns;
+        button.row_index = column;
+        button.height = height;
+        button.checked = *active;
+        items.push(button);
+        if column + 1 == columns || index + 1 == count {
+            *y += height + 4;
+        }
+    }
+}
+
 fn command_in_header(command: InspectorCommand) -> bool {
     matches!(
         command,
@@ -1121,8 +1640,10 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::ExtrudeFace => "Extrude",
         InspectorCommand::InsetFace => "Inset",
         InspectorCommand::Bevel => "Bevel",
+        InspectorCommand::Round => "Round",
         InspectorCommand::CancelModeling => "Cancel",
         InspectorCommand::ApplyModeling => "Done",
+        InspectorCommand::ApplyRound => "Apply",
         InspectorCommand::MirrorX => "Mirror X",
         InspectorCommand::MirrorY => "Mirror Y",
         InspectorCommand::MirrorZ => "Mirror Z",
@@ -1136,12 +1657,27 @@ pub fn command_label(command: InspectorCommand) -> &'static str {
         InspectorCommand::SelectionFace => "Face",
         InspectorCommand::SelectionEdge => "Edge",
         InspectorCommand::SelectionVertex => "Vertex",
+        InspectorCommand::SelectLoop => "Loop",
+        InspectorCommand::SelectRing => "Ring",
+        InspectorCommand::SelectConnected => "Connected",
+        InspectorCommand::SelectBoundary => "Boundary",
+        InspectorCommand::SelectGrow => "Grow",
+        InspectorCommand::SelectShrink => "Shrink",
         InspectorCommand::MoveEdge => "Move Edge",
         InspectorCommand::ExtrudeEdge => "Extrude Edge",
         InspectorCommand::SplitEdge => "Split Edge",
         InspectorCommand::MoveVertex => "Move",
         InspectorCommand::SubdivideFace => "Subdivide",
         InspectorCommand::SubdivideFace4 => "4×4",
+        InspectorCommand::AddMaterialSlot => "New Slot",
+        InspectorCommand::MakeUnique => "Make Unique",
+        InspectorCommand::SelectSlotFaces => "Select Faces Using Material",
+        InspectorCommand::CreateSurfaceGroup => "Create Group",
+        InspectorCommand::RenameSurfaceGroup => "Rename Group",
+        InspectorCommand::AddSurfaceGroupFaces => "Add To Group",
+        InspectorCommand::RemoveSurfaceGroupFaces => "Remove From Group",
+        InspectorCommand::SelectSurfaceGroup => "Select Group",
+        InspectorCommand::DeleteSurfaceGroup => "Delete Group",
     }
 }
 
@@ -1171,6 +1707,56 @@ pub const SOLID_UI_CLOSED: FieldId = FieldId(257);
 pub const SOLID_UI_GRID: FieldId = FieldId(258);
 /// Name of the open modeling operation. Not a registry field.
 pub const SOLID_UI_TOOL: FieldId = FieldId(259);
+/// Red channel of the surface base color, 0 to 1. Not a registry field.
+pub const SOLID_UI_COLOR_R: FieldId = FieldId(270);
+/// Green channel of the surface base color, 0 to 1. Not a registry field.
+pub const SOLID_UI_COLOR_G: FieldId = FieldId(271);
+/// Blue channel of the surface base color, 0 to 1. Not a registry field.
+pub const SOLID_UI_COLOR_B: FieldId = FieldId(272);
+/// Perceptual roughness of the surface slot, 0 to 1. Not a registry field.
+pub const SOLID_UI_ROUGHNESS: FieldId = FieldId(273);
+/// Metallic factor of the surface slot, 0 to 1. Not a registry field.
+pub const SOLID_UI_METALLIC: FieldId = FieldId(274);
+/// How many faces the Surface card is editing. Not a registry field.
+pub const SOLID_UI_SURFACE_COUNT: FieldId = FieldId(275);
+/// Name of the material those faces share. Not a registry field.
+pub const SOLID_UI_SURFACE_SLOT: FieldId = FieldId(276);
+/// What a color edit will do to the rest of the solid. Not a registry field.
+pub const SOLID_UI_SURFACE_NOTE: FieldId = FieldId(277);
+/// Existing slot chosen for the selected faces. Not a registry field.
+pub const SOLID_UI_SURFACE_ASSIGN: FieldId = FieldId(278);
+/// Group that contains the selected faces. Not a registry field.
+pub const SOLID_UI_GROUP_MEMBERSHIP: FieldId = FieldId(279);
+/// Visible name typed for Create Group or Rename Group. Not a registry field.
+pub const SOLID_UI_GROUP_NAME: FieldId = FieldId(280);
+/// Group chosen when no face is selected. Not a registry field.
+pub const SOLID_UI_GROUP_PICK: FieldId = FieldId(281);
+/// Round profile readout. Not a registry field and not authored.
+pub const SOLID_UI_PROFILE: FieldId = FieldId(282);
+/// Round render-resolution readout. Not a registry field and not authored.
+pub const SOLID_UI_RESOLUTION: FieldId = FieldId(283);
+/// Round radius interval. Not a registry field and not authored.
+pub const SOLID_UI_RANGE: FieldId = FieldId(284);
+/// How many semantic edges the picked topology resolved to. Not a registry field.
+pub const SOLID_UI_RESOLVED: FieldId = FieldId(285);
+/// Valid, Clamped, or Conflict. Not a registry field and not authored.
+pub const SOLID_UI_STATUS: FieldId = FieldId(286);
+/// Fragment collapse or the reason Apply will refuse. Not a registry field.
+pub const SOLID_UI_ROUND_NOTE: FieldId = FieldId(287);
+/// Object mode. Slot 0 is the material every unassigned face uses.
+pub const SURFACE_OBJECT_NOTE: &str = "Every unassigned face uses this material.";
+/// The selection is every face on slot 0, so a color edit is the whole solid.
+pub const SURFACE_WHOLE_NOTE: &str = "Editing Object Material changes every face that uses it.";
+/// The selection shares a slot with faces that are not selected.
+pub const SURFACE_SHARED_NOTE: &str = "Shared with other faces. A color edit makes a material for this selection only.";
+/// The selection is the only set of faces on this slot.
+pub const SURFACE_OWN_NOTE: &str = "Only this selection uses this material.";
+/// The selected faces name more than one slot.
+pub const SURFACE_MIXED_NOTE: &str = "Those faces do not share a material. Make Unique copies Object Material.";
+/// The selection is part of one group, and that group is the only user of its slot.
+pub const SURFACE_GROUP_OWN_NOTE: &str = "Only this group uses this material. A color edit changes the whole group.";
+/// The group's slot is still shared with faces that are not in the group.
+pub const SURFACE_GROUP_SHARED_NOTE: &str = "Shared with other faces. A color edit makes a material for this group only.";
 
 /// Current inset readout for one face. Not submitted through SetProperty.
 pub fn solid_ui_inset(face: u8) -> FieldId {
@@ -2003,6 +2589,14 @@ mod tests {
         assert!(auto.checked);
         assert_eq!(auto.face, ControlFace::Chip);
         assert_eq!(auto.row_columns, 5);
+        for label in ["Loop", "Ring", "Connected", "Boundary", "Grow", "Shrink"] {
+            let chip = planned.iter().find(|control| control.text == label).unwrap_or_else(|| panic!("missing {label}"));
+            assert_eq!(chip.face, ControlFace::Chip);
+            assert_eq!(chip.row_columns, 3);
+            assert!(!chip.checked);
+        }
+        assert_eq!(planned.iter().find(|control| control.text == "Loop").unwrap().row_index, 0);
+        assert_eq!(planned.iter().find(|control| control.text == "Boundary").unwrap().row_index, 0);
         assert!(!planned.iter().any(|control| control.text == "Show Grid"));
         assert!(!planned.iter().any(|control| {
             matches!(control.text.as_str(), "Extrude" | "Inset" | "Union" | "Subtract" | "Sketch" | "Edit Edges" | "Shell" | "Cancel" | "Apply" | "Move Edge" | "Extrude Edge" | "Split Edge" | "Subdivide" | "4×4")
@@ -2026,7 +2620,7 @@ mod tests {
         assert_eq!(edge_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_LENGTH).unwrap().display, "2.000 m");
         assert!(edge_model.section_titles().iter().any(|title| *title == "Model"));
         let edge_plan = plan(&edge_model, &PlanOptions::editing());
-        for label in ["Move Edge", "Extrude Edge", "Split Edge", "Edge"] {
+        for label in ["Move Edge", "Extrude Edge", "Split Edge", "Bevel", "Round", "Edge"] {
             assert!(edge_plan.iter().any(|control| control.text == label), "missing {label}");
         }
         assert!(!edge_plan.iter().any(|control| matches!(control.text.as_str(), "Extrude" | "Inset" | "Reset Shape" | "Subdivide" | "4×4")));
@@ -2056,6 +2650,12 @@ mod tests {
                 maximum: 0.9,
                 show_amount: true,
                 element_label: "Face",
+                profile: None,
+                resolution: None,
+                range: None,
+                resolved: None,
+                readiness: None,
+                note: None,
             },
         );
         assert!(model.section_titles().iter().any(|title| *title == "Active Tool"));
@@ -2064,10 +2664,41 @@ mod tests {
         assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().display, "0.600");
         assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_AMOUNT).unwrap().editable);
         let session_plan = plan(&model, &PlanOptions::editing());
-        for label in ["Amount", "0.600", "Cancel", "Done", "Duplicate", "Align", "Auto", "Object"] {
+        for label in ["Amount", "0.600", "Cancel", "Done", "Duplicate", "Align", "Auto", "Object", "Loop", "Ring", "Shrink"] {
             assert!(session_plan.iter().any(|control| control.text == label), "missing {label}");
         }
         assert!(!session_plan.iter().any(|control| control.text == "Apply"));
+        let mut round_model = build(&selection, &world);
+        attach_modeling_session(
+            &mut round_model,
+            &ModelingView {
+                title: "Round",
+                face: "1 Edge".into(),
+                amount_label: "Radius",
+                amount: 0.05,
+                minimum: 0.001,
+                maximum: 0.9,
+                show_amount: true,
+                element_label: "Selection",
+                profile: Some("Circular"),
+                resolution: Some("Automatic / Observation"),
+                range: Some("0.001 – 1.250 m".into()),
+                resolved: Some("2".into()),
+                readiness: Some("Valid".into()),
+                note: Some("3 picked edges resolve to 2 semantic edges.".into()),
+            },
+        );
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_TOOL).unwrap().display, "Round");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_FACE).unwrap().display, "1 Edge");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_RESOLVED).unwrap().display, "2");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_STATUS).unwrap().display, "Valid");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_ROUND_NOTE).unwrap().display, "3 picked edges resolve to 2 semantic edges.");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_PROFILE).unwrap().display, "Circular");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_RESOLUTION).unwrap().display, "Automatic / Observation");
+        assert_eq!(round_model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_RANGE).unwrap().display, "0.001 – 1.250 m");
+        let round_plan = plan(&round_model, &PlanOptions::editing());
+        assert!(round_plan.iter().any(|control| control.text == "Apply"));
+        assert!(!round_plan.iter().any(|control| control.text == "Done"));
         assert!(!session_plan.iter().any(|control| {
             matches!(control.text.as_str(), "Reset Shape" | "Extrude" | "Inset" | "Bevel" | "Move Edge" | "Subdivide" | "4×4")
                 && matches!(control.binding, InspectorBinding::Command { .. })
@@ -2083,5 +2714,105 @@ mod tests {
         let grid = plan(&stored, &PlanOptions::editing());
         assert!(grid.iter().any(|control| control.text == "Show Grid" && matches!(control.binding, InspectorBinding::ShowGrid)));
         assert!(grid.iter().any(|control| control.text.contains("Subdivide")));
+    }
+
+    #[test]
+    fn face_material_card_names_the_object_material_and_offers_make_unique() {
+        let mut world = SceneWorld::bootstrap();
+        let block = world.create_block(jarvig_core::Vec3::new(0.0, 1.0, -4.0), jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let mut selection = SelectionService::default();
+        selection.replace(SelectionItem::entity(block).unwrap()).unwrap();
+        let object = build(&selection, &world);
+        assert_eq!(object.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_SLOT).unwrap().display, "Object Material (Slot 0)");
+        assert_eq!(object.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_OBJECT_NOTE);
+        assert!(object.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_COUNT).is_none());
+        assert!(object.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_ASSIGN).is_none());
+        let object_plan = plan(&object, &PlanOptions::editing());
+        assert!(object_plan.iter().any(|control| control.text == "New Slot"));
+        assert!(object_plan.iter().any(|control| control.text == "Select Faces Using Material"));
+        assert!(!object_plan.iter().any(|control| control.text == "Make Unique"));
+
+        let record = world.authored_block(block).unwrap();
+        let mut model = build(&selection, &world);
+        set_surface_material(&mut model, &record, &[2]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_COUNT).unwrap().display, "1 Face");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_SLOT).unwrap().display, "Object Material (Slot 0)");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_SHARED_NOTE);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_ASSIGN).unwrap().display, "Object Material");
+        assert!(!selection_owns_material(&record, &[2], 0));
+        let face_plan = plan(&model, &PlanOptions::editing());
+        let unique = face_plan.iter().position(|control| matches!(control.binding, InspectorBinding::Command { command: InspectorCommand::MakeUnique, .. })).unwrap();
+        let assign = face_plan.iter().position(|control| matches!(control.binding, InspectorBinding::Choice { field: SOLID_UI_SURFACE_ASSIGN, .. })).unwrap();
+        let color = face_plan.iter().position(|control| matches!(control.binding, InspectorBinding::Text { field: SOLID_UI_COLOR_R, .. })).unwrap();
+        let select = face_plan.iter().position(|control| matches!(control.binding, InspectorBinding::Command { command: InspectorCommand::SelectSlotFaces, .. })).unwrap();
+        assert!(unique < assign && assign < color && color < select);
+        assert!(!face_plan.iter().any(|control| control.text == "New Slot"));
+
+        set_surface_material(&mut model, &record, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_COUNT).unwrap().display, "6 Faces");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_WHOLE_NOTE);
+        assert!(selection_owns_material(&record, &[1, 2, 3, 4, 5, 6], 0));
+
+        let mut painted = record.clone();
+        painted.add_material_slot().unwrap();
+        assert!(painted.set_material_factors(1, [1.0, 0.0, 0.0], 0.25, 0.8).unwrap());
+        assert!(painted.assign_faces(&[1, 3, 5], 1, |_| Vec::new()).unwrap());
+        set_surface_material(&mut model, &painted, &[1, 3, 5]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_COUNT).unwrap().display, "3 Faces");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_SLOT).unwrap().display, "Face Material 1 (Slot 1)");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_OWN_NOTE);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_COLOR_R).unwrap().display, "1.000");
+        assert!(selection_owns_material(&painted, &[1, 3, 5], 1));
+        set_surface_material(&mut model, &painted, &[1]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_SHARED_NOTE);
+        assert!(!selection_owns_material(&painted, &[1], 1));
+        set_surface_material(&mut model, &painted, &[1, 2]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_SLOT).unwrap().display, "Mixed");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_NOTE).unwrap().display, SURFACE_MIXED_NOTE);
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_COLOR_R).is_none());
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_SURFACE_ASSIGN).unwrap().choices[0], "Mixed");
+        assert!(plan(&model, &PlanOptions::editing()).iter().any(|control| control.text == "Make Unique"));
+        assert!(!plan(&model, &PlanOptions::editing()).iter().any(|control| control.text == "Select Faces Using Material" || control.text == "New Slot"));
+    }
+
+    #[test]
+    fn surface_group_card_names_upper_rim_after_the_material_controls() {
+        let mut world = SceneWorld::bootstrap();
+        let block = world.create_block(jarvig_core::Vec3::new(0.0, 1.0, -4.0), jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap()).unwrap();
+        let mut selection = SelectionService::default();
+        selection.replace(SelectionItem::entity(block).unwrap()).unwrap();
+        let plain = build(&selection, &world);
+        assert_eq!(plain.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_MEMBERSHIP).unwrap().display, "None");
+        assert_eq!(plain.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_PICK).unwrap().display, "None");
+        assert!(plain.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_NAME).unwrap().display.is_empty());
+
+        let record = world.authored_block(block).unwrap();
+        let mut model = build(&selection, &world);
+        set_surface_material(&mut model, &record, &[3, 5]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_MEMBERSHIP).unwrap().display, "None");
+        let before = plan(&model, &PlanOptions::editing());
+        let select = before.iter().position(|control| matches!(control.binding, InspectorBinding::Command { command: InspectorCommand::SelectSlotFaces, .. })).unwrap();
+        let create = before.iter().position(|control| matches!(control.binding, InspectorBinding::Command { command: InspectorCommand::CreateSurfaceGroup, .. })).unwrap();
+        assert!(select < create);
+        for label in ["Create Group", "Rename Group", "Add To Group", "Remove From Group", "Select Group", "Delete Group"] {
+            assert!(before.iter().any(|control| control.text == label), "missing {label}");
+        }
+
+        assert_eq!(world.create_block_surface_group(block, "Upper Rim", &[3, 5]).unwrap(), jarvig_core::AuthoringResult::Applied);
+        let grouped = world.authored_block(block).unwrap();
+        set_surface_material(&mut model, &grouped, &[3, 5]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_MEMBERSHIP).unwrap().display, "Upper Rim");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_NAME).unwrap().display, "Upper Rim");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_PICK).unwrap().display, "Upper Rim");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_PICK).unwrap().choices, vec!["Upper Rim".to_string()]);
+        set_surface_material(&mut model, &grouped, &[]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_MEMBERSHIP).unwrap().display, "None");
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_PICK).unwrap().display, "Upper Rim");
+        assert!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_NAME).unwrap().display.is_empty());
+
+        let mut unresolved = grouped.clone();
+        unresolved.surface_groups[0].members.push(jarvig_core::SurfaceMember { face: None, provenance: vec!["F:seed/1".into()] });
+        set_surface_material(&mut model, &unresolved, &[3]);
+        assert_eq!(model.field(TYPE_PARAMETRIC_BLOCK, SOLID_UI_GROUP_MEMBERSHIP).unwrap().display, "Upper Rim (unresolved)");
     }
 }

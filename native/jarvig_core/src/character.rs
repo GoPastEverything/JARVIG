@@ -134,6 +134,7 @@ impl CharacterDocument {
                 startup_camera: None,
             },
             entities,
+            organization: crate::SceneOrganization::default(),
         };
         document.validate()?;
         Ok(document)

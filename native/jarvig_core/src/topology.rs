@@ -75,6 +75,20 @@ pub struct TopologyEdit {
     pub size_m: [f64; 3],
 }
 
+/// A bevel that stayed closed. `width_m` is the inset that fit, which can be less than the request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BevelCut {
+    pub edit: TopologyEdit,
+    /// Perpendicular inset into each side face, in meters.
+    pub width_m: f64,
+    /// Edges the cut followed, including a straight run past the edges that were named.
+    pub edges: Vec<u32>,
+    /// The cut continued along a collinear run that was not entirely selected.
+    pub expanded: bool,
+    /// The requested inset did not fit, so the solid stopped at `width_m`.
+    pub clamped: bool,
+}
+
 /// Why a candidate was not stored.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TopologyError {
@@ -96,6 +110,94 @@ impl std::fmt::Display for TopologyError {
             Self::Degenerate => "that edit would collapse the solid",
             Self::Torn => "that edit would rip the solid",
         })
+    }
+}
+
+/// Face, edge, or vertex. This is the concrete element a birth names, not a semantic path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ElementKind {
+    Face,
+    Edge,
+    Vertex,
+}
+
+/// Role of one element at the moment a topology call creates or keeps it.
+///
+/// The source id is concrete on the body that entered the call. A later evaluation
+/// binds the same role again. Nothing in this role is a triangle index or a search hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BirthRole {
+    /// `axis` follows [`SolidBody::from_box`]: 0 +X, 1 −X, 2 +Y, 3 −Y, 4 +Z, 5 −Z.
+    SeedFace { axis: u8 },
+    /// Constructor edge `9 + slot`, slots `0..12`, in the order `from_box` writes them.
+    SeedEdge { slot: u8 },
+    /// Cell `(u, v)` of the face passed to subdivide. `u` runs along the face's first chain.
+    SubdivCell { u: u32, v: u32 },
+    /// One side of that cell. 0 is min V, 1 is max U, 2 is max V, 3 is min U.
+    SubdivEdge { u: u32, v: u32, side: u8 },
+    /// The selected face, which keeps its id and becomes the cap.
+    ExtrudeCap,
+    /// Wall grown from one directed boundary of `face`. `boundary` is that edge's id before the extrude.
+    ExtrudeSide { face: u32, boundary: u32 },
+    /// Edge of that wall opposite the boundary.
+    ExtrudeOuter { boundary: u32 },
+    /// Lip left where a sweep trimmed the neighbor instead of growing a wall.
+    /// `boundary` is the edge the extruded face crossed.
+    ExtrudeCarve { face: u32, boundary: u32 },
+    /// Leg from one end of that boundary to the swept vertex. `end` 0 is the directed start.
+    ExtrudeLeg { face: u32, boundary: u32, end: u8 },
+    /// Half that kept the split edge's id, beginning at its stored start vertex.
+    SplitKept,
+    /// The other half. Its id is the edge this call allocated.
+    SplitNew,
+    /// Midpoint vertex this call allocated.
+    SplitMidpoint,
+    /// Strip face of the rail that contains `source`.
+    BevelFace { source: u32 },
+    /// New edge on that strip. `slot` is its index in the strip loop that was stored.
+    BevelEdge { source: u32, slot: u32 },
+    /// Wall added by extrude-edge. The side splits that close it are not separate births.
+    ExtrudeEdgeWall,
+    /// New edge of that wall, opposite the edge that was extruded.
+    ExtrudeEdgeOuter,
+}
+
+/// One element a topology call emitted. Concrete id and role are both recorded at the alloc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementBirth {
+    pub kind: ElementKind,
+    pub id: u32,
+    pub role: BirthRole,
+    /// Concrete element this birth descended from, on the body before the call.
+    pub source: Option<u32>,
+}
+
+/// Births from one call. Empty for a reshape that mints nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopologyLineage {
+    pub births: Vec<ElementBirth>,
+}
+
+impl TopologyLineage {
+    /// Faces `1..=6` and edges `9..=20`. This is the `from_box` constructor contract.
+    pub(crate) fn seed_box() -> Self {
+        let mut births = Vec::with_capacity(18);
+        for axis in 0..6u8 {
+            births.push(ElementBirth { kind: ElementKind::Face, id: u32::from(axis) + 1, role: BirthRole::SeedFace { axis }, source: None });
+        }
+        for slot in 0..12u8 {
+            births.push(ElementBirth { kind: ElementKind::Edge, id: u32::from(slot) + 9, role: BirthRole::SeedEdge { slot }, source: None });
+        }
+        Self { births }
+    }
+
+    fn retain_live(mut self, body: &SolidBody) -> Self {
+        self.births.retain(|birth| match birth.kind {
+            ElementKind::Face => body.faces.iter().any(|face| face.id == birth.id),
+            ElementKind::Edge => body.edges.iter().any(|edge| edge.id == birth.id),
+            ElementKind::Vertex => body.vertices.iter().any(|vertex| vertex.id == birth.id),
+        });
+        self
     }
 }
 
@@ -431,6 +533,10 @@ impl SolidBody {
 
     /// New edge plus the wall that joins it. Side edges gain the new vertices so the solid stays closed.
     pub fn extrude_edge(&self, edge: u32, delta: [f64; 3]) -> Result<TopologyEdit, TopologyError> {
+        self.extrude_edge_traced(edge, delta).map(|(edit, _)| edit)
+    }
+
+    pub fn extrude_edge_traced(&self, edge: u32, delta: [f64; 3]) -> Result<(TopologyEdit, TopologyLineage), TopologyError> {
         if !usable_delta(delta) {
             return Err(TopologyError::Degenerate);
         }
@@ -490,18 +596,503 @@ impl SolidBody {
         }
         let wall_id = body.alloc()?;
         body.faces.push(SolidFace { id: wall_id, vertices: wall });
-        body.finish()
+        let outer = body.edge_between(p_id, q_id).ok_or(TopologyError::Torn)?;
+        let mut lineage = TopologyLineage::default();
+        lineage.births.push(ElementBirth { kind: ElementKind::Face, id: wall_id, role: BirthRole::ExtrudeEdgeWall, source: Some(edge) });
+        lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: outer, role: BirthRole::ExtrudeEdgeOuter, source: Some(edge) });
+        let edit = body.finish()?;
+        let lineage = lineage.retain_live(&edit.body);
+        Ok((edit, lineage))
+    }
+
+    /// Replaces each named edge with a strip. A straight run is one strip. Edges that meet share the corner.
+    ///
+    /// `distance_m` is the inset across each side face. A distance the surrounding faces cannot hold
+    /// stops at the largest inset that still closes. An error leaves this body unchanged.
+    pub fn bevel_edges(&self, edges: &[u32], distance_m: f64) -> Result<BevelCut, TopologyError> {
+        self.bevel_edges_traced(edges, distance_m).map(|(cut, _)| cut)
+    }
+
+    pub fn bevel_edges_traced(&self, edges: &[u32], distance_m: f64) -> Result<(BevelCut, TopologyLineage), TopologyError> {
+        if edges.is_empty() || !distance_m.is_finite() || distance_m <= MIN_DELTA_M {
+            return Err(TopologyError::Degenerate);
+        }
+        let (rails, used, expanded) = self.bevel_rails(edges)?;
+        if let Ok(cut) = self.bevel_at(&rails, &used, expanded, distance_m, false) {
+            return Ok(cut);
+        }
+        let probe = MIN_EDGE_M * 2.0;
+        if distance_m <= probe || self.bevel_at(&rails, &used, expanded, probe, true).is_err() {
+            return Err(TopologyError::Degenerate);
+        }
+        let mut low = probe;
+        let mut high = distance_m;
+        let mut best: Option<(BevelCut, TopologyLineage)> = None;
+        for _ in 0..24 {
+            let mid = (low + high) * 0.5;
+            match self.bevel_at(&rails, &used, expanded, mid, true) {
+                Ok(cut) => {
+                    low = mid;
+                    best = Some(cut);
+                }
+                Err(_) => high = mid,
+            }
+        }
+        best.ok_or(TopologyError::Degenerate)
+    }
+
+    fn bevel_rails(&self, requested: &[u32]) -> Result<(Vec<BevelRail>, Vec<u32>, bool), TopologyError> {
+        let mut wanted = Vec::new();
+        for id in requested {
+            if *id == 0 || self.edge_ids(*id).is_none() {
+                return Err(TopologyError::Missing);
+            }
+            if !wanted.contains(id) {
+                wanted.push(*id);
+            }
+        }
+        let mut consumed = Vec::new();
+        let mut rails = Vec::new();
+        for id in &wanted {
+            if consumed.contains(id) {
+                continue;
+            }
+            let rail = self.grow_rail(*id, &consumed)?;
+            for edge in &rail.edges {
+                if consumed.contains(edge) {
+                    return Err(TopologyError::Torn);
+                }
+                consumed.push(*edge);
+            }
+            rails.push(rail);
+        }
+        if rails.is_empty() {
+            return Err(TopologyError::Degenerate);
+        }
+        let expanded = consumed.iter().any(|edge| !wanted.contains(edge));
+        Ok((rails, consumed, expanded))
+    }
+
+    fn grow_rail(&self, edge: u32, consumed: &[u32]) -> Result<BevelRail, TopologyError> {
+        let (start, end) = self.edge_ids(edge).ok_or(TopologyError::Missing)?;
+        let faces = self.face_pair(start, end)?;
+        let mut verts = vec![start, end];
+        let mut edges = vec![edge];
+        self.extend_rail(&mut verts, &mut edges, &faces, consumed)?;
+        let origin = self.vertex_position(verts[0]).ok_or(TopologyError::Missing)?;
+        let far = self.vertex_position(*verts.last().ok_or(TopologyError::Torn)?).ok_or(TopologyError::Missing)?;
+        let direction = unit(sub(far, origin)).ok_or(TopologyError::Degenerate)?;
+        let mut normals = [[0.0; 3]; 2];
+        let mut inward = [[0.0; 3]; 2];
+        for slot in 0..2 {
+            normals[slot] = self.unit_normal(faces[slot]).ok_or(TopologyError::Degenerate)?;
+            inward[slot] = self.rail_inward(faces[slot], &edges, direction)?;
+        }
+        if dot(normals[0], normals[1]).abs() > 0.999 {
+            return Err(TopologyError::Degenerate);
+        }
+        Ok(BevelRail {
+            edges,
+            faces,
+            normals,
+            inward,
+            terminals: [verts[0], *verts.last().ok_or(TopologyError::Torn)?],
+            direction,
+            origin,
+        })
+    }
+
+    fn extend_rail(&self, verts: &mut Vec<u32>, edges: &mut Vec<u32>, faces: &[u32; 2], consumed: &[u32]) -> Result<(), TopologyError> {
+        for front in [true, false] {
+            loop {
+                if verts.len() > self.vertices.len() {
+                    return Err(TopologyError::Torn);
+                }
+                let (vertex, previous) = if front { (verts[0], verts[1]) } else { (*verts.last().ok_or(TopologyError::Torn)?, verts[verts.len() - 2]) };
+                let outward = unit(sub(
+                    self.vertex_position(vertex).ok_or(TopologyError::Missing)?,
+                    self.vertex_position(previous).ok_or(TopologyError::Missing)?,
+                ))
+                .ok_or(TopologyError::Degenerate)?;
+                let mut next: Option<(u32, u32)> = None;
+                for edge in &self.edges {
+                    if edges.contains(&edge.id) || consumed.contains(&edge.id) {
+                        continue;
+                    }
+                    let other = if edge.a == vertex {
+                        edge.b
+                    } else if edge.b == vertex {
+                        edge.a
+                    } else {
+                        continue
+                    };
+                    let Ok(pair) = self.face_pair(edge.a, edge.b) else {
+                        continue;
+                    };
+                    if pair != *faces {
+                        continue;
+                    }
+                    let dir = unit(sub(
+                        self.vertex_position(other).ok_or(TopologyError::Missing)?,
+                        self.vertex_position(vertex).ok_or(TopologyError::Missing)?,
+                    ))
+                    .ok_or(TopologyError::Degenerate)?;
+                    if dot(dir, outward) <= 0.999 {
+                        continue;
+                    }
+                    if next.is_some() {
+                        return Err(TopologyError::Torn);
+                    }
+                    next = Some((edge.id, other));
+                }
+                let Some((edge, other)) = next else { break };
+                if front {
+                    verts.insert(0, other);
+                    edges.insert(0, edge);
+                } else {
+                    verts.push(other);
+                    edges.push(edge);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn face_pair(&self, a: u32, b: u32) -> Result<[u32; 2], TopologyError> {
+        let mut faces = Vec::new();
+        for face in &self.faces {
+            let count = face.vertices.len();
+            let uses = (0..count).any(|index| {
+                let start = face.vertices[index];
+                let end = face.vertices[(index + 1) % count];
+                (start == a && end == b) || (start == b && end == a)
+            });
+            if uses {
+                faces.push(face.id);
+            }
+        }
+        if faces.len() != 2 {
+            return Err(TopologyError::Torn);
+        }
+        if faces[0] > faces[1] {
+            faces.swap(0, 1);
+        }
+        Ok([faces[0], faces[1]])
+    }
+
+    fn rail_inward(&self, face: u32, edges: &[u32], direction: [f64; 3]) -> Result<[f64; 3], TopologyError> {
+        let normal = self.unit_normal(face).ok_or(TopologyError::Degenerate)?;
+        let (a, b) = self.edge_ids(edges[0]).ok_or(TopologyError::Missing)?;
+        let loop_ = self.face_loop(face).ok_or(TopologyError::Missing)?;
+        let count = loop_.len();
+        let mut travel = None;
+        for index in 0..count {
+            let start = loop_[index];
+            let end = loop_[(index + 1) % count];
+            if (start == a && end == b) || (start == b && end == a) {
+                travel = Some(sub(self.vertex_position(end).ok_or(TopologyError::Missing)?, self.vertex_position(start).ok_or(TopologyError::Missing)?));
+                break;
+            }
+        }
+        let travel = travel.ok_or(TopologyError::Torn)?;
+        let along = if dot(travel, direction) >= 0.0 { direction } else { scale(direction, -1.0) };
+        unit(cross(normal, along)).ok_or(TopologyError::Degenerate)
+    }
+
+    fn bevel_at(&self, rails: &[BevelRail], used: &[u32], expanded: bool, distance: f64, clamped: bool) -> Result<(BevelCut, TopologyLineage), TopologyError> {
+        if !distance.is_finite() || distance <= MIN_DELTA_M {
+            return Err(TopologyError::Degenerate);
+        }
+        let mut body = self.clone();
+        let mut points = PointSet::default();
+        let mut ends = Vec::new();
+        for rail_index in 0..rails.len() {
+            for face_slot in 0..2 {
+                for terminal in 0..2 {
+                    let position = self.end_position(rails, rail_index, face_slot, terminal, distance)?;
+                    let id = points.take(&mut body, position)?;
+                    ends.push(BevelEnd { rail: rail_index, face_slot, terminal, id });
+                }
+            }
+        }
+        let mut meets = Vec::new();
+        let mut seen = Vec::new();
+        for rail in rails {
+            for terminal in rail.terminals {
+                if seen.contains(&terminal) {
+                    continue;
+                }
+                seen.push(terminal);
+                let incident = rails_touching(rails, terminal);
+                if incident.len() >= 3 {
+                    let position = meet_position(self, rails, &incident, distance)?;
+                    let id = points.take(&mut body, position)?;
+                    meets.push((terminal, id));
+                }
+            }
+        }
+        let face_ids: Vec<u32> = body.faces.iter().map(|face| face.id).collect();
+        for face_id in &face_ids {
+            let clips: Vec<usize> = rails.iter().enumerate().filter(|(_, rail)| rail.faces.contains(face_id)).map(|(index, _)| index).collect();
+            if clips.is_empty() {
+                continue;
+            }
+            let mut polygon = body.face_positions(*face_id).ok_or(TopologyError::Missing)?;
+            let mut ids: Vec<Option<u32>> = body.face_loop(*face_id).ok_or(TopologyError::Missing)?.iter().copied().map(Some).collect();
+            for rail_index in clips {
+                let rail = &rails[rail_index];
+                let slot = if rail.faces[0] == *face_id { 0 } else { 1 };
+                let clipped = clip_half(&polygon, &ids, rail.origin, rail.inward[slot], distance);
+                polygon = clipped.0;
+                ids = clipped.1;
+                if polygon.len() < 3 {
+                    return Err(TopologyError::Degenerate);
+                }
+            }
+            let mut loop_ids = Vec::new();
+            for (position, id) in polygon.iter().zip(ids.iter()) {
+                let resolved = match id {
+                    Some(id) => *id,
+                    None => points.take(&mut body, *position)?,
+                };
+                if loop_ids.last() == Some(&resolved) {
+                    continue;
+                }
+                loop_ids.push(resolved);
+            }
+            if loop_ids.len() >= 2 && loop_ids.first() == loop_ids.last() {
+                loop_ids.pop();
+            }
+            if loop_ids.len() < 3 || has_repeat(&loop_ids) {
+                return Err(TopologyError::Degenerate);
+            }
+            body.faces.iter_mut().find(|face| face.id == *face_id).ok_or(TopologyError::Missing)?.vertices = loop_ids;
+        }
+        body.rewrite_bevel_caps(rails, &ends)?;
+        let mut strips: Vec<(Vec<u32>, Vec<u32>, u32)> = Vec::new();
+        for rail_index in 0..rails.len() {
+            let rail = &rails[rail_index];
+            let mut chains = [Vec::new(), Vec::new()];
+            for slot in 0..2 {
+                let start = end_id(&ends, rail_index, slot, 0)?;
+                let finish = end_id(&ends, rail_index, slot, 1)?;
+                let loop_ = body.face_loop(rail.faces[slot]).ok_or(TopologyError::Torn)?.to_vec();
+                chains[slot] = chain_on_offset(&loop_, start, finish).ok_or(TopologyError::Degenerate)?;
+            }
+            let mut loop_ids = chains[0].clone();
+            push_new(&mut loop_ids, meet_of(&meets, rail.terminals[1]));
+            for id in chains[1].iter().rev().copied() {
+                push_new(&mut loop_ids, Some(id));
+            }
+            push_new(&mut loop_ids, meet_of(&meets, rail.terminals[0]));
+            if loop_ids.len() >= 2 && loop_ids.first() == loop_ids.last() {
+                loop_ids.pop();
+            }
+            if loop_ids.len() < 3 || has_repeat(&loop_ids) {
+                return Err(TopologyError::Degenerate);
+            }
+            let positions = body.positions_of(&loop_ids);
+            if positions.len() != loop_ids.len() {
+                return Err(TopologyError::Missing);
+            }
+            if dot(newell(&positions), add(rail.normals[0], rail.normals[1])) < 0.0 {
+                loop_ids.reverse();
+            }
+            let sources = rail.edges.clone();
+            let stored_loop = loop_ids.clone();
+            let id = body.alloc()?;
+            body.faces.push(SolidFace { id, vertices: loop_ids });
+            strips.push((sources, stored_loop, id));
+        }
+        let prior_edges: Vec<u32> = self.edges.iter().map(|edge| edge.id).collect();
+        body.sync_boundary()?;
+        let mut lineage = TopologyLineage::default();
+        for (sources, loop_ids, face_id) in strips {
+            for source in &sources {
+                lineage.births.push(ElementBirth {
+                    kind: ElementKind::Face,
+                    id: face_id,
+                    role: BirthRole::BevelFace { source: *source },
+                    source: Some(*source),
+                });
+            }
+            let count = loop_ids.len();
+            for slot in 0..count {
+                let edge_id = body.edge_between(loop_ids[slot], loop_ids[(slot + 1) % count]).ok_or(TopologyError::Torn)?;
+                if prior_edges.contains(&edge_id) {
+                    continue;
+                }
+                for source in &sources {
+                    lineage.births.push(ElementBirth {
+                        kind: ElementKind::Edge,
+                        id: edge_id,
+                        role: BirthRole::BevelEdge { source: *source, slot: slot as u32 },
+                        source: Some(*source),
+                    });
+                }
+            }
+        }
+        body.remove_unreferenced_vertices();
+        let edit = body.finish()?;
+        let lineage = lineage.retain_live(&edit.body);
+        Ok((BevelCut { edit, width_m: distance, edges: used.to_vec(), expanded, clamped }, lineage))
+    }
+
+    fn end_position(&self, rails: &[BevelRail], rail_index: usize, face_slot: usize, terminal: usize, distance: f64) -> Result<[f64; 3], TopologyError> {
+        let rail = &rails[rail_index];
+        let face = rail.faces[face_slot];
+        let vertex = rail.terminals[terminal];
+        let loop_ = self.face_loop(face).ok_or(TopologyError::Missing)?;
+        let count = loop_.len();
+        let index = loop_.iter().position(|id| *id == vertex).ok_or(TopologyError::Torn)?;
+        let prev = loop_[(index + count - 1) % count];
+        let next = loop_[(index + 1) % count];
+        let prev_rail = self.rail_of_edge(rails, prev, vertex);
+        let next_rail = self.rail_of_edge(rails, vertex, next);
+        let (wing, other_rail) = if prev_rail == Some(rail_index) && next_rail != Some(rail_index) {
+            (next, next_rail)
+        } else if next_rail == Some(rail_index) && prev_rail != Some(rail_index) {
+            (prev, prev_rail)
+        } else {
+            return Err(TopologyError::Torn);
+        };
+        let vertex_at = self.vertex_position(vertex).ok_or(TopologyError::Missing)?;
+        let point = if let Some(other_rail) = other_rail {
+            let other_slot = if rails[other_rail].faces[0] == face { 0 } else { 1 };
+            let first = add(vertex_at, scale(rail.inward[face_slot], distance));
+            let second = add(vertex_at, scale(rails[other_rail].inward[other_slot], distance));
+            line_line(first, rail.direction, second, rails[other_rail].direction).ok_or(TopologyError::Degenerate)?
+        } else {
+            let wing_at = self.vertex_position(wing).ok_or(TopologyError::Missing)?;
+            inset_along(vertex_at, wing_at, rail.inward[face_slot], distance)?
+        };
+        if self.face_loop(face).ok_or(TopologyError::Missing)?.iter().any(|id| {
+            self.vertex_position(*id).is_some_and(|position| length(sub(position, point)) < MIN_EDGE_M)
+        }) {
+            return Err(TopologyError::Degenerate);
+        }
+        match self.place_on_face(face, point) {
+            FacePlace::Outside => Err(TopologyError::Degenerate),
+            FacePlace::Boundary | FacePlace::Inside => Ok(point),
+        }
+    }
+
+    fn rail_of_edge(&self, rails: &[BevelRail], a: u32, b: u32) -> Option<usize> {
+        let edge = self.edge_between(a, b)?;
+        rails.iter().position(|rail| rail.edges.contains(&edge))
+    }
+
+    fn rewrite_bevel_caps(&mut self, rails: &[BevelRail], ends: &[BevelEnd]) -> Result<(), TopologyError> {
+        let mut singles = Vec::new();
+        let mut seen = Vec::new();
+        for (index, rail) in rails.iter().enumerate() {
+            for terminal in rail.terminals {
+                if seen.contains(&terminal) {
+                    continue;
+                }
+                seen.push(terminal);
+                if rails_touching(rails, terminal).len() == 1 {
+                    singles.push((terminal, index));
+                }
+            }
+        }
+        let face_ids: Vec<u32> = self.faces.iter().map(|face| face.id).collect();
+        for face_id in face_ids {
+            let old = self.face_loop(face_id).ok_or(TopologyError::Missing)?.to_vec();
+            if !old.iter().any(|vertex| singles.iter().any(|(id, _)| id == vertex)) {
+                continue;
+            }
+            let count = old.len();
+            let mut new_loop = Vec::new();
+            for index in 0..count {
+                let vertex = old[index];
+                let Some(rail_index) = singles.iter().find(|(id, _)| *id == vertex).map(|(_, rail)| *rail) else {
+                    push_new(&mut new_loop, Some(vertex));
+                    continue;
+                };
+                let terminal = if rails[rail_index].terminals[0] == vertex { 0 } else { 1 };
+                let prev = old[(index + count - 1) % count];
+                let next = old[(index + 1) % count];
+                let first = end_id(ends, rail_index, 0, terminal)?;
+                let second = end_id(ends, rail_index, 1, terminal)?;
+                let (left, right) = self.order_cap_points(prev, vertex, next, first, second)?;
+                push_new(&mut new_loop, Some(left));
+                push_new(&mut new_loop, Some(right));
+            }
+            if new_loop.len() >= 2 && new_loop.first() == new_loop.last() {
+                new_loop.pop();
+            }
+            if new_loop.len() < 3 || has_repeat(&new_loop) {
+                return Err(TopologyError::Degenerate);
+            }
+            self.faces.iter_mut().find(|face| face.id == face_id).ok_or(TopologyError::Missing)?.vertices = new_loop;
+        }
+        Ok(())
+    }
+
+    fn order_cap_points(&self, prev: u32, vertex: u32, next: u32, a: u32, b: u32) -> Result<(u32, u32), TopologyError> {
+        let prev_at = self.vertex_position(prev).ok_or(TopologyError::Missing)?;
+        let next_at = self.vertex_position(next).ok_or(TopologyError::Missing)?;
+        let vertex_at = self.vertex_position(vertex).ok_or(TopologyError::Missing)?;
+        let a_at = self.vertex_position(a).ok_or(TopologyError::Missing)?;
+        let b_at = self.vertex_position(b).ok_or(TopologyError::Missing)?;
+        let a_prev = point_on_span(a_at, prev_at, vertex_at);
+        let b_prev = point_on_span(b_at, prev_at, vertex_at);
+        let a_next = point_on_span(a_at, vertex_at, next_at);
+        let b_next = point_on_span(b_at, vertex_at, next_at);
+        if a_prev && b_next {
+            Ok((a, b))
+        } else if b_prev && a_next {
+            Ok((b, a))
+        } else {
+            Err(TopologyError::Degenerate)
+        }
+    }
+
+    fn sync_boundary(&mut self) -> Result<(), TopologyError> {
+        let pairs: Vec<(u32, u32)> = self
+            .faces
+            .iter()
+            .flat_map(|face| {
+                let count = face.vertices.len();
+                (0..count).map(move |index| (face.vertices[index], face.vertices[(index + 1) % count]))
+            })
+            .collect();
+        for (a, b) in pairs {
+            self.ensure_edge(a, b)?;
+        }
+        self.remove_unused_edges();
+        Ok(())
+    }
+
+    fn remove_unreferenced_vertices(&mut self) {
+        self.vertices.retain(|vertex| self.faces.iter().any(|face| face.vertices.contains(&vertex.id)));
     }
 
     /// Inserts the midpoint. The old edge id stays on the half that begins at the stored start vertex.
     pub fn split_edge(&self, edge: u32) -> Result<TopologyEdit, TopologyError> {
+        self.split_edge_traced(edge).map(|(edit, _)| edit)
+    }
+
+    pub(crate) fn split_edge_traced(&self, edge: u32) -> Result<(TopologyEdit, TopologyLineage), TopologyError> {
         let mut body = self.clone();
         let (start, end) = body.edge_ids(edge).ok_or(TopologyError::Missing)?;
         let mid = midpoint(body.vertex_position(start).ok_or(TopologyError::Missing)?, body.vertex_position(end).ok_or(TopologyError::Missing)?);
-        let id = body.alloc()?;
-        body.vertices.push(SolidVertex { id, position: mid });
-        body.split_edge_chain(start, end, &[id], None)?;
-        body.finish()
+        let vertex = body.alloc()?;
+        body.vertices.push(SolidVertex { id: vertex, position: mid });
+        let prior: Vec<u32> = body.edges.iter().map(|edge| edge.id).collect();
+        body.split_edge_chain(start, end, &[vertex], None)?;
+        let created: Vec<u32> = body.edges.iter().map(|edge| edge.id).filter(|id| !prior.contains(id)).collect();
+        if created.len() != 1 {
+            return Err(TopologyError::Torn);
+        }
+        let mut lineage = TopologyLineage::default();
+        lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: edge, role: BirthRole::SplitKept, source: Some(edge) });
+        lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: created[0], role: BirthRole::SplitNew, source: Some(edge) });
+        lineage.births.push(ElementBirth { kind: ElementKind::Vertex, id: vertex, role: BirthRole::SplitMidpoint, source: Some(edge) });
+        let edit = body.finish()?;
+        let lineage = lineage.retain_live(&edit.body);
+        Ok((edit, lineage))
     }
 
     /// Replaces one rectangular face with a `u` by `v` grid of quads. Corners and the original face id stay.
@@ -509,11 +1100,19 @@ impl SolidBody {
     /// A loop longer than four is still a quad when the extra vertices sit on the straight edges.
     /// Those vertices stay, and the grid grows so each of them lands on a division.
     pub fn subdivide_face(&self, face: u32, u: u32, v: u32) -> Result<TopologyEdit, TopologyError> {
+        self.subdivide_face_traced(face, u, v).map(|(edit, _)| edit)
+    }
+
+    pub(crate) fn subdivide_face_traced(&self, face: u32, u: u32, v: u32) -> Result<(TopologyEdit, TopologyLineage), TopologyError> {
         let (u, v) = self.subdivide_resolution(face, u, v)?;
         let origin = self.face_loop(face).ok_or(TopologyError::Missing)?[0];
         let mut body = self.clone();
         if u == 1 && v == 1 {
-            return body.finish();
+            let mut lineage = TopologyLineage::default();
+            lineage.births.push(ElementBirth { kind: ElementKind::Face, id: face, role: BirthRole::SubdivCell { u: 0, v: 0 }, source: Some(face) });
+            let edit = body.finish()?;
+            let lineage = lineage.retain_live(&edit.body);
+            return Ok((edit, lineage));
         }
         let quad = body.geometric_quad(face).ok_or(TopologyError::NotQuad)?;
         let bottom = body.refine_chain(&quad.chains[0], u, face)?;
@@ -554,26 +1153,42 @@ impl SolidBody {
         }
         let face_index = body.faces.iter().position(|entry| entry.id == face).ok_or(TopologyError::Missing)?;
         let mut kept = false;
+        let mut lineage = TopologyLineage::default();
         for j in 0..v {
             for i in 0..u {
                 let cell = [grid[at(i, j)], grid[at(i + 1, j)], grid[at(i + 1, j + 1)], grid[at(i, j + 1)]];
-                body.ensure_edge(cell[0], cell[1])?;
-                body.ensure_edge(cell[1], cell[2])?;
-                body.ensure_edge(cell[2], cell[3])?;
-                body.ensure_edge(cell[3], cell[0])?;
-                if !kept && cell.contains(&origin) {
+                let edges = [
+                    body.ensure_edge(cell[0], cell[1])?,
+                    body.ensure_edge(cell[1], cell[2])?,
+                    body.ensure_edge(cell[2], cell[3])?,
+                    body.ensure_edge(cell[3], cell[0])?,
+                ];
+                let face_id = if !kept && cell.contains(&origin) {
                     body.faces[face_index].vertices = cell.to_vec();
                     kept = true;
+                    face
                 } else {
                     let id = body.alloc()?;
                     body.faces.push(SolidFace { id, vertices: cell.to_vec() });
+                    id
+                };
+                lineage.births.push(ElementBirth { kind: ElementKind::Face, id: face_id, role: BirthRole::SubdivCell { u: i, v: j }, source: Some(face) });
+                for (side, edge_id) in edges.into_iter().enumerate() {
+                    lineage.births.push(ElementBirth {
+                        kind: ElementKind::Edge,
+                        id: edge_id,
+                        role: BirthRole::SubdivEdge { u: i, v: j, side: side as u8 },
+                        source: Some(face),
+                    });
                 }
             }
         }
         if !kept {
             return Err(TopologyError::Torn);
         }
-        body.finish()
+        let edit = body.finish()?;
+        let lineage = lineage.retain_live(&edit.body);
+        Ok((edit, lineage))
     }
 
     /// Moves the selected faces by `delta` and keeps one closed solid.
@@ -584,6 +1199,10 @@ impl SolidBody {
     /// trims the neighbor to the new edge instead, so the two faces share it and the overlapped
     /// strip is not a second polygon.
     pub fn extrude_faces(&self, faces: &[u32], delta: [f64; 3]) -> Result<TopologyEdit, TopologyError> {
+        self.extrude_faces_traced(faces, delta).map(|(edit, _)| edit)
+    }
+
+    pub fn extrude_faces_traced(&self, faces: &[u32], delta: [f64; 3]) -> Result<(TopologyEdit, TopologyLineage), TopologyError> {
         if !usable_delta(delta) {
             return Err(TopologyError::Degenerate);
         }
@@ -601,7 +1220,7 @@ impl SolidBody {
             selected.push(*id);
         }
         let mut body = self.clone();
-        let mut boundary: Vec<(u32, u32, u32)> = Vec::new();
+        let mut boundary: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut interior: Vec<u32> = Vec::new();
         for edge in &body.edges {
             let incidents = body.incident_face_indexes(edge.a, edge.b);
@@ -619,17 +1238,18 @@ impl SolidBody {
             let face_index = incidents.iter().copied().find(|index| selected.contains(&body.faces[*index].id)).ok_or(TopologyError::Torn)?;
             let neighbor_index = incidents.into_iter().find(|index| !selected.contains(&body.faces[*index].id)).ok_or(TopologyError::Torn)?;
             let neighbor = body.faces[neighbor_index].id;
+            let owner = body.faces[face_index].id;
             let loop_ = &body.faces[face_index].vertices;
             let count = loop_.len();
             let directed = (0..count).find_map(|index| {
                 let start = loop_[index];
                 let end = loop_[(index + 1) % count];
-                ((start == edge.a && end == edge.b) || (start == edge.b && end == edge.a)).then_some((start, end, neighbor))
+                ((start == edge.a && end == edge.b) || (start == edge.b && end == edge.a)).then_some((start, end, neighbor, owner))
             });
             boundary.push(directed.ok_or(TopologyError::Torn)?);
         }
         let mut degree: Vec<(u32, u32)> = Vec::new();
-        for (start, end, _) in &boundary {
+        for (start, end, _, _) in &boundary {
             for vertex in [*start, *end] {
                 if let Some(slot) = degree.iter_mut().find(|(id, _)| *id == vertex) {
                     slot.1 += 1;
@@ -692,7 +1312,7 @@ impl SolidBody {
         }
         let mut carve = Vec::new();
         let mut walls = Vec::new();
-        for (start, end, neighbor) in boundary {
+        for (start, end, neighbor, owner) in boundary {
             let start_new = mapped(&map, start)?;
             let end_new = mapped(&map, end)?;
             if start_new == start || end_new == end || start_new == end_new || start_new == end || end_new == start {
@@ -710,26 +1330,50 @@ impl SolidBody {
                     // that next face is a different edit, so this one refuses.
                     return Err(TopologyError::Torn);
                 }
-                carve.push((neighbor, start, end, start_new, end_new));
+                carve.push((owner, neighbor, start, end, start_new, end_new));
             } else {
-                walls.push((start, end, start_new, end_new));
+                walls.push((owner, start, end, start_new, end_new));
             }
         }
-        for (neighbor, start, end, start_new, end_new) in carve {
+        let mut carved_births = Vec::new();
+        for (owner, neighbor, start, end, start_new, end_new) in carve {
+            let boundary = body.edge_between(start, end).ok_or(TopologyError::Torn)?;
             body.carve_strip(neighbor, start, end, start_new, end_new)?;
+            let lip = body.edge_between(start_new, end_new).ok_or(TopologyError::Torn)?;
+            carved_births.push((owner, boundary, lip, start, end, start_new, end_new));
         }
         body.remove_unused_edges();
-        for (start, end, start_new, end_new) in walls {
+        let mut lineage = TopologyLineage::default();
+        for (owner, boundary, lip, start, end, start_new, end_new) in carved_births {
+            lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: lip, role: BirthRole::ExtrudeCarve { face: owner, boundary }, source: Some(boundary) });
+            if let Some(leg) = body.edge_between(start, start_new) {
+                lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: leg, role: BirthRole::ExtrudeLeg { face: owner, boundary, end: 0 }, source: Some(boundary) });
+            }
+            if let Some(leg) = body.edge_between(end, end_new) {
+                lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: leg, role: BirthRole::ExtrudeLeg { face: owner, boundary, end: 1 }, source: Some(boundary) });
+            }
+        }
+        for (owner, start, end, start_new, end_new) in walls {
+            let boundary = body.edge_between(start, end).ok_or(TopologyError::Torn)?;
             body.ensure_edge(start, end)?;
-            body.ensure_edge(end, end_new)?;
-            body.ensure_edge(end_new, start_new)?;
-            body.ensure_edge(start_new, start)?;
+            let leg_end = body.ensure_edge(end, end_new)?;
+            let outer = body.ensure_edge(end_new, start_new)?;
+            let leg_start = body.ensure_edge(start_new, start)?;
             // [start, end, end', start'] opposes the neighbor on the old edge and the cap on the new one.
             // Reversing it would give both faces the same direction, which the closed-solid check rejects.
             let wall_id = body.alloc()?;
             body.faces.push(SolidFace { id: wall_id, vertices: vec![start, end, end_new, start_new] });
+            lineage.births.push(ElementBirth { kind: ElementKind::Face, id: wall_id, role: BirthRole::ExtrudeSide { face: owner, boundary }, source: Some(boundary) });
+            lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: outer, role: BirthRole::ExtrudeOuter { boundary }, source: Some(boundary) });
+            lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: leg_start, role: BirthRole::ExtrudeLeg { face: owner, boundary, end: 0 }, source: Some(boundary) });
+            lineage.births.push(ElementBirth { kind: ElementKind::Edge, id: leg_end, role: BirthRole::ExtrudeLeg { face: owner, boundary, end: 1 }, source: Some(boundary) });
         }
-        body.finish()
+        for face in &selected {
+            lineage.births.push(ElementBirth { kind: ElementKind::Face, id: *face, role: BirthRole::ExtrudeCap, source: Some(*face) });
+        }
+        let edit = body.finish()?;
+        let lineage = lineage.retain_live(&edit.body);
+        Ok((edit, lineage))
     }
 
     /// Scales about the current center, then recenters. Ids stay.
@@ -1625,9 +2269,254 @@ fn unit(value: [f64; 3]) -> Option<[f64; 3]> {
     }
 }
 
+struct BevelRail {
+    edges: Vec<u32>,
+    faces: [u32; 2],
+    normals: [[f64; 3]; 2],
+    inward: [[f64; 3]; 2],
+    terminals: [u32; 2],
+    direction: [f64; 3],
+    origin: [f64; 3],
+}
+
+struct BevelEnd {
+    rail: usize,
+    face_slot: usize,
+    terminal: usize,
+    id: u32,
+}
+
+#[derive(Default)]
+struct PointSet {
+    ids: Vec<u32>,
+    positions: Vec<[f64; 3]>,
+}
+
+impl PointSet {
+    fn take(&mut self, body: &mut SolidBody, position: [f64; 3]) -> Result<u32, TopologyError> {
+        for (id, existing) in self.ids.iter().zip(self.positions.iter()) {
+            if distance(*existing, position) <= 1.0e-5 {
+                return Ok(*id);
+            }
+        }
+        let id = body.alloc()?;
+        body.vertices.push(SolidVertex { id, position });
+        self.ids.push(id);
+        self.positions.push(position);
+        Ok(id)
+    }
+}
+
+fn rails_touching(rails: &[BevelRail], vertex: u32) -> Vec<usize> {
+    rails.iter().enumerate().filter(|(_, rail)| rail.terminals.contains(&vertex)).map(|(index, _)| index).collect()
+}
+
+fn end_id(ends: &[BevelEnd], rail: usize, face_slot: usize, terminal: usize) -> Result<u32, TopologyError> {
+    ends.iter()
+        .find(|end| end.rail == rail && end.face_slot == face_slot && end.terminal == terminal)
+        .map(|end| end.id)
+        .ok_or(TopologyError::Torn)
+}
+
+fn meet_of(meets: &[(u32, u32)], vertex: u32) -> Option<u32> {
+    meets.iter().find(|(candidate, _)| *candidate == vertex).map(|(_, id)| *id)
+}
+
+fn push_new(loop_: &mut Vec<u32>, id: Option<u32>) {
+    let Some(id) = id else { return };
+    if loop_.last() != Some(&id) {
+        loop_.push(id);
+    }
+}
+
+fn has_repeat(loop_: &[u32]) -> bool {
+    loop_.iter().enumerate().any(|(index, id)| loop_[..index].contains(id))
+}
+
+fn inset_along(origin: [f64; 3], wing: [f64; 3], inward: [f64; 3], width: f64) -> Result<[f64; 3], TopologyError> {
+    let span = sub(wing, origin);
+    let denom = dot(span, inward);
+    if denom <= 1.0e-8 {
+        return Err(TopologyError::Degenerate);
+    }
+    let step = width / denom;
+    if !(0.0..1.0).contains(&step) {
+        return Err(TopologyError::Degenerate);
+    }
+    let point = add(origin, scale(span, step));
+    if length(sub(point, origin)) < MIN_EDGE_M || length(sub(point, wing)) < MIN_EDGE_M {
+        return Err(TopologyError::Degenerate);
+    }
+    Ok(point)
+}
+
+fn point_on_span(point: [f64; 3], start: [f64; 3], end: [f64; 3]) -> bool {
+    let span = distance(start, end);
+    if span < MIN_EDGE_M {
+        return false;
+    }
+    let along = project_segment(point, start, end);
+    along > 1.0e-6 && along < span - 1.0e-6 && point_segment_distance(point, start, end) <= 1.0e-4
+}
+
+fn line_line(origin: [f64; 3], direction: [f64; 3], other: [f64; 3], other_direction: [f64; 3]) -> Option<[f64; 3]> {
+    let direction = unit(direction)?;
+    let other_direction = unit(other_direction)?;
+    let cross_d = cross(direction, other_direction);
+    let denom = dot(cross_d, cross_d);
+    if denom < 1.0e-12 {
+        return None;
+    }
+    let delta = sub(other, origin);
+    let along = dot(cross(delta, other_direction), cross_d) / denom;
+    let across = dot(cross(delta, direction), cross_d) / denom;
+    let left = add(origin, scale(direction, along));
+    let right = add(other, scale(other_direction, across));
+    if distance(left, right) > 1.0e-4 {
+        None
+    } else {
+        Some(midpoint(left, right))
+    }
+}
+
+fn meet_position(body: &SolidBody, rails: &[BevelRail], incident: &[usize], width: f64) -> Result<[f64; 3], TopologyError> {
+    if incident.len() < 3 {
+        return Err(TopologyError::Torn);
+    }
+    let mut planes = Vec::new();
+    for index in incident {
+        planes.push(rail_plane(&rails[*index], width)?);
+    }
+    let point = meet_planes(planes[0], planes[1], planes[2]).ok_or(TopologyError::Degenerate)?;
+    for plane in planes.iter().skip(3) {
+        if (dot(plane.0, point) - plane.1).abs() > 1.0e-4 {
+            return Err(TopologyError::Degenerate);
+        }
+    }
+    if body.vertices.iter().any(|vertex| length(sub(vertex.position, point)) < MIN_EDGE_M) {
+        return Err(TopologyError::Degenerate);
+    }
+    Ok(point)
+}
+
+fn rail_plane(rail: &BevelRail, distance: f64) -> Result<([f64; 3], f64), TopologyError> {
+    let left = add(rail.origin, scale(rail.inward[0], distance));
+    let right = add(rail.origin, scale(rail.inward[1], distance));
+    let mut normal = unit(cross(rail.direction, sub(right, left))).ok_or(TopologyError::Degenerate)?;
+    if dot(normal, add(rail.normals[0], rail.normals[1])) < 0.0 {
+        normal = scale(normal, -1.0);
+    }
+    Ok((normal, dot(normal, left)))
+}
+
+fn meet_planes(first: ([f64; 3], f64), second: ([f64; 3], f64), third: ([f64; 3], f64)) -> Option<[f64; 3]> {
+    let mut rows = [
+        [first.0[0], first.0[1], first.0[2], first.1],
+        [second.0[0], second.0[1], second.0[2], second.1],
+        [third.0[0], third.0[1], third.0[2], third.1],
+    ];
+    for column in 0..3 {
+        let mut pivot = column;
+        for row in column + 1..3 {
+            if rows[row][column].abs() > rows[pivot][column].abs() {
+                pivot = row;
+            }
+        }
+        if rows[pivot][column].abs() < 1.0e-12 {
+            return None;
+        }
+        rows.swap(column, pivot);
+        let divisor = rows[column][column];
+        for entry in column..4 {
+            rows[column][entry] /= divisor;
+        }
+        for row in 0..3 {
+            if row == column {
+                continue;
+            }
+            let factor = rows[row][column];
+            for entry in column..4 {
+                rows[row][entry] -= factor * rows[column][entry];
+            }
+        }
+    }
+    let point = [rows[0][3], rows[1][3], rows[2][3]];
+    if point.iter().all(|axis| axis.is_finite()) { Some(point) } else { None }
+}
+
+fn chain_on_offset(loop_: &[u32], start: u32, end: u32) -> Option<Vec<u32>> {
+    if start == end {
+        return None;
+    }
+    let count = loop_.len();
+    let from = loop_.iter().position(|id| *id == start)?;
+    let to = loop_.iter().position(|id| *id == end)?;
+    let walk = |step: usize| {
+        let mut chain = vec![loop_[from]];
+        let mut cursor = from;
+        for _ in 0..count {
+            cursor = (cursor + step) % count;
+            chain.push(loop_[cursor]);
+            if cursor == to {
+                break;
+            }
+        }
+        chain
+    };
+    let forward = walk(1);
+    let backward = walk(count - 1);
+    if forward.len() == backward.len() {
+        return None;
+    }
+    Some(if forward.len() < backward.len() { forward } else { backward })
+}
+
+fn clip_half(positions: &[[f64; 3]], ids: &[Option<u32>], origin: [f64; 3], inward: [f64; 3], distance: f64) -> (Vec<[f64; 3]>, Vec<Option<u32>>) {
+    let signed = |point: [f64; 3]| dot(sub(point, origin), inward) - distance;
+    let inside = |point: [f64; 3]| signed(point) >= -1.0e-8;
+    let intersect = |start: [f64; 3], end: [f64; 3]| {
+        let from = signed(start);
+        let to = signed(end);
+        let denom = from - to;
+        let step = if denom.abs() < 1.0e-15 { 0.0 } else { from / denom };
+        add(start, scale(sub(end, start), step.clamp(0.0, 1.0)))
+    };
+    let mut out_positions = Vec::new();
+    let mut out_ids = Vec::new();
+    if positions.is_empty() {
+        return (out_positions, out_ids);
+    }
+    let mut start_at = *positions.last().unwrap_or(&[0.0; 3]);
+    for index in 0..positions.len() {
+        let end_at = positions[index];
+        let end_id = ids.get(index).copied().unwrap_or(None);
+        let start_in = inside(start_at);
+        let end_in = inside(end_at);
+        if end_in {
+            if !start_in {
+                out_positions.push(intersect(start_at, end_at));
+                out_ids.push(None);
+            }
+            out_positions.push(end_at);
+            out_ids.push(end_id);
+        } else if start_in {
+            out_positions.push(intersect(start_at, end_at));
+            out_ids.push(None);
+        }
+        start_at = end_at;
+    }
+    (out_positions, out_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pushing_a_whole_box_face_inward_stays_refused() {
+        let body = SolidBody::from_box([2.0, 2.0, 2.0]).unwrap();
+        assert_eq!(body.extrude_faces(&[5], [0.0, 0.0, -0.2]), Err(TopologyError::Torn));
+    }
 
     fn box_body() -> SolidBody {
         SolidBody::from_box([2.0, 2.0, 2.0]).unwrap()
@@ -1692,6 +2581,138 @@ mod tests {
         let wall = edit.body.faces.iter().find(|face| face.id >= 21).unwrap();
         let normal = edit.body.unit_normal(wall.id).unwrap();
         assert!(normal[2] > 0.9, "{normal:?}");
+    }
+
+    fn near_vertex(body: &SolidBody, point: [f64; 3]) -> bool {
+        body.vertices.iter().any(|vertex| distance(vertex.position, point) < 1.0e-5)
+    }
+
+    #[test]
+    fn bevel_one_edge_replaces_it_with_a_closed_strip() {
+        let body = box_body();
+        let cut = body.bevel_edges(&[16], 0.2).unwrap();
+        assert!((cut.width_m - 0.2).abs() < 1.0e-9);
+        assert!(!cut.clamped);
+        assert!(!cut.expanded);
+        assert_eq!(cut.edges, vec![16]);
+        let edited = &cut.edit.body;
+        assert_eq!(edited.faces.len(), 7);
+        assert_eq!(edited.vertices.len(), 10);
+        assert_eq!(crate::mesh_from_body(edited).triangle_indices().len(), 16);
+        assert_eq!(edited.face_len(3), Some(5));
+        assert_eq!(edited.face_len(4), Some(5));
+        assert!(edited.vertex_position(6).is_none());
+        assert!(edited.vertex_position(8).is_none());
+        assert!(edited.edges.iter().all(|edge| edge.id != 16));
+        assert!(near_vertex(edited, [1.0, 1.0, 0.8]));
+        let bevel = edited.faces.iter().find(|face| face.id >= 21).unwrap();
+        let normal = edited.unit_normal(bevel.id).unwrap();
+        assert!(normal[0] > 0.2 && normal[2] > 0.2, "{normal:?}");
+        assert!(cut.edit.shift.iter().all(|axis| axis.abs() < 1.0e-6), "{:?}", cut.edit.shift);
+        assert!((cut.edit.size_m[0] - 2.0).abs() < 1.0e-6, "{:?}", cut.edit.size_m);
+        edited.validate().unwrap();
+        assert_eq!(body.vertices.len(), 8);
+    }
+
+    #[test]
+    fn bevel_refuses_a_zero_or_missing_edge_without_changing_the_body() {
+        let body = box_body();
+        assert_eq!(body.bevel_edges(&[16], 0.0), Err(TopologyError::Degenerate));
+        assert_eq!(body.bevel_edges(&[16], f64::NAN), Err(TopologyError::Degenerate));
+        assert_eq!(body.bevel_edges(&[16], f64::INFINITY), Err(TopologyError::Degenerate));
+        assert_eq!(body.bevel_edges(&[16], -0.2), Err(TopologyError::Degenerate));
+        assert_eq!(body.bevel_edges(&[], 0.2), Err(TopologyError::Degenerate));
+        assert_eq!(body.bevel_edges(&[99], 0.2), Err(TopologyError::Missing));
+        assert_eq!(body.vertices.len(), 8);
+        assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn bevel_clamps_a_distance_the_box_cannot_hold() {
+        let cut = box_body().bevel_edges(&[16], 5.0).unwrap();
+        assert!(cut.clamped);
+        assert!(cut.width_m > 1.0 && cut.width_m < 2.0, "{}", cut.width_m);
+        cut.edit.body.validate().unwrap();
+        assert!(cut.edit.body.edges.iter().all(|edge| edge.id != 16));
+    }
+
+    #[test]
+    fn bevel_refuses_a_coplanar_edge() {
+        let divided = box_body().subdivide_face(3, 2, 2).unwrap();
+        let edge = divided
+            .body
+            .edges
+            .iter()
+            .find(|edge| {
+                let faces = divided.body.faces_of_edge(edge.id);
+                faces.len() == 2 && dot(divided.body.unit_normal(faces[0]).unwrap(), divided.body.unit_normal(faces[1]).unwrap()) > 0.999
+            })
+            .expect("an interior grid edge is flat");
+        assert_eq!(divided.body.bevel_edges(&[edge.id], 0.2), Err(TopologyError::Degenerate));
+        assert!(divided.body.edges.iter().any(|candidate| candidate.id == edge.id));
+    }
+
+    #[test]
+    fn bevel_follows_a_split_straight_run() {
+        let split = box_body().split_edge(16).unwrap();
+        let midpoint = split.body.vertices.iter().find(|vertex| vertex.id > 8).unwrap().id;
+        let cut = split.body.bevel_edges(&[16], 0.2).unwrap();
+        assert!(cut.expanded);
+        assert!(cut.edges.len() >= 2);
+        assert!(cut.edges.contains(&16));
+        let edited = &cut.edit.body;
+        edited.validate().unwrap();
+        assert!(edited.vertex_position(6).is_none());
+        assert!(edited.vertex_position(8).is_none());
+        assert!(edited.vertex_position(midpoint).is_none());
+        assert!(edited.edges.iter().all(|edge| edge.id != 16));
+        assert_eq!(edited.faces.len(), 7);
+    }
+
+    #[test]
+    fn bevel_two_disjoint_edges_stays_closed() {
+        let cut = box_body().bevel_edges(&[16, 13], 0.2).unwrap();
+        assert!(!cut.clamped);
+        assert_eq!(cut.edit.body.faces.len(), 8);
+        assert!(cut.edit.body.vertex_position(6).is_none());
+        assert!(cut.edit.body.vertex_position(1).is_none());
+        assert!(cut.edit.body.edges.iter().all(|edge| edge.id != 16 && edge.id != 13));
+        cut.edit.body.validate().unwrap();
+        assert_eq!(crate::mesh_from_body(&cut.edit.body).triangle_indices().len(), 20);
+    }
+
+    #[test]
+    fn bevel_two_edges_that_share_a_corner_miter() {
+        let cut = box_body().bevel_edges(&[16, 12], 0.2).unwrap();
+        let edited = &cut.edit.body;
+        edited.validate().unwrap();
+        assert!(near_vertex(edited, [1.0, 1.0, 0.8]), "miter stays on the unbeveled edge");
+        assert!(near_vertex(edited, [0.8, 0.8, 1.0]), "miter meets the shared face");
+        assert!(!near_vertex(edited, [0.8, 1.0, 1.0]), "the corner is not a point on the rail");
+        assert!(!near_vertex(edited, [1.0, 0.8, 1.0]), "the corner is not a point on the rail");
+        let west = edited.vertices.iter().find(|vertex| distance(vertex.position, [1.0, 1.0, 0.8]) < 1.0e-5).unwrap();
+        let meet = edited.vertices.iter().find(|vertex| distance(vertex.position, [0.8, 0.8, 1.0]) < 1.0e-5).unwrap();
+        let edge = edited.edge_between(west.id, meet.id).expect("the chamfers share the miter");
+        assert_eq!(edited.faces_of_edge(edge).len(), 2);
+        assert!(edited.vertex_position(6).is_none());
+        assert!(edited.vertex_position(8).is_none());
+        assert!(edited.edges.iter().all(|edge| edge.id != 16 && edge.id != 12));
+        assert_eq!(edited.faces.len(), 8);
+        assert_eq!(edited.vertices.len(), 11);
+    }
+
+    #[test]
+    fn bevel_three_edges_that_meet_at_one_vertex_share_the_corner() {
+        let cut = box_body().bevel_edges(&[16, 12, 20], 0.2).unwrap();
+        let edited = &cut.edit.body;
+        edited.validate().unwrap();
+        assert!((cut.width_m - 0.2).abs() < 1.0e-9);
+        assert!(!cut.clamped);
+        assert!(near_vertex(edited, [0.9, 0.9, 0.9]), "the three chamfer planes meet inside the corner");
+        let corner = edited.vertices.iter().find(|vertex| distance(vertex.position, [0.9, 0.9, 0.9]) < 1.0e-4).unwrap();
+        assert!(edited.faces_of_vertex(corner.id).len() >= 3, "each bevel reaches the shared point");
+        assert!(edited.vertex_position(8).is_none());
+        assert!(edited.edges.iter().all(|edge| edge.id != 16 && edge.id != 12 && edge.id != 20));
     }
 
     #[test]
@@ -1991,6 +3012,98 @@ mod tests {
         let rise = edit.body.vertex_position(shared).unwrap()[1] - edit.body.vertex_position(1).unwrap()[1];
         let original = divided.body.vertex_position(shared).unwrap()[1] - before;
         assert!((rise - original - 0.4).abs() < 1.0e-6, "{rise} {original}");
+    }
+
+    fn solid_volume(body: &SolidBody) -> f64 {
+        let mut sum = 0.0;
+        for face in &body.faces {
+            let Some(positions) = body.face_positions(face.id) else { continue };
+            if positions.len() < 3 {
+                continue;
+            }
+            for index in 1..positions.len() - 1 {
+                let (a, b, c) = (positions[0], positions[index], positions[index + 1]);
+                let triple = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+                sum += triple;
+            }
+        }
+        sum / 6.0
+    }
+
+    #[test]
+    fn bevel_three_connected_edges_meet_through_two_vertices() {
+        let before = box_body();
+        // 16 is 6–8, 12 is 7–8, 15 is 5–7. The path meets at 8 and at 7.
+        assert_eq!(before.edge_between(6, 8), Some(16));
+        assert_eq!(before.edge_between(7, 8), Some(12));
+        assert_eq!(before.edge_between(5, 7), Some(15));
+        let cut = before.bevel_edges(&[16, 12, 15], 0.2).unwrap();
+        let edited = &cut.edit.body;
+        edited.validate().unwrap();
+        assert!((cut.width_m - 0.2).abs() < 1.0e-9);
+        assert!(!cut.clamped);
+        assert!(solid_volume(edited) > 1.0);
+        assert!(solid_volume(edited) < solid_volume(&before) - 1.0e-4);
+        assert!(edited.edges.iter().all(|edge| edge.id != 16 && edge.id != 12 && edge.id != 15));
+        assert!(edited.vertex_position(8).is_none(), "the first shared corner is replaced");
+        assert!(edited.vertex_position(7).is_none(), "the second shared corner is replaced");
+        assert_eq!(before.vertices.len(), 8);
+    }
+
+    #[test]
+    fn an_unresolvable_multi_bevel_leaves_the_body_unchanged() {
+        let body = box_body();
+        let copy = body.clone();
+        assert_eq!(body.bevel_edges(&[16, 12], 0.0), Err(TopologyError::Degenerate));
+        assert_eq!(body, copy);
+        let divided = body.subdivide_face(3, 2, 2).unwrap();
+        let before = divided.body.clone();
+        let tops = top_faces(&before);
+        let interior = before
+            .edges
+            .iter()
+            .find(|edge| {
+                let faces = before.faces_of_edge(edge.id);
+                faces.len() == 2 && faces.iter().all(|face| tops.contains(face))
+            })
+            .expect("a 2×2 top has one interior edge")
+            .id;
+        let boundary = before
+            .edges
+            .iter()
+            .find(|edge| before.faces_of_edge(edge.id).iter().filter(|face| tops.contains(face)).count() == 1)
+            .expect("the top still has a boundary edge")
+            .id;
+        assert!(divided.body.bevel_edges(&[interior, boundary], 0.5).is_err());
+        assert_eq!(divided.body, before);
+    }
+
+    #[test]
+    fn extruding_two_adjacent_cells_keeps_the_shared_seam_and_adds_no_interior_wall() {
+        let divided = box_body().subdivide_face(3, 2, 2).unwrap();
+        let tops = top_faces(&divided.body);
+        let left = tops[0];
+        let right = tops.iter().copied().find(|face| *face != left && shared_vertices(&divided.body, left, *face) == 2).unwrap();
+        let seam = divided
+            .body
+            .edges
+            .iter()
+            .find(|edge| {
+                let faces = divided.body.faces_of_edge(edge.id);
+                faces.contains(&left) && faces.contains(&right)
+            })
+            .unwrap()
+            .id;
+        let before_volume = solid_volume(&divided.body);
+        let edit = divided.body.extrude_faces(&[left, right], [0.0, 0.4, 0.0]).unwrap();
+        edit.body.validate().unwrap();
+        assert!(edit.body.face_loop(left).is_some());
+        assert!(edit.body.face_loop(right).is_some());
+        let incident = edit.body.faces_of_edge(seam);
+        assert_eq!(incident.len(), 2, "the shared seam stays between the two caps");
+        assert!(incident.contains(&left) && incident.contains(&right));
+        assert!(solid_volume(&edit.body) > before_volume + 1.0e-4);
+        assert!(edit.body.faces.len() > divided.body.faces.len());
     }
 
     #[test]

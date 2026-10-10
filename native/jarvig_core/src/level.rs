@@ -38,6 +38,8 @@ pub struct LevelDocument {
     pub name: String,
     pub world_settings: WorldSettingsRecord,
     pub entities: Vec<EntityRecord>,
+    /// Folders and locks. Omitted from the file when empty. Not a spatial parent.
+    pub organization: crate::SceneOrganization,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +180,8 @@ pub struct MaterialAssetRef {
 pub enum LevelError {
     Syntax(String),
     UnsupportedVersion(u32),
+    /// A component schema this reader does not implement. This is not the outer level format.
+    UnsupportedComponentVersion { component: &'static str, version: u32, supported: &'static str },
     DuplicateUuid(String),
     InvalidParent(String),
     Cycle(String),
@@ -192,6 +196,9 @@ impl fmt::Display for LevelError {
         match self {
             Self::Syntax(text) | Self::Corrupt(text) | Self::UnknownComponent(text) | Self::MissingAsset(text) => write!(formatter, "{text}"),
             Self::UnsupportedVersion(version) => write!(formatter, "level format version {version} is newer than {LEVEL_BLOCK_VERSION}"),
+            Self::UnsupportedComponentVersion { component, version, supported } => {
+                write!(formatter, "{component} version {version} is not supported; this reader supports versions {supported}")
+            }
             Self::DuplicateUuid(uuid) => write!(formatter, "duplicate entity uuid {uuid}"),
             Self::InvalidParent(uuid) => write!(formatter, "parent uuid {uuid} is not in the level"),
             Self::Cycle(uuid) => write!(formatter, "parent cycle includes {uuid}"),
@@ -336,20 +343,24 @@ impl LevelDocument {
                 return Err(LevelError::Corrupt(format!("startup camera {camera} has no Camera component")));
             }
         }
+        self.organization.validate().map_err(|error| LevelError::Corrupt(error.to_string()))?;
         Ok(())
     }
 
     pub fn to_json(&self) -> String {
         let entities = Json::array(self.entities.iter().map(EntityRecord::to_json).collect());
-        Json::object(vec![
+        let mut fields = vec![
             ("schema", Json::string(LEVEL_SCHEMA)),
             ("format_version", Json::int(self.format_version as i64)),
             ("level_uuid", Json::string(self.level_uuid.to_string())),
             ("name", Json::string(&self.name)),
             ("world_settings", self.world_settings.to_json()),
             ("entities", entities),
-        ])
-        .write()
+        ];
+        if !self.organization.is_empty() {
+            fields.push(("organization", self.organization.to_json()));
+        }
+        Json::object(fields).write()
     }
 
     /// Rebuild a session world. Runtime ids are new. UUIDs, names, parents, and payloads are not.
@@ -360,8 +371,15 @@ impl LevelDocument {
 
     /// Same as [`Self::instantiate`], resolving `scheme: jarvig.asset` from `assets`.
     pub fn instantiate_with(&self, assets: &crate::MeshAssetLibrary) -> Result<SceneWorld, LevelError> {
+        self.instantiate_with_experiment(assets, false)
+    }
+
+    /// Same as [`Self::instantiate_with`]. `intent_authority_experiment` is runtime state on the
+    /// world. It is not a field of the level file. The default path passes false.
+    pub fn instantiate_with_experiment(&self, assets: &crate::MeshAssetLibrary, intent_authority_experiment: bool) -> Result<SceneWorld, LevelError> {
         self.validate()?;
         let mut world = SceneWorld::new_session();
+        world.set_intent_authority_experiment(intent_authority_experiment);
         world.install_imported_meshes(assets);
         let mut remaining: Vec<&EntityRecord> = self.entities.iter().collect();
         let mut guard = remaining.len() + 1;
@@ -384,6 +402,7 @@ impl LevelDocument {
         if let Some(camera) = self.world_settings.startup_camera {
             world.set_startup_camera(Some(camera)).map_err(authoring)?;
         }
+        world.install_organization(self.organization.clone());
         Ok(world)
     }
 
@@ -395,6 +414,9 @@ impl LevelDocument {
                 settings = Some(record);
             }
             entities.push(capture_entity(world, row.uuid)?);
+        }
+        if world.intent_authority_experiment() {
+            omit_eligible_bodies(&mut entities);
         }
         let world_settings = settings.ok_or(LevelError::MissingWorldSettings)?;
         let has_block = entities.iter().any(|entity| entity.components.iter().any(|component| matches!(component, ComponentRecord::ParametricBlock(_))));
@@ -415,7 +437,8 @@ impl LevelDocument {
         } else {
             LEVEL_FORMAT_VERSION
         };
-        let document = Self { format_version, level_uuid, name: name.into(), world_settings, entities };
+        let organization = world.organization().clone();
+        let document = Self { format_version, level_uuid, name: name.into(), world_settings, entities, organization };
         document.validate()?;
         Ok(document)
     }
@@ -695,7 +718,7 @@ impl ComponentRecord {
             Self::ParametricBlock(block) => {
                 let mut fields = vec![
                     ("type", Json::string("ParametricBlock")),
-                    ("version", Json::int(1)),
+                    ("version", Json::int(parametric_component_version(block))),
                     ("size_m", Json::array(block.size_m.iter().copied().map(Json::number).collect())),
                     ("material", block.material.to_json()),
                 ];
@@ -704,8 +727,32 @@ impl ComponentRecord {
                     fields.push(("bevel_m", Json::number(block.bevel_m)));
                     fields.push(("history", block_history_json(&block.history)));
                 }
+                if !block.history.is_empty() || block.has_authored_seed() {
+                    if let Some(seed) = block.seed_size_m {
+                        fields.push(("seed_size_m", Json::array(seed.iter().copied().map(Json::number).collect())));
+                    }
+                }
+                if !block.steps.is_empty() {
+                    fields.push(("steps", block_steps_json(&block.steps)));
+                    fields.push(("next_step", Json::int(block.next_step as i64)));
+                }
+                if !block.intent.is_empty() {
+                    fields.push(("intent", block_intent_json(&block.intent)));
+                }
                 if let Some(body) = &block.body {
                     fields.push(("body", solid_body_json(body)));
+                }
+                if !block.materials.is_empty() {
+                    fields.push(("materials", Json::array(block.materials.iter().map(MaterialAssetRef::to_json).collect())));
+                }
+                if !block.face_materials.is_empty() {
+                    fields.push(("face_materials", Json::array(block.face_materials.iter().map(face_material_json).collect())));
+                }
+                if !block.surface_groups.is_empty() {
+                    fields.push(("surface_groups", Json::array(block.surface_groups.iter().map(surface_group_json).collect())));
+                }
+                if block.next_surface_group != 1 {
+                    fields.push(("next_surface_group", Json::int(i64::from(block.next_surface_group))));
                 }
                 Json::object(fields)
             }
@@ -756,12 +803,35 @@ pub fn parse_level(text: &str) -> Result<LevelDocument, LevelError> {
     for entity in entities_json {
         entities.push(parse_entity(entity)?);
     }
-    let document = LevelDocument { format_version, level_uuid, name, world_settings, entities };
+    let organization = match json.get("organization") {
+        None => crate::SceneOrganization::default(),
+        Some(value) => crate::SceneOrganization::from_json(value).map_err(LevelError::Corrupt)?,
+    };
+    let document = LevelDocument { format_version, level_uuid, name, world_settings, entities, organization };
     document.validate()?;
     Ok(document)
 }
 
+/// Drop the evaluated body of an eligible solid from a file capture.
+///
+/// The live record is not changed. Undo snapshots go through [`capture_entity`] and keep the
+/// body, because undo restores that record and does not replay the tape.
+fn omit_eligible_bodies(entities: &mut [EntityRecord]) {
+    for entity in entities {
+        for component in &mut entity.components {
+            if let ComponentRecord::ParametricBlock(block) = component {
+                if crate::semantic_shadow::intent_authority_eligibility(block) == crate::semantic_shadow::IntentAuthorityEligibility::Eligible {
+                    block.body = None;
+                }
+            }
+        }
+    }
+}
+
 /// One authored entity, in the same shape [`LevelDocument::capture`] writes.
+///
+/// This keeps an evaluated body. The experiment's file writer removes that body afterwards,
+/// and only for an eligible solid, in [`LevelDocument::capture`].
 pub fn capture_entity(world: &SceneWorld, id: EntityId) -> Result<EntityRecord, LevelError> {
     let outline = world.entity_outline();
     let row = outline.iter().find(|row| row.uuid == id).ok_or_else(|| LevelError::Corrupt("entity is not authored".into()))?;
@@ -1049,10 +1119,31 @@ fn parse_terrain(json: &Json) -> Result<crate::TerrainRecord, LevelError> {
     Ok(record)
 }
 
+fn parametric_component_version(block: &crate::BlockRecord) -> i64 {
+    if block.has_authored_seed() {
+        return 4;
+    }
+    let round = block.intent.iter().any(|entry| matches!(entry.payload, crate::IntentPayload::Round { .. }));
+    let analytic = block.intent.iter().any(|entry| matches!(entry.payload, crate::IntentPayload::AnalyticSurface { .. }));
+    if round && !analytic {
+        3
+    } else if analytic && !round {
+        2
+    } else if round && analytic {
+        0
+    } else {
+        1
+    }
+}
+
 fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
     let kind = required_str(json, "type")?;
     let version = required_u32(json, "version")?;
-    if version != 1 {
+    if kind == "ParametricBlock" {
+        if version != 1 && version != 2 && version != 3 && version != 4 {
+            return Err(LevelError::UnsupportedComponentVersion { component: "ParametricBlock", version, supported: "1, 2, 3, and 4" });
+        }
+    } else if version != 1 {
         return Err(LevelError::UnsupportedVersion(version));
     }
     match kind {
@@ -1094,19 +1185,51 @@ fn parse_component(json: &Json) -> Result<ComponentRecord, LevelError> {
                 Some(_) => return Err(LevelError::Corrupt("inset_m has the wrong width".into())),
             };
             let bevel_m = optional_f64(json, "bevel_m", 0.0)?;
-            let history = parse_block_history(json)?;
+            let mut history = parse_block_history(json)?;
+            let mut steps = parse_block_steps(json)?;
+            if history.len() > crate::BLOCK_HISTORY_LIMIT {
+                let extra = history.len() - crate::BLOCK_HISTORY_LIMIT;
+                let aligned = steps.len() == history.len();
+                history.drain(0..extra);
+                if aligned {
+                    steps.drain(0..extra);
+                }
+            }
+            let next_step = if steps.is_empty() {
+                1
+            } else if json.get("next_step").is_some() {
+                required_step_id(json, "next_step")?
+            } else {
+                steps.iter().map(|step| step.id.number()).max().unwrap_or(0).saturating_add(1).max(1)
+            };
             let body = match json.get("body") {
                 None => None,
                 Some(value) => Some(parse_solid_body(value)?),
             };
-            let block = crate::BlockRecord {
+            let seed_size_m = match optional_floats(json, "seed_size_m")? {
+                None => None,
+                Some(values) if values.len() == 3 => Some([values[0], values[1], values[2]]),
+                Some(_) => return Err(LevelError::Corrupt("seed_size_m has the wrong width".into())),
+            };
+            let surface_groups = parse_surface_groups(json)?;
+            let next_surface_group = parse_next_surface_group(json, &surface_groups)?;
+            let mut block = crate::BlockRecord {
                 size_m: [size[0], size[1], size[2]],
+                seed_size_m,
                 inset_m: inset,
                 bevel_m,
                 material,
                 history,
+                steps,
+                intent: parse_block_intent(json, version)?,
+                next_step,
                 body,
+                materials: parse_block_materials(json)?,
+                face_materials: parse_face_materials(json)?,
+                surface_groups,
+                next_surface_group,
             };
+            block.orphan_unbound();
             block.validate()?;
             Ok(ComponentRecord::ParametricBlock(block))
         }
@@ -1233,6 +1356,153 @@ fn parse_material(json: &Json) -> Result<MaterialAssetRef, LevelError> {
     Ok(material)
 }
 
+fn face_material_json(entry: &crate::FaceMaterialAssignment) -> Json {
+    let mut fields = Vec::new();
+    if let Some(face) = entry.face {
+        fields.push(("face", Json::int(i64::from(face))));
+    }
+    fields.push(("slot", Json::int(i64::from(entry.slot))));
+    if !entry.provenance.is_empty() {
+        fields.push(("provenance", Json::array(entry.provenance.iter().map(Json::string).collect())));
+    }
+    Json::object(fields)
+}
+
+fn parse_block_materials(json: &Json) -> Result<Vec<MaterialAssetRef>, LevelError> {
+    match json.get("materials") {
+        None => Ok(Vec::new()),
+        Some(Json::Array(values)) => {
+            let mut materials = Vec::new();
+            for value in values {
+                materials.push(parse_material(value)?);
+            }
+            Ok(materials)
+        }
+        Some(_) => Err(LevelError::Corrupt("block material slots exceed 16".into())),
+    }
+}
+
+fn parse_face_materials(json: &Json) -> Result<Vec<crate::FaceMaterialAssignment>, LevelError> {
+    match json.get("face_materials") {
+        None => Ok(Vec::new()),
+        Some(Json::Array(values)) => {
+            let mut assignments = Vec::new();
+            for value in values {
+                assignments.push(parse_face_material(value)?);
+            }
+            Ok(assignments)
+        }
+        Some(_) => Err(LevelError::Corrupt("block face material id is zero or repeated".into())),
+    }
+}
+
+fn parse_face_material(json: &Json) -> Result<crate::FaceMaterialAssignment, LevelError> {
+    let face = match json.get("face") {
+        None | Some(Json::Null) => None,
+        Some(_) => Some(required_u32(json, "face")?),
+    };
+    let slot = required_u32(json, "slot")?;
+    let provenance = match json.get("provenance") {
+        None => Vec::new(),
+        Some(Json::Array(values)) => {
+            let mut names = Vec::new();
+            for value in values {
+                let token = value.as_str().ok_or_else(|| LevelError::Corrupt("block face provenance is not a semantic reference".into()))?;
+                names.push(token.to_string());
+            }
+            names
+        }
+        Some(_) => return Err(LevelError::Corrupt("block face provenance is not a semantic reference".into())),
+    };
+    Ok(crate::FaceMaterialAssignment { face, slot, provenance })
+}
+
+fn surface_group_json(group: &crate::SurfaceGroup) -> Json {
+    Json::object(vec![
+        ("id", Json::int(i64::from(group.id))),
+        ("name", Json::string(&group.name)),
+        ("slot", Json::int(i64::from(group.slot))),
+        ("members", Json::array(group.members.iter().map(surface_member_json).collect())),
+    ])
+}
+
+fn surface_member_json(member: &crate::SurfaceMember) -> Json {
+    let mut fields = Vec::new();
+    if let Some(face) = member.face {
+        fields.push(("face", Json::int(i64::from(face))));
+    }
+    if !member.provenance.is_empty() {
+        fields.push(("provenance", Json::array(member.provenance.iter().map(Json::string).collect())));
+    }
+    Json::object(fields)
+}
+
+fn parse_surface_groups(json: &Json) -> Result<Vec<crate::SurfaceGroup>, LevelError> {
+    match json.get("surface_groups") {
+        None => Ok(Vec::new()),
+        Some(Json::Array(values)) => {
+            let mut groups = Vec::new();
+            for value in values {
+                groups.push(parse_surface_group(value)?);
+            }
+            Ok(groups)
+        }
+        Some(_) => Err(LevelError::Corrupt("block surface group id is zero or repeated".into())),
+    }
+}
+
+fn parse_surface_group(json: &Json) -> Result<crate::SurfaceGroup, LevelError> {
+    let id = required_u32(json, "id")?;
+    let name = required_str(json, "name")?.to_string();
+    let slot = required_u32(json, "slot")?;
+    let members = match json.get("members") {
+        None => Vec::new(),
+        Some(Json::Array(values)) => {
+            let mut members = Vec::new();
+            for value in values {
+                members.push(parse_surface_member(value)?);
+            }
+            members
+        }
+        Some(_) => return Err(LevelError::Corrupt("block surface group face is zero or repeated".into())),
+    };
+    Ok(crate::SurfaceGroup { id, name, slot, members })
+}
+
+fn parse_surface_member(json: &Json) -> Result<crate::SurfaceMember, LevelError> {
+    let face = match json.get("face") {
+        None | Some(Json::Null) => None,
+        Some(_) => Some(required_u32(json, "face")?),
+    };
+    let provenance = match json.get("provenance") {
+        None => Vec::new(),
+        Some(Json::Array(values)) => {
+            let mut names = Vec::new();
+            for value in values {
+                let token = value.as_str().ok_or_else(|| LevelError::Corrupt("block surface group provenance is not a semantic reference".into()))?;
+                names.push(token.to_string());
+            }
+            names
+        }
+        Some(_) => return Err(LevelError::Corrupt("block surface group provenance is not a semantic reference".into())),
+    };
+    Ok(crate::SurfaceMember { face, provenance })
+}
+
+fn parse_next_surface_group(json: &Json, groups: &[crate::SurfaceGroup]) -> Result<u32, LevelError> {
+    match json.get("next_surface_group") {
+        None => Ok(groups.iter().map(|group| group.id).max().unwrap_or(0).saturating_add(1).max(1)),
+        Some(_) => {
+            let next = required_u32(json, "next_surface_group")?;
+            if next == 0 || groups.iter().any(|group| group.id >= next) {
+                Err(LevelError::Corrupt("block surface group counter is behind its groups".into()))
+            } else {
+                Ok(next)
+            }
+        }
+    }
+}
+
 fn parse_policy(text: &str) -> Result<ProbeUpdatePolicy, LevelError> {
     Ok(match text {
         "static" => ProbeUpdatePolicy::Static,
@@ -1325,6 +1595,11 @@ fn block_history_json(history: &[crate::BlockOp]) -> Json {
                     ("faces", Json::array(faces.iter().copied().map(|id| Json::int(id as i64)).collect())),
                     ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
                 ]),
+                crate::BlockOp::BevelEdges { edges, distance_m } => Json::object(vec![
+                    ("op", Json::string("bevel-edges")),
+                    ("edges", Json::array(edges.iter().copied().map(|id| Json::int(id as i64)).collect())),
+                    ("distance_m", Json::number(*distance_m)),
+                ]),
             })
             .collect(),
     )
@@ -1357,15 +1632,306 @@ fn parse_block_history(json: &Json) -> Result<Vec<crate::BlockOp>, LevelError> {
             },
             "move-vertex" => crate::BlockOp::MoveVertex { vertex: nonzero_u32(entry, "vertex")?, delta_m: required_delta(entry)? },
             "extrude-faces" => crate::BlockOp::ExtrudeFaces { faces: required_face_ids(entry)?, delta_m: required_delta(entry)? },
+            "bevel-edges" => crate::BlockOp::BevelEdges { edges: required_edge_ids(entry)?, distance_m: required_f64(entry, "distance_m")? },
             other => return Err(LevelError::Corrupt(format!("unknown block edit {other}"))),
         };
         history.push(op);
     }
-    if history.len() > crate::BLOCK_HISTORY_LIMIT {
-        let extra = history.len() - crate::BLOCK_HISTORY_LIMIT;
-        history.drain(0..extra);
-    }
     Ok(history)
+}
+
+fn block_steps_json(steps: &[crate::GeometryStep]) -> Json {
+    Json::array(
+        steps
+            .iter()
+            .map(|step| {
+                let mut fields = vec![
+                    ("id", Json::int(step.id.number() as i64)),
+                    (
+                        "concrete",
+                        Json::array(
+                            step.concrete
+                                .iter()
+                                .map(|element| {
+                                    Json::object(vec![
+                                        ("kind", Json::string(element.kind_name())),
+                                        ("id", Json::int(element.body_id() as i64)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ];
+                if let Some(groups) = &step.semantic {
+                    fields.push((
+                        "semantic",
+                        Json::array(
+                            groups
+                                .iter()
+                                .map(|group| Json::array(group.iter().cloned().map(Json::string).collect()))
+                                .collect(),
+                        ),
+                    ));
+                }
+                Json::object(fields)
+            })
+            .collect(),
+    )
+}
+
+fn parse_block_steps(json: &Json) -> Result<Vec<crate::GeometryStep>, LevelError> {
+    let Some(entries) = json.get("steps") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries.as_array().ok_or_else(|| LevelError::Corrupt("block steps are not a list".into()))?;
+    let mut steps = Vec::new();
+    for entry in entries {
+        let id = crate::SemanticStepId::from_raw(required_step_id(entry, "id")?).ok_or_else(|| LevelError::Corrupt("block step id is zero".into()))?;
+        let values = entry.get("concrete").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block step elements are missing".into()))?;
+        let mut concrete = Vec::new();
+        for element in values {
+            let kind = required_str(element, "kind")?;
+            let body_id = nonzero_u32(element, "id")?;
+            concrete.push(match kind {
+                "face" => crate::ConcreteElement::Face(body_id),
+                "edge" => crate::ConcreteElement::Edge(body_id),
+                "vertex" => crate::ConcreteElement::Vertex(body_id),
+                _ => return Err(LevelError::Corrupt("block step element is not a face, edge, or vertex".into())),
+            });
+        }
+        let semantic = match entry.get("semantic") {
+            None => None,
+            Some(value) => Some(parse_semantic_groups(value)?),
+        };
+        steps.push(crate::GeometryStep { id, concrete, semantic });
+    }
+    Ok(steps)
+}
+
+fn block_intent_json(entries: &[crate::IntentEntry]) -> Json {
+    Json::array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut fields = match &entry.payload {
+                    crate::IntentPayload::Size { size_m } => vec![
+                        ("op", Json::string("size")),
+                        ("size_m", Json::array(size_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::Subdivide { u, v } => {
+                        vec![("op", Json::string("subdivide")), ("u", Json::int(*u as i64)), ("v", Json::int(*v as i64))]
+                    }
+                    crate::IntentPayload::Extrude { delta_m } => vec![
+                        ("op", Json::string("extrude")),
+                        ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::Split => vec![("op", Json::string("split"))],
+                    crate::IntentPayload::Bevel { width_m } => vec![("op", Json::string("bevel")), ("width_m", Json::number(*width_m))],
+                    crate::IntentPayload::MoveEdge { delta_m } => vec![
+                        ("op", Json::string("move-edge")),
+                        ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::MoveVertex { delta_m } => vec![
+                        ("op", Json::string("move-vertex")),
+                        ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::ExtrudeEdge { delta_m } => vec![
+                        ("op", Json::string("extrude-edge")),
+                        ("delta_m", Json::array(delta_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::Mirror { axis } => vec![("op", Json::string("mirror")), ("axis", Json::int(*axis as i64))],
+                    crate::IntentPayload::PushFace { face, distance_m } => {
+                        vec![("op", Json::string("extrude-face")), ("face", Json::int(*face as i64)), ("distance_m", Json::number(*distance_m))]
+                    }
+                    crate::IntentPayload::Gap { operation } => vec![("op", Json::string("gap")), ("operation", Json::string(operation))],
+                    crate::IntentPayload::AnalyticSurface { identity, chart, domain_u, domain_v, radius_m, translation_m } => vec![
+                        ("op", Json::string("analytic-surface")),
+                        ("identity", Json::string(identity)),
+                        ("chart", Json::string(chart)),
+                        ("domain_u", Json::array(domain_u.iter().copied().map(Json::number).collect())),
+                        ("domain_v", Json::array(domain_v.iter().copied().map(Json::number).collect())),
+                        ("radius_m", Json::number(*radius_m)),
+                        ("translation_m", Json::array(translation_m.iter().copied().map(Json::number).collect())),
+                    ],
+                    crate::IntentPayload::Round { radius_m } => vec![("op", Json::string("round")), ("radius_m", Json::number(*radius_m))],
+                    crate::IntentPayload::Seed => vec![("op", Json::string("seed"))],
+                };
+                if let Some(groups) = &entry.groups {
+                    fields.push((
+                        "groups",
+                        Json::array(groups.iter().map(|group| Json::array(group.iter().cloned().map(Json::string).collect())).collect()),
+                    ));
+                }
+                Json::object(fields)
+            })
+            .collect(),
+    )
+}
+
+fn parse_block_intent(json: &Json, component_version: u32) -> Result<Vec<crate::IntentEntry>, LevelError> {
+    let Some(entries) = json.get("intent") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries.as_array().ok_or_else(|| LevelError::Corrupt("block intent is not a list".into()))?;
+    let mut intent = Vec::new();
+    for entry in entries {
+        let op = required_str(entry, "op")?;
+        if op == "analytic-surface" && component_version != 2 {
+            let detail = if component_version == 3 {
+                "ParametricBlock version 3 cannot store analytic-surface; that operation requires ParametricBlock version 2".to_string()
+            } else {
+                format!("ParametricBlock version {component_version} cannot store analytic-surface; that operation requires ParametricBlock version 2")
+            };
+            return Err(LevelError::Corrupt(detail));
+        }
+        if op == "seed" && component_version != 4 {
+            return Err(LevelError::Corrupt(format!(
+                "ParametricBlock version {component_version} cannot store seed; that operation requires ParametricBlock version 4"
+            )));
+        }
+        if op == "seed" && entry.get("groups").is_some() {
+            return Err(LevelError::Corrupt("seed does not store a semantic group".into()));
+        }
+        if op == "analytic-surface" && entry.get("groups").is_some() {
+            return Err(LevelError::Corrupt("analytic-surface does not store a semantic face group".into()));
+        }
+        if op == "round" && component_version != 3 && component_version != 4 {
+            return Err(LevelError::Corrupt(format!(
+                "ParametricBlock version {component_version} cannot store round; that operation requires ParametricBlock version 3 or 4"
+            )));
+        }
+        let groups = match entry.get("groups") {
+            None => None,
+            Some(value) => Some(parse_semantic_groups(value)?),
+        };
+        let payload = match op {
+            "size" => {
+                let size = required_floats(entry, "size_m", 3)?;
+                crate::IntentPayload::Size { size_m: [size[0], size[1], size[2]] }
+            }
+            "subdivide" => crate::IntentPayload::Subdivide { u: required_u32(entry, "u")?, v: required_u32(entry, "v")? },
+            "extrude" => {
+                let delta = required_floats(entry, "delta_m", 3)?;
+                crate::IntentPayload::Extrude { delta_m: [delta[0], delta[1], delta[2]] }
+            }
+            "split" => crate::IntentPayload::Split,
+            "bevel" => crate::IntentPayload::Bevel { width_m: required_f64(entry, "width_m")? },
+            "move-edge" => {
+                let delta = required_floats(entry, "delta_m", 3)?;
+                crate::IntentPayload::MoveEdge { delta_m: [delta[0], delta[1], delta[2]] }
+            }
+            "move-vertex" => {
+                let delta = required_floats(entry, "delta_m", 3)?;
+                crate::IntentPayload::MoveVertex { delta_m: [delta[0], delta[1], delta[2]] }
+            }
+            "extrude-edge" => {
+                let delta = required_floats(entry, "delta_m", 3)?;
+                crate::IntentPayload::ExtrudeEdge { delta_m: [delta[0], delta[1], delta[2]] }
+            }
+            "mirror" => {
+                let axis = required_u32(entry, "axis")?;
+                if axis > 2 {
+                    return Err(LevelError::Corrupt("block intent mirror axis is not 0, 1, or 2".into()));
+                }
+                crate::IntentPayload::Mirror { axis: axis as u8 }
+            }
+            "extrude-face" => {
+                let face = required_u32(entry, "face")?;
+                if face > 5 {
+                    return Err(LevelError::Corrupt("block intent face is not a constructor face".into()));
+                }
+                crate::IntentPayload::PushFace { face: face as u8, distance_m: required_f64(entry, "distance_m")? }
+            }
+            "gap" => {
+                let operation = required_str(entry, "operation")?;
+                if operation.is_empty() {
+                    return Err(LevelError::Corrupt("block intent gap names no operation".into()));
+                }
+                crate::IntentPayload::Gap { operation: operation.to_string() }
+            }
+            "analytic-surface" => parse_analytic_surface(entry)?,
+            "round" => parse_round(entry)?,
+            "seed" => {
+                if groups.is_some() {
+                    return Err(LevelError::Corrupt("block intent seed does not name an element".into()));
+                }
+                crate::IntentPayload::Seed
+            }
+            other => return Err(LevelError::Corrupt(format!("unknown block intent operation {other}"))),
+        };
+        intent.push(crate::IntentEntry { groups, payload });
+    }
+    Ok(intent)
+}
+
+fn parse_analytic_surface(entry: &Json) -> Result<crate::IntentPayload, LevelError> {
+    if let Json::Object(fields) = entry {
+        for (key, _) in fields {
+            if !matches!(key.as_str(), "op" | "identity" | "chart" | "domain_u" | "domain_v" | "radius_m" | "translation_m") {
+                return Err(LevelError::Corrupt(format!("analytic-surface stores a field this record does not define ({key})")));
+            }
+        }
+    }
+    let identity = required_str(entry, "identity")?;
+    if identity.is_empty() {
+        return Err(LevelError::Corrupt("block intent analytic surface has no identity".into()));
+    }
+    let chart = required_str(entry, "chart")?;
+    let domain_u = required_floats(entry, "domain_u", 2)?;
+    let domain_v = required_floats(entry, "domain_v", 2)?;
+    let translation = required_floats(entry, "translation_m", 3)?;
+    Ok(crate::IntentPayload::AnalyticSurface {
+        identity: identity.to_string(),
+        chart: chart.to_string(),
+        domain_u: [domain_u[0], domain_u[1]],
+        domain_v: [domain_v[0], domain_v[1]],
+        radius_m: required_f64(entry, "radius_m")?,
+        translation_m: [translation[0], translation[1], translation[2]],
+    })
+}
+
+fn parse_round(entry: &Json) -> Result<crate::IntentPayload, LevelError> {
+    if let Json::Object(fields) = entry {
+        for (key, _) in fields {
+            if !matches!(key.as_str(), "op" | "radius_m" | "groups") {
+                return Err(LevelError::Corrupt(format!("round stores a field this record does not define ({key})")));
+            }
+        }
+    }
+    let radius_m = required_f64(entry, "radius_m")?;
+    if !radius_m.is_finite() || radius_m <= 0.0 {
+        return Err(LevelError::Corrupt("block intent round radius is not a positive finite length".into()));
+    }
+    let groups = entry.get("groups").ok_or_else(|| LevelError::Corrupt("block intent round does not name a semantic edge".into()))?;
+    let groups = parse_semantic_groups(groups)?;
+    if crate::round_intent::round_group_tokens(Some(&groups)).is_err() {
+        return Err(LevelError::Corrupt("block intent round does not name a semantic edge".into()));
+    }
+    Ok(crate::IntentPayload::Round { radius_m })
+}
+
+fn parse_semantic_groups(value: &Json) -> Result<Vec<Vec<String>>, LevelError> {
+    let groups = value.as_array().ok_or_else(|| LevelError::Corrupt("block step semantic references are not a list".into()))?;
+    let mut parsed = Vec::new();
+    for group in groups {
+        let tokens = group.as_array().ok_or_else(|| LevelError::Corrupt("block step semantic group is not a list".into()))?;
+        let mut names = Vec::new();
+        for token in tokens {
+            let text = token.as_str().ok_or_else(|| LevelError::Corrupt("block step semantic reference is not text".into()))?;
+            crate::semantic_shadow::semantic_reference_token(text).map_err(|detail| LevelError::Corrupt(format!("block step semantic reference is not usable ({detail})")))?;
+            names.push(text.to_string());
+        }
+        parsed.push(names);
+    }
+    Ok(parsed)
+}
+
+fn required_step_id(json: &Json, key: &str) -> Result<u64, LevelError> {
+    let value = required_f64(json, key)?;
+    if value.fract() != 0.0 || value < 1.0 || value > i64::MAX as f64 {
+        return Err(LevelError::Corrupt(format!("{key} is not a step id")));
+    }
+    Ok(value as u64)
 }
 
 fn topology_delta_json(op: &str, key: &str, id: u32, delta_m: [f64; 3]) -> Json {
@@ -1474,6 +2040,22 @@ fn nonzero_u32(json: &Json, key: &str) -> Result<u32, LevelError> {
         return Err(LevelError::Corrupt("block element id is zero".into()));
     }
     Ok(value)
+}
+
+fn required_edge_ids(json: &Json) -> Result<Vec<u32>, LevelError> {
+    let values = json.get("edges").and_then(Json::as_array).ok_or_else(|| LevelError::Corrupt("block edges are missing".into()))?;
+    if values.is_empty() {
+        return Err(LevelError::Corrupt("block edges are empty".into()));
+    }
+    let mut edges = Vec::new();
+    for value in values {
+        let id = json_u32(value, "edge")?;
+        if id == 0 || edges.contains(&id) {
+            return Err(LevelError::Corrupt("block edge id is repeated or zero".into()));
+        }
+        edges.push(id);
+    }
+    Ok(edges)
 }
 
 fn required_face_ids(json: &Json) -> Result<Vec<u32>, LevelError> {
@@ -1663,6 +2245,7 @@ pub fn empty_world_level() -> LevelDocument {
             parent_uuid: None,
             components: vec![ComponentRecord::WorldSettings],
         }],
+        organization: crate::SceneOrganization::default(),
     }
 }
 
@@ -1686,6 +2269,7 @@ pub fn lighting_lab_level() -> LevelDocument {
             probe_update_policy: ProbeUpdatePolicy::Static,
             startup_camera: None,
         },
+        organization: crate::SceneOrganization::default(),
         entities: vec![
             EntityRecord {
                 uuid: settings_id,

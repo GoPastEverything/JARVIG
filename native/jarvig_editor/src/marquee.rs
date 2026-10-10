@@ -21,11 +21,13 @@ pub struct MarqueeDrag {
     pub shift: bool,
     pub ctrl: bool,
     pub moved: bool,
+    /// Face, edge, or vertex box. An object marquee leaves this false.
+    pub elements: bool,
 }
 
 impl MarqueeDrag {
     pub fn new(x: f64, y: f64, shift: bool, ctrl: bool) -> Self {
-        Self { origin_x: x, origin_y: y, x, y, shift, ctrl, moved: false }
+        Self { origin_x: x, origin_y: y, x, y, shift, ctrl, moved: false, elements: false }
     }
 
     pub fn update(&mut self, x: f64, y: f64) {
@@ -93,6 +95,30 @@ pub fn selection_hits(kind: MarqueeKind, rect: ScreenRect, corners: &[ProjectedC
     }
 }
 
+/// Authored element points. A vertex is one point, an edge is its endpoints, and a face is its vertex loop.
+///
+/// Window selection needs every point in front and inside. Crossing selection uses the front bounds.
+/// The point count is the element's, not the eight corners of an object box.
+pub fn element_hits(kind: MarqueeKind, rect: ScreenRect, points: &[ProjectedCorner]) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    match kind {
+        MarqueeKind::Window => points.iter().all(|point| point.in_front && rect.contains(point.x, point.y)),
+        MarqueeKind::Crossing => {
+            let front: Vec<_> = points.iter().copied().filter(|point| point.in_front).collect();
+            if front.is_empty() {
+                return false;
+            }
+            let min_x = front.iter().map(|point| point.x).fold(f64::INFINITY, f64::min);
+            let min_y = front.iter().map(|point| point.y).fold(f64::INFINITY, f64::min);
+            let max_x = front.iter().map(|point| point.x).fold(f64::NEG_INFINITY, f64::max);
+            let max_y = front.iter().map(|point| point.y).fold(f64::NEG_INFINITY, f64::max);
+            rect.overlaps(min_x, min_y, max_x, max_y)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +158,16 @@ mod tests {
         let all_behind: Vec<_> = cube().into_iter().map(|mut corner| { corner.in_front = false; corner }).collect();
         assert!(!selection_hits(MarqueeKind::Crossing, enclosed, &all_behind));
         assert!(!selection_hits(MarqueeKind::Window, enclosed, &cube()[..7]));
+        let face = vec![corner(0.0, 0.0, true), corner(10.0, 0.0, true), corner(0.0, 10.0, true)];
+        let tight = ScreenRect::from_drag(0.0, 0.0, 10.0, 10.0);
+        assert!(element_hits(MarqueeKind::Window, tight, &face));
+        assert!(element_hits(MarqueeKind::Window, tight, &face[..1]));
+        assert!(!element_hits(MarqueeKind::Window, ScreenRect::from_drag(1.0, 1.0, 4.0, 4.0), &face));
+        assert!(element_hits(MarqueeKind::Crossing, ScreenRect::from_drag(8.0, 8.0, 12.0, 12.0), &face));
+        let mut behind = face.clone();
+        behind[0].in_front = false;
+        assert!(!element_hits(MarqueeKind::Window, tight, &behind));
+        assert!(!element_hits(MarqueeKind::Window, tight, &[]));
+        assert!(!element_hits(MarqueeKind::Crossing, tight, &[]));
     }
 }

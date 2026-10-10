@@ -357,18 +357,20 @@ fn push_number(out: &mut String, value: f64) {
         out.push_str(&format!("{}", value as i64));
         return;
     }
-    // Authored floats are f32 factors stored in f64. Print the f32 text when that is exact.
+    // f32 factors stored in f64 keep the short spelling when that spelling is the same f64.
+    // A shorter f32 spelling that parses as a different f64 would move a saved coordinate.
     let narrow = value as f32;
     if (narrow as f64) == value {
-        out.push_str(&format!("{narrow}"));
-        return;
+        let narrow_text = format!("{narrow}");
+        if narrow_text.parse::<f64>().ok() == Some(value) {
+            out.push_str(&narrow_text);
+            return;
+        }
     }
     out.push_str(&format!("{value}"));
 }
 
-/// The f64 this writer will read back. Exact f32 values often print as a shorter
-/// spelling, and that spelling is a different f64. Callers that compare a parsed
-/// document with `PartialEq` store this value.
+/// The f64 this writer will read back. The spelling parses as the same value.
 pub(crate) fn round_trip_number(value: f64) -> f64 {
     let mut text = String::new();
     push_number(&mut text, value);
@@ -413,11 +415,14 @@ mod tests {
     fn round_trip_number_is_stable_for_exact_f32_values() {
         for bits in [0xbe40000000000000_u64, 0x3feecf1180000000, 0xc000305160000000] {
             let value = f64::from_bits(bits);
-            let once = round_trip_number(value);
-            assert_eq!(round_trip_number(once), once);
-            let text = Json::number(once).write();
-            assert_eq!(parse_json(&text).expect("number"), Json::number(once), "{text}");
+            assert_eq!(round_trip_number(value), value, "{bits:x}");
+            let text = Json::number(value).write();
+            assert_eq!(parse_json(&text).expect("number"), Json::number(value), "{text}");
         }
+        let coordinate = -3.0 - 29.0 / 256.0;
+        assert_eq!(coordinate as f32 as f64, coordinate);
+        assert_eq!(round_trip_number(coordinate), coordinate);
+        assert_eq!(round_trip_number(0.04), 0.04);
         assert_eq!(Json::number(1.5).write().trim(), "1.5");
         assert_eq!(Json::number(100.0).write().trim(), "100");
     }

@@ -18,7 +18,7 @@ Build the site from the repository root:
 pwsh -File scripts\build-docs.ps1
 ```
 
-Open `docs/site/index.html`. That folder is the rendered copy of these pages. Rebuild it with the command above. Session logs stay in `docs/status/` and are not part of the site. The private surface rule for procedural detail is not taught here.
+Open `docs/site/index.html`. Rebuild that folder with the command above. It is a reader, not a second authority. Session logs stay in `docs/status/` on disk and are not part of the site. The private surface rule for procedural detail is not taught here.
 
 ## Start here
 
@@ -26,7 +26,7 @@ Open `docs/site/index.html`. That folder is the rendered copy of these pages. Re
 | --- | --- |
 | Build the editor and place the first block | [Your first hour](../getting-started.md) |
 | Camera, selection, undo, panels | [The editor](editor.md) |
-| Extrude, inset, bevel | [Blocks](modeling.md) |
+| Extrude, round, inset, and bevel | [Blocks](modeling.md) |
 | glTF import and the content browser | [Models and content](content.md) |
 | Level, Land, and Character | [Worlds](worlds.md) |
 | Environment, lights, and debug views | [Lighting](lighting.md) |

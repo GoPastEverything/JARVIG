@@ -148,6 +148,39 @@ pub fn ray_plane(ray_origin: Vec3, ray_direction: Vec3, point: Vec3, normal: Vec
     }
 }
 
+/// Screen direction that increases a round, and meters of crown motion per pixel along it.
+///
+/// `ahead_px` is the crown after `sample_m` along the crown. When that step is shorter
+/// than a few pixels, the crown points at the camera and the edge supplies the axis.
+pub fn round_screen_scale(crown_px: (f64, f64), ahead_px: Option<(f64, f64)>, edge_px: Option<(f64, f64)>, sample_m: f64, world_per_pixel: f64) -> (f64, f64, f64) {
+    let sample = if sample_m.is_finite() && sample_m > 1.0e-6 { sample_m } else { 0.05 };
+    let fallback = if world_per_pixel.is_finite() && world_per_pixel > 1.0e-6 { world_per_pixel } else { 0.01 };
+    let Some((ax, ay)) = ahead_px else {
+        return (0.0, -1.0, fallback);
+    };
+    let dx = ax - crown_px.0;
+    let dy = ay - crown_px.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len >= 3.0 && len.is_finite() {
+        return (dx / len, dy / len, sample / len);
+    }
+    if let Some((ex, ey)) = edge_px {
+        let edx = ex - crown_px.0;
+        let edy = ey - crown_px.1;
+        let elen = (edx * edx + edy * edy).sqrt();
+        if elen >= 3.0 && elen.is_finite() {
+            let mut sx = -edy / elen;
+            let mut sy = edx / elen;
+            if sx * dx + sy * dy < 0.0 {
+                sx = -sx;
+                sy = -sy;
+            }
+            return (sx, sy, fallback);
+        }
+    }
+    (0.0, -1.0, fallback)
+}
+
 pub fn rotation_angle(origin: Vec3, axis: Vec3, start: Vec3, current: Vec3) -> Option<f64> {
     let axis = normalize(axis)?;
     let start = project_plane(sub(start, origin), axis)?;
@@ -529,6 +562,18 @@ mod tests {
             original_world_rotation: Quat::IDENTITY,
             start_hit: Vec3::new(1.0e9, 2.0, -4.0),
         }
+    }
+
+    #[test]
+    fn round_screen_scale_tracks_the_crown_and_a_view_along_it() {
+        let (sx, sy, meters) = round_screen_scale((100.0, 200.0), Some((110.0, 200.0)), None, 0.05, 0.01);
+        assert!((sx - 1.0).abs() < 1.0e-9);
+        assert!(sy.abs() < 1.0e-9);
+        assert!((meters - 0.005).abs() < 1.0e-9);
+        let (sx, sy, meters) = round_screen_scale((100.0, 200.0), Some((101.0, 200.0)), Some((100.0, 230.0)), 0.05, 0.012);
+        assert!((sx - 1.0).abs() < 1.0e-9);
+        assert!(sy.abs() < 1.0e-9);
+        assert!((meters - 0.012).abs() < 1.0e-9);
     }
 
     #[test]

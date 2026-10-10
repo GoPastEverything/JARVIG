@@ -69,15 +69,21 @@ Do not edit an Accepted ADR in place to change the decision. Write a new ADR and
 | [0059](ADR-0059-a-character-asset-is-not-a-player.md) | A character asset, a player definition, and a player start are different objects | Accepted. Empty character path clarified by 0060 |
 | [0060](ADR-0060-the-hub-chooses-a-project-before-the-editor.md) | The hub chooses a project before the editor starts | Accepted |
 | [0061](ADR-0061-virtual-geometry-defaults-on-microgeometry-stays-adaptive.md) | Virtual geometry defaults on. Microgeometry stays adaptive | Accepted |
-| [0062](ADR-0062-parametric-geometry-is-the-object.md) | A parametric solid is the object. Meshlets and Einstein are derived | Accepted. The size-only save sentence is superseded by 0066 |
+| [0062](ADR-0062-parametric-geometry-is-the-object.md) | A parametric solid is the object. Meshlets and Einstein are derived | Accepted. The size-only save sentence is superseded by 0066. The one-material-slot sentence is superseded by 0075 |
 | [0063](ADR-0063-render-residency-does-not-outlive-the-world.md) | A world's render residency does not outlive that world | Accepted. The empty-record sentence for a parametric solid is superseded by 0064 |
 | [0064](ADR-0064-a-parametric-solid-builds-its-clusters.md) | A parametric solid builds its clusters from the derived surface | Accepted. The close-view patch sentence for an exact solid is superseded by 0065. The size-only save sentence is superseded by 0066 |
 | [0065](ADR-0065-an-exact-parametric-solid-draws-no-relief.md) | An exact parametric solid is classified and draws no relief | Accepted. The size-only save sentence is superseded by 0066 |
 | [0066](ADR-0066-a-solid-keeps-its-parameters.md) | A solid keeps its parameters, and the inspector shows what it can do | Accepted. The permanent Modeling form and the mouse-up face commit are superseded by 0067 |
 | [0067](ADR-0067-a-modeling-operation-is-one-session.md) | A modeling operation is one session across the toolbar, the panel, and the viewport | Accepted. Mixing commands into Features is superseded by 0068. The mouse-up sentence is superseded by 0069 |
 | [0068](ADR-0068-selection-promotes-and-an-edit-is-one-transaction.md) | Selection promotes, and an edit is one transaction | Accepted. The sentence that Edge and Vertex are not shown is superseded by 0069 |
-| [0069](ADR-0069-direct-manipulation-commits-and-topology-is-the-solid.md) | Direct manipulation commits, and topology is the solid | Accepted. The analytic-extrude refusal is superseded for Extrude by 0070. Inset and Bevel stay refused |
-| [0070](ADR-0070-region-extrude-is-authored-topology.md) | Region extrude is authored topology, and the cage is the solid | Accepted |
+| [0069](ADR-0069-direct-manipulation-commits-and-topology-is-the-solid.md) | Direct manipulation commits, and topology is the solid | Accepted. The analytic-extrude refusal is superseded for Extrude by 0070. Inset stays refused. A uniform bevel stays refused. A bevel of selected edges is 0072 |
+| [0070](ADR-0070-region-extrude-is-authored-topology.md) | Region extrude is authored topology, and the cage is the solid | Accepted. The stored-body bevel refusal is superseded for selected edges by 0072. Inset and a uniform bevel stay refused |
 | [0071](ADR-0071-einstein-has-its-own-latency-queue.md) | Einstein surface builds have their own latency queue | Accepted |
+| [0072](ADR-0072-edge-bevel-is-authored-topology.md) | An edge bevel is authored topology | Accepted |
+| [0073](ADR-0073-geometry-truth-is-the-evaluated-body.md) | Geometry truth is the evaluated body | Accepted |
+| [0074](ADR-0074-intent-authority-for-eligible-solids.md) | Intent authority for eligible solids | Proposed |
+| [0075](ADR-0075-face-material-slots.md) | A face may name a material slot | Proposed |
+| [0076](ADR-0076-named-surface-groups.md) | A solid may name a surface group | Proposed |
+| [0077](ADR-0077-scene-organization.md) | A level may organize objects into folders | Proposed |
 
 RFCs are not in this list. See [../rfc/README.md](../rfc/README.md).

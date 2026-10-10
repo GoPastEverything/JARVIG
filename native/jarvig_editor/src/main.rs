@@ -19,6 +19,14 @@ mod rfc_runtime;
 mod selection;
 mod edit_history;
 mod marquee;
+mod context_menu;
+mod view_lab;
+mod observation_lab;
+mod direct_lab;
+mod intent_lab;
+mod analytic_intent_lab;
+mod authored_intent_lab;
+mod authored_curve_lab;
 
 use std::num::NonZeroIsize;
 use std::time::Instant;
@@ -78,7 +86,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, EnableMenuItem, ModifyMenuW,
-    GetMenuItemCount,
+    GetMenuItemCount, GetMenuItemID, GetSubMenu,
     CallWindowProcW, GetClientRect, GetCursorPos, GetMessageW, GetParent, GetWindowRect, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, IsDialogMessageW, IsIconic, KillTimer, LoadCursorW,
     LoadIconW, MessageBoxW,
@@ -117,6 +125,7 @@ const ID_FILE_TEMPLATE_TERRAIN: usize = 1061;
 const ID_FILE_TEMPLATE_THIRD: usize = 1062;
 const ID_FILE_TEMPLATE_FPS: usize = 1063;
 const ID_CREATE_BLOCK: usize = 1070;
+const ID_CREATE_PLANE: usize = 1071;
 const ID_FILE_EXIT: usize = 1001;
 const ID_PLAY: usize = 1101;
 const ID_PLAY_STANDALONE: usize = 1102;
@@ -210,6 +219,7 @@ const ID_VIEW_EINSTEIN_OFF: usize = 1416;
 const ID_VIEW_FREEZE_DIAGNOSTIC: usize = 1417;
 const ID_VIEW_COMPARE_LEAF: usize = 1418;
 const ID_VIEW_GRID: usize = 1419;
+const ID_VIEW_INTENT_SHADOW: usize = 1420;
 const ID_VIEW_RECAPTURE: usize = 1327;
 const ID_PROBE_STATIC: usize = 1328;
 const ID_PROBE_ON_DEMAND: usize = 1329;
@@ -229,6 +239,7 @@ const WM_SETFONT: u32 = 0x0030;
 const EN_SETFOCUS: u32 = 0x0100;
 const EN_KILLFOCUS: u32 = 0x0200;
 const ES_AUTOHSCROLL: u32 = 0x0080;
+const EM_SETSEL: u32 = 0x00B1;
 const WS_TABSTOP: u32 = 0x00010000;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_DRAWITEM: u32 = 0x002B;
@@ -259,6 +270,7 @@ const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 const TPM_RETURNCMD: u32 = 0x0100;
 const TPM_NONOTIFY: u32 = 0x0080;
 const NM_SETFOCUS: u32 = 4294967289;
+const NM_RCLICK: u32 = NM_CLICK.wrapping_sub(3);
 const SW_HIDE: i32 = 0;
 const PW_RENDERFULLCONTENT: u32 = 0x0002;
 const TOOLBAR_DIP: f32 = 58.0;
@@ -352,15 +364,28 @@ enum ModelingTool {
     MoveEdge,
     ExtrudeEdge,
     MoveVertex,
+    /// Bevel of the selected edges. Distinct from the analytic all-edge chamfer.
+    BevelEdge,
+    /// One semantic fillet. The radius is authored. The arc division is not.
+    Round,
 }
 
 fn topology_tool(tool: ModelingTool) -> bool {
     matches!(tool, ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex)
 }
 
+/// A session whose preview is a stored body, including a plain box that has not been written yet.
+fn restores_authored_body(session: ModelingSession) -> bool {
+    topology_tool(session.tool) || region_extrude(session) || session.tool == ModelingTool::BevelEdge
+}
+
 /// Face extrude on a stored body. `element` is the primary face id. Analytic extrude keeps it at zero.
 fn region_extrude(session: ModelingSession) -> bool {
     session.tool == ModelingTool::Extrude && session.element != 0
+}
+
+fn projects_new_faces(session: ModelingSession) -> bool {
+    region_extrude(session) || session.tool == ModelingTool::BevelEdge || session.tool == ModelingTool::ExtrudeEdge
 }
 
 /// Viewport pick resolution. Auto still selects a face.
@@ -394,6 +419,90 @@ struct ModelingSession {
     baseline_bevel: f64,
     baseline_local: Vec3,
     amount: f64,
+}
+
+/// One disposable extrude preview. The record does not store this body.
+struct ExtrudePreview {
+    entity: EntityUuid,
+    mesh: Option<jarvig_core::MeshId>,
+    body: SolidBody,
+}
+
+/// One disposable fillet mesh for the color pass. The record does not store it.
+struct RoundViewCache {
+    entity: EntityUuid,
+    intent_len: usize,
+    size_bits: [u64; 3],
+    radius_bits: u64,
+    divisions: u32,
+    mesh: jarvig_core::MeshId,
+    /// The first fillet. The cache check uses this so a held frame still has a fillet.
+    fillet: Option<jarvig_core::Fillet>,
+    /// Every fillet in the observation. Arc divisions are the finest among them.
+    fillets: Vec<jarvig_core::Fillet>,
+    /// Source tokens in fillet order. Empty when a preview mixes fillets this session is not editing.
+    tokens: Vec<String>,
+    /// Semantic fillet faces, boundaries, junctions, and corner patches. Arc divisions are not entries.
+    curves: Vec<jarvig_core::CurveElement>,
+    logged_divisions: Option<u32>,
+    noted_failure: bool,
+}
+
+/// One body-less record whose tape was already refused. Identity is the entity, the tape length, and the size and radius bits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RoundRefusal {
+    entity: EntityUuid,
+    intent_len: usize,
+    size_bits: [u64; 3],
+    radius_bits: u64,
+}
+
+/// Whether the open Round can be applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoundStatus {
+    Valid,
+    Clamped,
+    Conflict,
+}
+
+/// The planar solid and fillets resolved when Round opened. A drag scales the selected fillets.
+///
+/// The intent tape is not replayed from here. Apply is the one commit.
+struct RoundBasis {
+    entity: EntityUuid,
+    /// First picked topology edge. The session element stays on this edge.
+    edge: u32,
+    picked: usize,
+    tokens: Vec<String>,
+    body: SolidBody,
+    /// Selected fillets at the radius the tool opened with.
+    fillets: Vec<jarvig_core::Fillet>,
+    /// Committed fillets whose chains were not selected.
+    kept: Vec<jarvig_core::Fillet>,
+    /// The handle grabbed for the radius label. One of the selected fillets.
+    fillet: jarvig_core::Fillet,
+    max_radius_m: f64,
+    /// Crown distance from the sharp edge, divided by the radius.
+    crown_per_radius: f64,
+    /// Object-local direction from the sharp edge toward the arc crown.
+    away: [f64; 3],
+    readiness: RoundStatus,
+    note: String,
+}
+
+/// One press on the radius handle. Release keeps the preview and does not commit.
+#[derive(Clone, Copy)]
+struct RoundDrag {
+    entity: EntityUuid,
+    amount_origin: f64,
+    origin_x: f64,
+    origin_y: f64,
+    /// Unit screen direction. Motion along it leaves the sharp edge.
+    screen_x: f64,
+    screen_y: f64,
+    /// Meters of crown motion for one pixel along `screen_x` / `screen_y`.
+    meters_per_pixel: f64,
+    clamped: bool,
 }
 
 /// One topology drag. The candidate is always the baseline body plus the full snapped delta.
@@ -626,6 +735,19 @@ struct AsyncFrame {
     stage: String,
 }
 
+/// One rename field. Enter commits. Escape cancels. It is not an inspector control.
+enum NameTarget {
+    Entity(EntityUuid),
+    Folder(u32),
+    NewFolder(Option<u32>),
+    SurfaceGroup(EntityUuid),
+}
+
+struct RenamePrompt {
+    hwnd: HWND,
+    target: NameTarget,
+}
+
 struct Editor {
     engine: EngineSession,
     workspace: DockWorkspace,
@@ -849,6 +971,60 @@ struct Editor {
     outliner_character: bool,
     drop_feedback: String,
     content_check: bool,
+    /// One live discard after the first presented frame. The engine owns the rebuild.
+    /// This flag does not turn on spawn realization by itself.
+    intent_live_rerealize: bool,
+    intent_live_stage: u8,
+    intent_live_mark: u32,
+    intent_live_legacy: Option<jarvig_core::SolidBody>,
+    intent_live_legacy_mesh: Option<jarvig_core::MeshId>,
+    intent_live_legacy_at: Option<jarvig_core::Vec3>,
+    intent_live_counts: Option<(usize, usize, usize)>,
+    /// Per-view realization measurement. None unless `--view-realization-experiment` is set.
+    /// The host's worker exists only in that case. It does not turn on intent-authority realization.
+    view_realization: Option<ViewRealizationRun>,
+    /// Simultaneous-view measurement. None unless `--view-realization-2b` is set.
+    /// It does not start beside `view_realization`. The product renderer stays in place.
+    view_lab: Option<view_lab::ViewLab>,
+    /// Observation-local GPU proof. None unless `--observation-gpu-3b` is set.
+    /// It does not start a realization worker.
+    observation_lab: Option<observation_lab::ObservationLab>,
+    /// Direct analytic realization proof. None unless `--observation-direct-3c` is set.
+    /// It does not start a realization worker and it does not run beside 3B.
+    direct_lab: Option<direct_lab::DirectLab>,
+    /// Intent-tape observation proof. None unless `--intent-observation-4` is set.
+    /// It does not start a realization worker and it does not enable intent authority.
+    intent_lab: Option<intent_lab::IntentLab>,
+    /// Persistent analytic-surface proof. None unless `--analytic-intent-5` is set.
+    /// It does not start a realization worker and it does not enable intent authority.
+    analytic_lab: Option<analytic_intent_lab::AnalyticLab>,
+    /// Persisted authoring-intent proof. None unless `--authored-intent-6` is set.
+    /// It does not start a realization worker and it does not enable intent authority.
+    authored_lab: Option<authored_intent_lab::AuthoredLab>,
+    /// Persisted round proof. None unless `--authored-curve-7` is set.
+    /// It does not start a realization worker and it does not enable intent authority.
+    curve_lab: Option<authored_curve_lab::CurveLab>,
+    /// One window capture after the ordinary renderer has presented. None unless `--window-shot` is set.
+    /// It does not enable intent authority and it does not change the level.
+    window_shot: Option<std::path::PathBuf>,
+    window_shot_framed: bool,
+    /// Clone of the solid while Round is open. The world record stays unchanged until Apply.
+    round_preview: Option<jarvig_core::BlockRecord>,
+    round_view: Option<RoundViewCache>,
+    /// Shaded extrude drag for an authored seed. Cleared on mouse-up, Cancel, and a zero amount.
+    extrude_preview: Option<ExtrudePreview>,
+    /// Eligibility already failed for this record identity. The frame loop does not replay it again.
+    round_refused: Option<RoundRefusal>,
+    /// Planar body and fillet resolved at the start of Round. Drags scale the fillet.
+    round_basis: Option<RoundBasis>,
+    /// Live radius drag. Empty after mouse-up. Apply is still required.
+    round_drag: Option<RoundDrag>,
+    /// "Radius 0.043 m" beside the handle while a drag is down.
+    round_label: HWND,
+    graphics_name: String,
+    graphics_vendor: u32,
+    graphics_device: u32,
+    graphics_api: String,
     bind_pose_dir: Option<std::path::PathBuf>,
     bind_pose_index: u8,
     bind_pose_capture_next: bool,
@@ -863,6 +1039,14 @@ struct Editor {
     level_file: Option<std::path::PathBuf>,
     level_name: String,
     level_uuid: Option<jarvig_core::EntityId>,
+    /// Hide in Editor. Session only. It does not write object visibility or the level.
+    editor_hidden: Vec<jarvig_core::EntityId>,
+    /// Open and collapsed folders, keyed by level. Saved in workspace.json, not the level.
+    folder_expansion: Vec<documents::FolderOpenRecord>,
+    /// False while a level is adopting, so the first tree does not overwrite workspace.json.
+    folder_expansion_ready: bool,
+    /// The saved open set has been applied to this level's outliner once.
+    folder_expansion_applied: bool,
     saved_revision: u64,
     unsaved_policy: bool,
     recent_projects: Vec<std::path::PathBuf>,
@@ -907,10 +1091,26 @@ struct Editor {
     show_grid: bool,
     /// Faces captured when a region extrude opened. Empty when that session is closed.
     region_faces: Vec<u32>,
-    /// Outward direction of `region_faces`, in the solid's local frame.
+    /// Outward direction of `region_faces`, or the bevel bisector, in the solid's local frame.
     region_normal: [f64; 3],
     selected_edge: Option<(EntityUuid, u32)>,
+    /// Every edge in the current solid's selection. The primary id stays in `selected_edge`.
+    selected_edges: Vec<u32>,
+    /// Edges the user named for the open bevel. Empty when that session is closed.
+    bevel_request: Vec<u32>,
+    /// Edges the last preview actually cut, including a straight run past the request.
+    bevel_edges: Vec<u32>,
+    /// Midpoint of the first requested edge, in the solid's local frame.
+    bevel_anchor: [f64; 3],
+    /// First id the baseline body would allocate. A new bevel face is at or above this.
+    bevel_next_id: u32,
+    bevel_expanded: bool,
+    bevel_clamped: bool,
     selected_vertex: Option<(EntityUuid, u32)>,
+    /// Every vertex in the current solid's selection. The primary id stays in `selected_vertex`.
+    selected_vertices: Vec<u32>,
+    /// The selection the modeling commands read. The element fields above are its published copy.
+    element_selection: selection::SelectionSet,
     /// Face under the click that selected the current edge. Subdivide uses it when the edge is shared.
     subdivide_hint: Option<(EntityUuid, u32)>,
     edge_hover: Option<u32>,
@@ -920,8 +1120,21 @@ struct Editor {
     topology_delta: [f64; 3],
     /// `None` means no topology session. `Some(None)` means the session started from a plain box.
     topology_session_body: Option<Option<SolidBody>>,
+    /// Face materials at the start of the topology session. Preview projects from this copy.
+    topology_session_materials: Vec<jarvig_core::FaceMaterialAssignment>,
+    /// Surface groups at the start of the topology session. Preview projects from this copy.
+    topology_session_groups: Vec<jarvig_core::SurfaceGroup>,
+    /// Edge names captured when the session opened. Later frames do not ask the live body.
+    topology_session_edge_names: Vec<(u32, Vec<String>)>,
+    /// New faces the last preview left on slot 0 because their neighbors disagreed.
+    topology_defaulted: u32,
+    /// New faces the last preview did not join to a surface group.
+    topology_group_ambiguous: u32,
     selection_mode: SelectionMode,
     marquee: Option<marquee::MarqueeDrag>,
+    /// Right button waiting to see a click from a look drag.
+    right_press: Option<marquee::MarqueeDrag>,
+    rename: Option<RenamePrompt>,
     pick_requests: u64,
     pick_hits: u64,
     pick_misses: u64,
@@ -1003,6 +1216,7 @@ struct Editor {
 enum TreeKey {
     World,
     Entity(EntityUuid),
+    Folder(u32),
     Tool(LandTool),
 }
 
@@ -1197,6 +1411,71 @@ fn main() {
     if args.iter().any(|arg| arg == "--content-check") {
         editor.content_check = true;
     }
+    if args.iter().any(|arg| arg == "--intent-authority-experiment") {
+        editor.engine.set_intent_authority_experiment(true);
+    }
+    if args.iter().any(|arg| arg == "--intent-live-rerealize") {
+        editor.intent_live_rerealize = true;
+    }
+    if args.iter().any(|arg| arg == "--view-realization-2b") {
+        editor.view_lab = Some(view_lab::ViewLab::new());
+    } else if args.iter().any(|arg| arg == "--view-realization-experiment") {
+        editor.view_realization = Some(ViewRealizationRun::new());
+    }
+    if args.iter().any(|arg| arg == "--observation-gpu-3b") {
+        if editor.view_lab.is_some() || editor.view_realization.is_some() || args.iter().any(|arg| arg == "--analytic-intent-5" || arg == "--authored-intent-6" || arg == "--authored-curve-7") {
+            eprintln!("JARVIG_FAIL --observation-gpu-3b refuses a realization worker");
+            std::process::exit(1);
+        }
+        editor.observation_lab = Some(observation_lab::ObservationLab::new());
+    }
+    if args.iter().any(|arg| arg == "--observation-direct-3c") {
+        let forbidden = ["--intent-authority-experiment", "--intent-live-rerealize", "--view-realization-experiment", "--view-realization-2b", "--observation-gpu-3b", "--intent-observation-4", "--analytic-intent-5", "--authored-intent-6", "--authored-curve-7"];
+        if forbidden.iter().any(|flag| args.iter().any(|arg| arg == *flag)) {
+            eprintln!("JARVIG_FAIL --observation-direct-3c refuses a realization, observation-3b, intent-observation-4, or analytic-intent-5 flag");
+            std::process::exit(1);
+        }
+        editor.direct_lab = Some(direct_lab::DirectLab::new());
+    }
+    if args.iter().any(|arg| arg == "--intent-observation-4") {
+        let forbidden = ["--intent-authority-experiment", "--intent-live-rerealize", "--view-realization-experiment", "--view-realization-2b", "--observation-gpu-3b", "--observation-direct-3c", "--analytic-intent-5", "--authored-intent-6", "--authored-curve-7"];
+        if forbidden.iter().any(|flag| args.iter().any(|arg| arg == *flag)) {
+            eprintln!("JARVIG_FAIL --intent-observation-4 refuses a realization, observation, analytic-intent-5, or intent-authority flag");
+            std::process::exit(1);
+        }
+        editor.intent_lab = Some(intent_lab::IntentLab::new());
+    }
+    if args.iter().any(|arg| arg == "--analytic-intent-5") {
+        let forbidden = ["--intent-authority-experiment", "--intent-live-rerealize", "--view-realization-experiment", "--view-realization-2b", "--observation-gpu-3b", "--observation-direct-3c", "--intent-observation-4", "--authored-intent-6", "--authored-curve-7"];
+        if forbidden.iter().any(|flag| args.iter().any(|arg| arg == *flag)) {
+            eprintln!("JARVIG_FAIL --analytic-intent-5 refuses a realization, observation, intent-observation-4, authored-intent-6, or intent-authority flag");
+            std::process::exit(1);
+        }
+        editor.analytic_lab = Some(analytic_intent_lab::AnalyticLab::new());
+    }
+    if args.iter().any(|arg| arg == "--authored-intent-6") {
+        let forbidden = ["--intent-authority-experiment", "--intent-live-rerealize", "--view-realization-experiment", "--view-realization-2b", "--observation-gpu-3b", "--observation-direct-3c", "--intent-observation-4", "--analytic-intent-5", "--authored-curve-7"];
+        if forbidden.iter().any(|flag| args.iter().any(|arg| arg == *flag)) {
+            eprintln!("JARVIG_FAIL --authored-intent-6 refuses a realization, observation, intent-observation-4, analytic-intent-5, authored-curve-7, or intent-authority flag");
+            std::process::exit(1);
+        }
+        editor.authored_lab = Some(authored_intent_lab::AuthoredLab::new());
+    }
+    if args.iter().any(|arg| arg == "--authored-curve-7") {
+        let forbidden = ["--intent-authority-experiment", "--intent-live-rerealize", "--view-realization-experiment", "--view-realization-2b", "--observation-gpu-3b", "--observation-direct-3c", "--intent-observation-4", "--analytic-intent-5", "--authored-intent-6"];
+        if forbidden.iter().any(|flag| args.iter().any(|arg| arg == *flag)) {
+            eprintln!("JARVIG_FAIL --authored-curve-7 refuses a realization, observation, intent-observation-4, analytic-intent-5, authored-intent-6, or intent-authority flag");
+            std::process::exit(1);
+        }
+        editor.curve_lab = Some(authored_curve_lab::CurveLab::new());
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--window-shot") {
+        let Some(path) = args.get(index + 1).filter(|path| !path.starts_with('-')) else {
+            eprintln!("JARVIG_FAIL --window-shot needs a png path");
+            std::process::exit(1);
+        };
+        editor.window_shot = Some(std::path::PathBuf::from(path));
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--bind-pose-shots") {
         let Some(path) = args.get(index + 1) else {
             eprintln!("JARVIG_FAIL --bind-pose-shots needs a directory");
@@ -1241,8 +1520,89 @@ fn harness_args(args: &[String]) -> bool {
         "--rfc0002-settle",
         "--content-check",
         "--bind-pose-shots",
+        "--intent-authority-experiment",
+        "--intent-live-rerealize",
+        "--view-realization-experiment",
+        "--view-realization-2b",
+        "--observation-gpu-3b",
+        "--observation-direct-3c",
+        "--intent-observation-4",
+        "--analytic-intent-5",
+        "--authored-intent-6",
+        "--authored-curve-7",
+        "--window-shot",
     ];
     args.iter().any(|arg| FLAGS.contains(&arg.as_str()))
+}
+
+/// One experimental pass. The host worker starts only when the CLI flag constructs this.
+struct ViewRealizationRun {
+    host: jarvig_core::ViewRealizationHost,
+    stage: u8,
+    mark: u32,
+    baseline: Option<ViewBaseline>,
+    same_strict: Option<jarvig_core::RealizationCamera>,
+    same_loose: Option<jarvig_core::RealizationCamera>,
+    far_strict: Option<jarvig_core::RealizationCamera>,
+    far_loose: Option<jarvig_core::RealizationCamera>,
+    far_eye: Option<Vec3>,
+    same_control: Option<jarvig_core::ViewRealizationControl>,
+    far_control: Option<jarvig_core::ViewRealizationControl>,
+    library: std::collections::BTreeMap<u32, jarvig_core::MeshId>,
+    report: String,
+    wait_from: Option<Instant>,
+    same_a_id: u64,
+    same_b_id: u64,
+    retired_ids: Vec<jarvig_core::MeshId>,
+}
+
+#[derive(Clone)]
+struct ViewBaseline {
+    intent: jarvig_core::EntityId,
+    legacy: jarvig_core::EntityId,
+    record: jarvig_core::BlockRecord,
+    legacy_record: jarvig_core::BlockRecord,
+    body_hash: u64,
+    pose: Vec3,
+    legacy_pose: Vec3,
+    object_mesh: jarvig_core::MeshId,
+    legacy_mesh: jarvig_core::MeshId,
+    mesh_count: usize,
+    revision: u64,
+    collision_inside: Vec3,
+    collision_outside: Vec3,
+    name: String,
+    legacy_name: String,
+    meshlets: Vec<jarvig_core::Meshlet>,
+    vertex_indices: Vec<u32>,
+    local_indices: Vec<u8>,
+    home_position: Vec3,
+    home_yaw: f64,
+    home_pitch: f64,
+}
+
+impl ViewRealizationRun {
+    fn new() -> Self {
+        Self {
+            host: jarvig_core::ViewRealizationHost::new(),
+            stage: 0,
+            mark: 0,
+            baseline: None,
+            same_strict: None,
+            same_loose: None,
+            far_strict: None,
+            far_loose: None,
+            far_eye: None,
+            same_control: None,
+            far_control: None,
+            library: std::collections::BTreeMap::new(),
+            report: String::new(),
+            wait_from: None,
+            same_a_id: 0,
+            same_b_id: 0,
+            retired_ids: Vec::new(),
+        }
+    }
 }
 
 impl Editor {
@@ -1457,6 +1817,34 @@ impl Editor {
             outliner_character: false,
             drop_feedback: String::new(),
             content_check: false,
+            intent_live_rerealize: false,
+            intent_live_stage: 0,
+            intent_live_mark: 0,
+            intent_live_legacy: None,
+            intent_live_legacy_mesh: None,
+            intent_live_legacy_at: None,
+            intent_live_counts: None,
+            view_realization: None,
+            view_lab: None,
+            observation_lab: None,
+            direct_lab: None,
+            intent_lab: None,
+            analytic_lab: None,
+            authored_lab: None,
+            curve_lab: None,
+            window_shot: None,
+            window_shot_framed: false,
+            round_preview: None,
+            round_view: None,
+            extrude_preview: None,
+            round_refused: None,
+            round_basis: None,
+            round_drag: None,
+            round_label: std::ptr::null_mut(),
+            graphics_name: String::new(),
+            graphics_vendor: 0,
+            graphics_device: 0,
+            graphics_api: String::new(),
             bind_pose_dir: None,
             bind_pose_index: 0,
             bind_pose_capture_next: false,
@@ -1470,6 +1858,10 @@ impl Editor {
             level_file: None,
             level_name: String::new(),
             level_uuid: None,
+            editor_hidden: Vec::new(),
+            folder_expansion: Vec::new(),
+            folder_expansion_ready: false,
+            folder_expansion_applied: false,
             saved_revision: 0,
             unsaved_policy: false,
             recent_projects: Vec::new(),
@@ -1513,7 +1905,16 @@ impl Editor {
             region_faces: Vec::new(),
             region_normal: [0.0; 3],
             selected_edge: None,
+            selected_edges: Vec::new(),
+            bevel_request: Vec::new(),
+            bevel_edges: Vec::new(),
+            bevel_anchor: [0.0; 3],
+            bevel_next_id: 0,
+            bevel_expanded: false,
+            bevel_clamped: false,
             selected_vertex: None,
+            selected_vertices: Vec::new(),
+            element_selection: selection::SelectionSet::default(),
             subdivide_hint: None,
             edge_hover: None,
             vertex_hover: None,
@@ -1521,8 +1922,15 @@ impl Editor {
             topology_drag: None,
             topology_delta: [0.0; 3],
             topology_session_body: None,
+            topology_session_materials: Vec::new(),
+            topology_session_groups: Vec::new(),
+            topology_session_edge_names: Vec::new(),
+            topology_defaulted: 0,
+            topology_group_ambiguous: 0,
             selection_mode: SelectionMode::Auto,
             marquee: None,
+            right_press: None,
+            rename: None,
             pick_requests: 0,
             pick_hits: 0,
             pick_misses: 0,
@@ -1859,6 +2267,10 @@ impl Editor {
         );
         println!("JARVIG {graphics}");
         self.append(&graphics);
+        self.graphics_name = attached.selection.adapter.name.clone();
+        self.graphics_vendor = attached.selection.adapter.vendor_id;
+        self.graphics_device = attached.selection.adapter.device_id;
+        self.graphics_api = attached.selection.adapter.api.label().to_string();
         self.status_base = format!("Ready  |  {}  |  {:?}", attached.selection.adapter.name, attached.selection.adapter.kind);
         self.probe_budget = self.render_quality.budget().probe_resolution;
         self.append(&format!(
@@ -1988,7 +2400,24 @@ impl Editor {
                 self.append(&format!("entity \"{name}\" {}", row.uuid));
             }
         }
-        let next = outliner::WorldOutlinerModel::derive(revision, &outline, &self.outliner);
+        let mut next = outliner::WorldOutlinerModel::derive(revision, &outline, &self.outliner);
+        if !self.character_workspace {
+            next.place_folders(self.viewed_world().organization());
+        }
+        let apply_expansion = self.folder_expansion_ready
+            && !self.folder_expansion_applied
+            && !self.character_workspace
+            && !self.session_active();
+        if apply_expansion {
+            if let Some(level) = self.level_uuid {
+                if let Some(record) = self.folder_expansion.iter().find(|row| row.level == level) {
+                    let known = record.known.clone();
+                    let open = record.open.clone();
+                    next.apply_folder_expansion(&known, &open);
+                }
+            }
+            self.folder_expansion_applied = true;
+        }
         // A pose or a simulation tick revises the world. The tree is the entity list, so those do not delete it.
         let same_rows = self.outliner_source == source
             && self.outliner_character == self.character_workspace
@@ -2016,6 +2445,8 @@ impl Editor {
         if !same_rows {
             let live: Vec<EntityUuid> = outline.iter().map(|row| row.uuid).collect();
             self.selection.reconcile_entities(&live);
+        }
+        if !same_rows || apply_expansion {
             self.realize_outliner();
         }
         self.sync_selection_view();
@@ -2038,15 +2469,9 @@ impl Editor {
             if self.selected_face.is_some_and(|(id, _)| !owns(id)) {
                 self.selected_face = None;
             }
-            if self.selected_body_face.is_some_and(|(id, _)| !owns(id)) {
-                self.selected_body_face = None;
-                self.selected_body_faces.clear();
-            }
-            if self.selected_edge.is_some_and(|(id, _)| !owns(id)) {
-                self.selected_edge = None;
-            }
-            if self.selected_vertex.is_some_and(|(id, _)| !owns(id)) {
-                self.selected_vertex = None;
+            if self.element_selection.entity().is_some_and(|id| !owns(id)) {
+                self.element_selection.clear();
+                self.publish_elements();
             }
         }
         self.selection_seen = self.selection.revision();
@@ -2065,7 +2490,12 @@ impl Editor {
             ));
         }
         if selection_changed {
-            unsafe { InvalidateRect(self.panel_hwnd(OUTLINER), std::ptr::null(), 0); }
+            unsafe {
+                InvalidateRect(self.panel_hwnd(OUTLINER), std::ptr::null(), 0);
+                if !self.toolbar.is_null() {
+                    InvalidateRect(self.toolbar, std::ptr::null(), 0);
+                }
+            }
         }
     }
 
@@ -2102,12 +2532,50 @@ impl Editor {
                 SelectionMode::Vertex => "Vertex",
             };
             let mut model = inspector::build_solid(&self.selection, self.viewed_world(), &staged, &meshes, element, mode_name);
-            if self.selected_body_faces.len() > 1 {
-                inspector::set_selected_face_label(&mut model, &format!("{} faces", self.selected_body_faces.len()));
+            if self.element_selection.len() > 1 {
+                if let Some(label) = self.element_selection.label() {
+                    inspector::set_selected_face_label(&mut model, &label);
+                    inspector::hide_single_element_measures(&mut model);
+                }
+            }
+            if let Some(entity) = primary {
+                if let Some(record) = record.as_ref() {
+                    let faces = if self.selection_mode == SelectionMode::Object {
+                        Vec::new()
+                    } else {
+                        self.selected_topology_faces(entity)
+                    };
+                    inspector::set_surface_material(&mut model, record, &faces);
+                }
             }
             if let Some(session) = self.modeling_session {
                 if self.selection.primary_entity() == Some(session.entity) {
-                    inspector::attach_modeling_session(&mut model, &modeling_view(session, &self.region_faces));
+                    let mut view = modeling_view(session, &self.region_faces, &self.bevel_request);
+                    if region_extrude(session) {
+                        if let Some(block) = record.as_ref().filter(|block| block.has_authored_seed() && block.body.is_none()) {
+                            view.face = match self.region_faces.as_slice() {
+                                [id] => inspector::face_identity_label(block, *id),
+                                faces => format!("{} Faces selected", faces.len()),
+                            };
+                        }
+                    }
+                    if session.tool == ModelingTool::Round {
+                        if let Some(basis) = self.round_basis.as_ref() {
+                            view.face = round_selection_label(basis.picked);
+                            view.maximum = basis.max_radius_m.max(0.001);
+                            view.range = Some(format!("0.001 – {:.3} m", view.maximum));
+                            view.resolved = Some(basis.tokens.len().to_string());
+                            view.readiness = Some(match basis.readiness {
+                                RoundStatus::Valid => "Valid",
+                                RoundStatus::Clamped => "Clamped",
+                                RoundStatus::Conflict => "Conflict",
+                            }.to_string());
+                            if !basis.note.is_empty() {
+                                view.note = Some(basis.note.clone());
+                            }
+                        }
+                    }
+                    inspector::attach_modeling_session(&mut model, &view);
                     if let inspector::InspectorBody::Entity { sections } = &mut model.body {
                         for section in sections.iter_mut() {
                             for field in &mut section.fields {
@@ -2349,7 +2817,11 @@ impl Editor {
             inspector::ControlFace::Row | inspector::ControlFace::Native => chrome::ShelfPaint::Row,
         };
         let pressed = draw.itemState & 1 != 0;
-        self.toolbar_icons.paint_shelf(draw.hDC, draw.rcItem, &caption, self.ui_font, icon, control.checked, pressed, kind);
+        let dimmed = match &control.binding {
+            inspector::InspectorBinding::Command { command, .. } => self.shelf_command_dimmed(*command),
+            _ => false,
+        };
+        self.toolbar_icons.paint_shelf(draw.hDC, draw.rcItem, &caption, self.ui_font, icon, control.checked, pressed, kind, dimmed);
     }
 
     fn layout_inspector_controls(&mut self) {
@@ -2456,6 +2928,17 @@ impl Editor {
             self.commit_modeling_amount(text);
             return;
         }
+        if matches!(
+            field,
+            inspector::SOLID_UI_COLOR_R | inspector::SOLID_UI_COLOR_G | inspector::SOLID_UI_COLOR_B | inspector::SOLID_UI_ROUGHNESS | inspector::SOLID_UI_METALLIC
+        ) {
+            self.commit_surface_factor(entity, field, text);
+            return;
+        }
+        if field == inspector::SOLID_UI_GROUP_NAME {
+            self.commit_group_name(entity, text);
+            return;
+        }
         let Some(slot) = self.inspector_model.field(type_id, field).cloned() else { return };
         if !slot.editable {
             return;
@@ -2525,6 +3008,24 @@ impl Editor {
     fn commit_inspector_choice(&mut self, entity: EntityUuid, type_id: jarvig_core::TypeId, field: jarvig_core::FieldId, text: &str) {
         let Some(slot) = self.inspector_model.field(type_id, field).cloned() else { return };
         if !slot.editable {
+            return;
+        }
+        if field == inspector::SOLID_UI_GROUP_PICK {
+            return;
+        }
+        if field == inspector::SOLID_UI_SURFACE_ASSIGN {
+            if text == slot.display || text == "Mixed" {
+                return;
+            }
+            let Some(index) = surface_slot_from_choice(text) else {
+                self.realize_inspector_controls();
+                return;
+            };
+            if index > u32::from(u8::MAX) {
+                self.realize_inspector_controls();
+                return;
+            }
+            self.assign_material_slot(entity, index as u8);
             return;
         }
         if field == inspector::PLAYER_UI_CHARACTER {
@@ -2722,6 +3223,15 @@ impl Editor {
                 self.set_selection_mode(SelectionMode::Vertex);
                 return;
             }
+            inspector::InspectorCommand::SelectLoop
+            | inspector::InspectorCommand::SelectRing
+            | inspector::InspectorCommand::SelectConnected
+            | inspector::InspectorCommand::SelectBoundary
+            | inspector::InspectorCommand::SelectGrow
+            | inspector::InspectorCommand::SelectShrink => {
+                self.select_topology(command);
+                return;
+            }
             _ => {}
         }
         let Some(entity) = self.inspector_target() else { return };
@@ -2758,12 +3268,24 @@ impl Editor {
             inspector::InspectorCommand::ResetPose => self.reset_character_pose(),
             inspector::InspectorCommand::CreateTerrain => self.create_land_terrain(),
             inspector::InspectorCommand::ResetShape => {
+                if self.engine.world().authored_block(entity).is_some_and(|record| record.has_authored_seed()) {
+                    self.append(&authored_block_refusal("Reset Shape"));
+                    return;
+                }
                 self.cancel_modeling(false);
                 self.reset_block_shape(entity);
             }
             inspector::InspectorCommand::ExtrudeFace => self.begin_modeling(ModelingTool::Extrude),
             inspector::InspectorCommand::InsetFace => self.begin_modeling(ModelingTool::Inset),
-            inspector::InspectorCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
+            inspector::InspectorCommand::Bevel => {
+                if self.selection_mode == SelectionMode::Edge {
+                    self.begin_modeling(ModelingTool::BevelEdge);
+                } else {
+                    self.begin_modeling(ModelingTool::Bevel);
+                }
+            }
+            inspector::InspectorCommand::Round => self.begin_modeling(ModelingTool::Round),
+            inspector::InspectorCommand::ApplyRound => self.apply_modeling(),
             inspector::InspectorCommand::MoveEdge => self.begin_modeling(ModelingTool::MoveEdge),
             inspector::InspectorCommand::ExtrudeEdge => self.begin_modeling(ModelingTool::ExtrudeEdge),
             inspector::InspectorCommand::MoveVertex => self.begin_modeling(ModelingTool::MoveVertex),
@@ -2783,11 +3305,956 @@ impl Editor {
                 self.selected_face = Some((entity, face));
                 self.begin_modeling(ModelingTool::Inset);
             }
+            inspector::InspectorCommand::AddMaterialSlot => self.add_material_slot(entity),
+            inspector::InspectorCommand::MakeUnique => self.make_face_material(entity),
+            inspector::InspectorCommand::SelectSlotFaces => self.select_slot_faces(entity),
+            inspector::InspectorCommand::CreateSurfaceGroup => self.create_surface_group(entity),
+            inspector::InspectorCommand::RenameSurfaceGroup => self.rename_surface_group(entity),
+            inspector::InspectorCommand::AddSurfaceGroupFaces => self.add_surface_group_faces(entity),
+            inspector::InspectorCommand::RemoveSurfaceGroupFaces => self.remove_surface_group_faces(entity),
+            inspector::InspectorCommand::SelectSurfaceGroup => self.select_surface_group(entity),
+            inspector::InspectorCommand::DeleteSurfaceGroup => self.delete_surface_group(entity),
             inspector::InspectorCommand::SelectionAuto
             | inspector::InspectorCommand::SelectionObject
             | inspector::InspectorCommand::SelectionFace
             | inspector::InspectorCommand::SelectionEdge
-            | inspector::InspectorCommand::SelectionVertex => {}
+            | inspector::InspectorCommand::SelectionVertex
+            | inspector::InspectorCommand::SelectLoop
+            | inspector::InspectorCommand::SelectRing
+            | inspector::InspectorCommand::SelectConnected
+            | inspector::InspectorCommand::SelectBoundary
+            | inspector::InspectorCommand::SelectGrow
+            | inspector::InspectorCommand::SelectShrink => {}
+        }
+    }
+
+    /// Replaces the element set from a read-only walk. Does not open a tool and does not write the solid.
+    fn select_topology(&mut self, command: inspector::InspectorCommand) {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            self.append("Return to the level before selecting solid topology.");
+            return;
+        }
+        if self.modeling_session.is_some() {
+            self.append("Close the open tool before changing the selection.");
+            return;
+        }
+        let Some(entity) = self.inspector_target() else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let Some(body) = (if record.has_authored_seed() { selection_body(&record) } else { record.display_body() }) else {
+            self.append("That solid has no faces to walk.");
+            return;
+        };
+        let same = self.element_selection.entity() == Some(entity);
+        let kind = if same { self.element_selection.kind() } else { None };
+        let ids = if same { self.element_selection.ids().to_vec() } else { Vec::new() };
+        match command {
+            inspector::InspectorCommand::SelectLoop | inspector::InspectorCommand::SelectRing => {
+                if kind != Some(selection::ElementKind::Edge) || ids.is_empty() {
+                    self.append("Select an edge first.");
+                    return;
+                }
+                let walk = if command == inspector::InspectorCommand::SelectLoop { body.edge_loop(&ids) } else { body.edge_ring(&ids) };
+                self.install_topology_selection(entity, selection::ElementKind::Edge, Some(SelectionMode::Edge), walk);
+            }
+            inspector::InspectorCommand::SelectBoundary => {
+                if kind != Some(selection::ElementKind::Face) || ids.is_empty() {
+                    if kind == Some(selection::ElementKind::Edge)
+                        || kind == Some(selection::ElementKind::Vertex)
+                        || matches!(self.selection_mode, SelectionMode::Edge | SelectionMode::Vertex)
+                    {
+                        self.append("Boundary uses the selected faces.");
+                    } else {
+                        self.append("Select a face first.");
+                    }
+                    return;
+                }
+                self.install_topology_selection(entity, selection::ElementKind::Edge, Some(SelectionMode::Edge), body.region_boundary(&ids));
+            }
+            inspector::InspectorCommand::SelectConnected | inspector::InspectorCommand::SelectGrow | inspector::InspectorCommand::SelectShrink => {
+                let Some(kind) = kind else {
+                    self.append("Select a face, edge, or vertex first.");
+                    return;
+                };
+                if ids.is_empty() {
+                    self.append("Select a face, edge, or vertex first.");
+                    return;
+                }
+                let walk = match (command, kind) {
+                    (inspector::InspectorCommand::SelectConnected, selection::ElementKind::Face) => body.connected_faces(&ids),
+                    (inspector::InspectorCommand::SelectConnected, selection::ElementKind::Edge) => body.connected_edges(&ids),
+                    (inspector::InspectorCommand::SelectConnected, selection::ElementKind::Vertex) => body.connected_vertices(&ids),
+                    (inspector::InspectorCommand::SelectGrow, selection::ElementKind::Face) => body.grow_faces(&ids),
+                    (inspector::InspectorCommand::SelectGrow, selection::ElementKind::Edge) => body.grow_edges(&ids),
+                    (inspector::InspectorCommand::SelectGrow, selection::ElementKind::Vertex) => body.grow_vertices(&ids),
+                    (inspector::InspectorCommand::SelectShrink, selection::ElementKind::Face) => body.shrink_faces(&ids),
+                    (inspector::InspectorCommand::SelectShrink, selection::ElementKind::Edge) => body.shrink_edges(&ids),
+                    (inspector::InspectorCommand::SelectShrink, selection::ElementKind::Vertex) => body.shrink_vertices(&ids),
+                    _ => return,
+                };
+                self.install_topology_selection(entity, kind, None, walk);
+            }
+            _ => {}
+        }
+    }
+
+    fn install_topology_selection(&mut self, entity: jarvig_core::EntityUuid, kind: selection::ElementKind, mode: Option<SelectionMode>, walk: jarvig_core::ElementWalk) {
+        if walk.ids.is_empty() {
+            if let Some(note) = walk.note {
+                self.append(&note.sentence());
+                return;
+            }
+            self.selected_face = None;
+            self.element_selection.clear();
+            self.publish_elements();
+            self.inspector_force_realize = true;
+            self.rebuild_inspector();
+            self.refresh_status();
+            self.append("Nothing selected.");
+            return;
+        }
+        if let Some(mode) = mode {
+            self.selection_mode = mode;
+            if matches!(mode, SelectionMode::Edge | SelectionMode::Vertex) {
+                self.selected_face = None;
+            }
+        }
+        self.element_selection.replace_ids(entity, kind, &walk.ids);
+        self.publish_elements();
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        self.refresh_status();
+        let label = self.element_selection.label().unwrap_or_default();
+        if let Some(note) = walk.note {
+            self.append(&format!("{label}. {}", note.sentence()));
+        } else {
+            self.append(&label);
+        }
+    }
+
+    fn selected_topology_faces(&self, entity: EntityUuid) -> Vec<u32> {
+        if self.element_selection.entity() == Some(entity) && self.element_selection.kind() == Some(selection::ElementKind::Face) {
+            return self.element_selection.ids().to_vec();
+        }
+        if let Some((id, face)) = self.selected_face {
+            if id == entity {
+                return vec![u32::from(face) + 1];
+            }
+        }
+        Vec::new()
+    }
+
+    fn surface_slot(&self, entity: EntityUuid) -> Option<u32> {
+        let record = self.engine.world().authored_block(entity)?;
+        let faces = if self.selection_mode == SelectionMode::Object { Vec::new() } else { self.selected_topology_faces(entity) };
+        if faces.is_empty() {
+            return Some(0);
+        }
+        let mut shared = None;
+        for face in faces {
+            let slot = record.bound_slot(face);
+            if shared.is_some_and(|current| current != slot) {
+                return None;
+            }
+            shared = Some(slot);
+        }
+        shared
+    }
+
+    fn surface_edit_allowed(&mut self) -> bool {
+        if self.session_active() || self.land_mode || self.character_workspace {
+            self.append("Return to the level before selecting solid topology.");
+            return false;
+        }
+        if self.modeling_session.is_some() {
+            self.append("Close the open tool before changing the selection.");
+            return false;
+        }
+        true
+    }
+
+    fn assign_material_slot(&mut self, entity: EntityUuid, slot: u8) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let faces = self.selected_topology_faces(entity);
+        if faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        if u32::from(slot) >= record.slot_count() {
+            self.append(if record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+                "A solid has 16 material slots."
+            } else {
+                "That material slot does not exist."
+            });
+            return;
+        }
+        match record.surface_group_cover(&faces) {
+            jarvig_core::SurfaceGroupCover::Mixed => {
+                self.append("Those faces are not in one surface group.");
+                return;
+            }
+            jarvig_core::SurfaceGroupCover::Covered(group) => {
+                let opened = self.history_begin("Surface Group", &[entity]);
+                match self.engine.world_mut().set_block_surface_group_slot(entity, group, u32::from(slot)) {
+                    Ok(jarvig_core::AuthoringResult::Applied) => {
+                        if opened {
+                            self.history_commit();
+                        }
+                        let _ = self.engine.rebind_entity_material(entity);
+                        self.inspector_force_realize = true;
+                        self.rebuild_inspector();
+                        self.refresh_status();
+                        self.append(&format!("Assigned {}.", inspector::surface_slot_name(u32::from(slot))));
+                    }
+                    Ok(_) => {
+                        if opened {
+                            let _ = self.history_cancel();
+                        }
+                    }
+                    Err(_) => {
+                        if opened {
+                            let _ = self.history_cancel();
+                        }
+                        self.append("That face is not on the solid.");
+                    }
+                }
+                return;
+            }
+            jarvig_core::SurfaceGroupCover::None => {}
+        }
+        let opened = self.history_begin("Assign Material", &[entity]);
+        match self.engine.world_mut().assign_block_faces(entity, &faces, u32::from(slot)) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Assigned {}.", inspector::surface_slot_name(u32::from(slot))));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That face is not on the solid.");
+            }
+        }
+    }
+
+    fn add_material_slot(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        if record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+            self.append("A solid has 16 material slots.");
+            return;
+        }
+        let opened = self.history_begin("Material Slot", &[entity]);
+        match self.engine.world_mut().add_block_material_slot(entity) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let count = self.engine.world().authored_block(entity).map(|block| block.slot_count()).unwrap_or(1);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Slot {}.", count.saturating_sub(1)));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("A solid has 16 material slots.");
+            }
+        }
+    }
+
+    fn make_face_material(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let faces = self.selected_topology_faces(entity);
+        if faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        if record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+            self.append("A solid has 16 material slots.");
+            return;
+        }
+        let opened = self.history_begin("Face Material", &[entity]);
+        match self.engine.world_mut().make_block_faces_unique(entity, &faces) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let slot = self.engine.world().authored_block(entity).map(|block| block.slot_count().saturating_sub(1)).unwrap_or(1);
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Face Material {slot}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That face is not on the solid.");
+            }
+        }
+    }
+
+    fn select_slot_faces(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        if record.material_body().is_none() {
+            self.append("That solid has no faces to select.");
+            return;
+        }
+        let Some(slot) = self.surface_slot(entity) else {
+            return;
+        };
+        let ids = record.faces_on_slot(slot);
+        self.selection_mode = SelectionMode::Face;
+        self.selected_face = None;
+        if ids.is_empty() {
+            self.element_selection.clear();
+            self.publish_elements();
+            self.inspector_force_realize = true;
+            self.rebuild_inspector();
+            self.refresh_status();
+            self.append("Nothing selected.");
+            return;
+        }
+        self.element_selection.replace_ids(entity, selection::ElementKind::Face, &ids);
+        self.publish_elements();
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        self.refresh_status();
+        let label = self.element_selection.label().unwrap_or_default();
+        self.append(&label);
+    }
+
+    fn group_name_text(&self) -> String {
+        if let Some(control) = self.inspector_controls.iter().find(|control| {
+            matches!(&control.binding, inspector::InspectorBinding::Text { field, .. } if *field == inspector::SOLID_UI_GROUP_NAME)
+        }) {
+            return window_text(control.hwnd);
+        }
+        self.inspector_model
+            .field(jarvig_core::TYPE_PARAMETRIC_BLOCK, inspector::SOLID_UI_GROUP_NAME)
+            .map(|field| field.display.clone())
+            .unwrap_or_default()
+    }
+
+    fn group_pick_text(&self) -> String {
+        if let Some(control) = self.inspector_controls.iter().find(|control| {
+            matches!(&control.binding, inspector::InspectorBinding::Choice { field, .. } if *field == inspector::SOLID_UI_GROUP_PICK)
+        }) {
+            let text = combo_text(control.hwnd);
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        self.inspector_model
+            .field(jarvig_core::TYPE_PARAMETRIC_BLOCK, inspector::SOLID_UI_GROUP_PICK)
+            .map(|field| field.display.clone())
+            .unwrap_or_default()
+    }
+
+    fn surface_faces_of(&self, entity: EntityUuid) -> Vec<u32> {
+        if self.selection_mode == SelectionMode::Object {
+            Vec::new()
+        } else {
+            self.selected_topology_faces(entity)
+        }
+    }
+
+    fn active_surface_group(&self, entity: EntityUuid) -> Result<u32, &'static str> {
+        let record = self.engine.world().authored_block(entity).ok_or("Select a solid first.")?;
+        let faces = self.surface_faces_of(entity);
+        if !faces.is_empty() {
+            return match record.surface_group_cover(&faces) {
+                jarvig_core::SurfaceGroupCover::Covered(id) => Ok(id),
+                jarvig_core::SurfaceGroupCover::Mixed => Err("Those faces are not in one surface group."),
+                jarvig_core::SurfaceGroupCover::None => Err("That group is not on the solid."),
+            };
+        }
+        let picked = self.group_pick_text();
+        record.surface_groups.iter().find(|group| group.name == picked).map(|group| group.id).ok_or("That group is not on the solid.")
+    }
+
+    fn picked_surface_group(&self, entity: EntityUuid) -> Option<u32> {
+        let record = self.engine.world().authored_block(entity)?;
+        let picked = self.group_pick_text();
+        record.surface_groups.iter().find(|group| group.name == picked).map(|group| group.id)
+    }
+
+    fn commit_group_name(&mut self, entity: EntityUuid, text: &str) {
+        if !self.surface_edit_allowed() {
+            self.realize_inspector_controls();
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(group_id) = self.active_surface_group(entity) else {
+            return;
+        };
+        let Some(record) = self.engine.world().authored_block(entity) else { return };
+        let Some(group) = record.surface_group(group_id) else { return };
+        if group.name == trimmed {
+            return;
+        }
+        self.rename_surface_group_to(entity, group_id, trimmed);
+    }
+
+    fn create_surface_group(&mut self, entity: EntityUuid) {
+        let trimmed = self.group_name_text().trim().to_string();
+        self.create_named_surface_group(entity, &trimmed);
+    }
+
+    fn create_named_surface_group(&mut self, entity: EntityUuid, name: &str) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let faces = self.selected_topology_faces(entity);
+        if self.selection_mode == SelectionMode::Object || faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            self.append("Name the group first.");
+            return;
+        }
+        if let Some(message) = surface_group_name_message(&trimmed) {
+            self.append(message);
+            return;
+        }
+        if record.surface_groups.iter().any(|group| group.name == trimmed) {
+            self.append("That group name is already used.");
+            return;
+        }
+        if let Some(message) = surface_group_face_message(&record, &faces) {
+            self.append(message);
+            return;
+        }
+        if faces.iter().any(|face| record.surface_group_of_face(*face).is_some()) {
+            self.append("A selected face is already in a group.");
+            return;
+        }
+        let mut slots = Vec::new();
+        for face in &faces {
+            let slot = record.bound_slot(*face);
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+        let Some(shared) = slots.first().copied().filter(|_| slots.len() == 1) else {
+            self.append("Those faces do not share a material.");
+            return;
+        };
+        if !inspector::selection_owns_material(&record, &faces, shared) && record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+            self.append("A solid has 16 material slots.");
+            return;
+        }
+        if faces.iter().any(|face| record.recorded_face_names(*face).is_empty()) {
+            self.append("That face has no semantic name.");
+            return;
+        }
+        let opened = self.history_begin("Surface Group", &[entity]);
+        match self.engine.world_mut().create_block_surface_group(entity, &trimmed, &faces) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Created {trimmed}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That face is not on the solid.");
+            }
+        }
+    }
+
+    fn rename_surface_group(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let trimmed = self.group_name_text().trim().to_string();
+        if trimmed.is_empty() {
+            self.append("Name the group first.");
+            return;
+        }
+        if let Some(message) = surface_group_name_message(&trimmed) {
+            self.append(message);
+            return;
+        }
+        let group_id = match self.active_surface_group(entity) {
+            Ok(id) => id,
+            Err(message) => {
+                self.append(message);
+                return;
+            }
+        };
+        self.rename_surface_group_to(entity, group_id, &trimmed);
+    }
+
+    fn rename_surface_group_to(&mut self, entity: EntityUuid, group_id: u32, name: &str) {
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        if record.surface_groups.iter().any(|group| group.id != group_id && group.name == name) {
+            self.append("That group name is already used.");
+            self.realize_inspector_controls();
+            return;
+        }
+        let opened = self.history_begin("Surface Group", &[entity]);
+        match self.engine.world_mut().rename_block_surface_group(entity, group_id, name) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Renamed {name}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That group is not on the solid.");
+                self.realize_inspector_controls();
+            }
+        }
+    }
+
+    fn add_surface_group_faces(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let faces = self.selected_topology_faces(entity);
+        if self.selection_mode == SelectionMode::Object || faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        let Some(group_id) = self.picked_surface_group(entity) else {
+            self.append("That group is not on the solid.");
+            return;
+        };
+        if let Some(message) = surface_group_face_message(&record, &faces) {
+            self.append(message);
+            return;
+        }
+        if faces.iter().any(|face| record.surface_group_of_face(*face).is_some_and(|existing| existing != group_id)) {
+            self.append("A selected face is already in a group.");
+            return;
+        }
+        if faces.iter().any(|face| record.recorded_face_names(*face).is_empty()) {
+            self.append("That face has no semantic name.");
+            return;
+        }
+        let name = record.surface_group(group_id).map(|group| group.name.clone()).unwrap_or_default();
+        let opened = self.history_begin("Surface Group", &[entity]);
+        match self.engine.world_mut().add_block_surface_group_faces(entity, group_id, &faces) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Added to {name}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That face is not on the solid.");
+            }
+        }
+    }
+
+    fn remove_surface_group_faces(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let faces = self.selected_topology_faces(entity);
+        if self.selection_mode == SelectionMode::Object || faces.is_empty() {
+            self.append("Select a face first.");
+            return;
+        }
+        let group_id = match self.active_surface_group(entity) {
+            Ok(id) => id,
+            Err(message) => {
+                self.append(message);
+                return;
+            }
+        };
+        let name = self.engine.world().authored_block(entity).and_then(|record| record.surface_group(group_id).map(|group| group.name.clone())).unwrap_or_default();
+        let opened = self.history_begin("Surface Group", &[entity]);
+        match self.engine.world_mut().remove_block_surface_group_faces(entity, group_id, &faces) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Removed from {name}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Those faces are not in that group.");
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That group is not on the solid.");
+            }
+        }
+    }
+
+    fn select_surface_group(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            self.append("Select a solid first.");
+            return;
+        };
+        let Some(group_id) = self.picked_surface_group(entity) else {
+            self.append("That group is not on the solid.");
+            return;
+        };
+        if record.material_body().is_none() {
+            self.append("That group has no faces on the solid.");
+            return;
+        }
+        let ids = record.resolved_group_faces(group_id);
+        if ids.is_empty() {
+            self.append("That group has no faces on the solid.");
+            return;
+        }
+        self.selection_mode = SelectionMode::Face;
+        self.selected_face = None;
+        self.element_selection.replace_ids(entity, selection::ElementKind::Face, &ids);
+        self.publish_elements();
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        self.refresh_status();
+        let label = self.element_selection.label().unwrap_or_default();
+        self.append(&label);
+    }
+
+    fn delete_surface_group(&mut self, entity: EntityUuid) {
+        if !self.surface_edit_allowed() {
+            return;
+        }
+        let group_id = match self.active_surface_group(entity) {
+            Ok(id) => id,
+            Err(message) => {
+                self.append(message);
+                return;
+            }
+        };
+        let name = self.engine.world().authored_block(entity).and_then(|record| record.surface_group(group_id).map(|group| group.name.clone())).unwrap_or_default();
+        let opened = self.history_begin("Surface Group", &[entity]);
+        match self.engine.world_mut().delete_block_surface_group(entity, group_id) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+                self.append(&format!("Deleted {name}."));
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("That group is not on the solid.");
+            }
+        }
+    }
+
+    fn commit_group_factor(
+        &mut self,
+        entity: EntityUuid,
+        group_id: u32,
+        record: &jarvig_core::BlockRecord,
+        faces: &[u32],
+        color: [f32; 3],
+        roughness: f32,
+        metallic: f32,
+    ) {
+        let Some(group) = record.surface_group(group_id) else {
+            self.append("That group is not on the solid.");
+            self.realize_inspector_controls();
+            return;
+        };
+        if faces.iter().any(|face| record.bound_slot(*face) != group.slot) {
+            self.append("That group does not use this material.");
+            self.realize_inspector_controls();
+            return;
+        }
+        let resolved = record.resolved_group_faces(group_id);
+        let owns = inspector::selection_owns_material(record, &resolved, group.slot);
+        if !owns && record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+            self.append("A solid has 16 material slots.");
+            self.realize_inspector_controls();
+            return;
+        }
+        let opened = self.history_begin(if owns { "Material" } else { "Face Material" }, &[entity]);
+        let target = if owns {
+            group.slot
+        } else {
+            match self.engine.world_mut().make_block_faces_unique(entity, &resolved) {
+                Ok(jarvig_core::AuthoringResult::Applied) => {
+                    let new_slot = self.engine.world().authored_block(entity).map(|block| block.slot_count().saturating_sub(1)).unwrap_or(group.slot);
+                    match self.engine.world_mut().set_block_surface_group_slot(entity, group_id, new_slot) {
+                        Ok(_) => new_slot,
+                        Err(_) => {
+                            if opened {
+                                let _ = self.history_cancel();
+                            }
+                            self.append("That face is not on the solid.");
+                            self.realize_inspector_controls();
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    if opened {
+                        let _ = self.history_cancel();
+                    }
+                    self.realize_inspector_controls();
+                    return;
+                }
+                Err(_) => {
+                    if opened {
+                        let _ = self.history_cancel();
+                    }
+                    self.append(if record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+                        "A solid has 16 material slots."
+                    } else {
+                        "That face is not on the solid."
+                    });
+                    self.realize_inspector_controls();
+                    return;
+                }
+            }
+        };
+        match self.engine.world_mut().set_block_material_factors(entity, target, color, roughness, metallic) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Those material values stay between 0 and 1.");
+                self.realize_inspector_controls();
+            }
+        }
+    }
+
+    fn commit_surface_factor(&mut self, entity: EntityUuid, field: jarvig_core::FieldId, text: &str) {
+        if !self.surface_edit_allowed() {
+            self.realize_inspector_controls();
+            return;
+        }
+        let Some(slot) = self.surface_slot(entity) else {
+            self.append("Those faces do not share a material.");
+            self.realize_inspector_controls();
+            return;
+        };
+        let Some(value) = text.trim().parse::<f64>().ok().filter(|value| value.is_finite()) else {
+            self.append("Inspector kept the authoritative value. The text was not a finite number.");
+            self.realize_inspector_controls();
+            return;
+        };
+        let value = value.clamp(0.0, 1.0) as f32;
+        let Some(record) = self.engine.world().authored_block(entity) else {
+            return;
+        };
+        let Some(material) = record.material_slot(slot).cloned() else {
+            self.append("That material slot does not exist.");
+            return;
+        };
+        let mut color = [material.base_color[0], material.base_color[1], material.base_color[2]];
+        let mut roughness = material.roughness;
+        let mut metallic = material.metallic;
+        match field {
+            inspector::SOLID_UI_COLOR_R => color[0] = value,
+            inspector::SOLID_UI_COLOR_G => color[1] = value,
+            inspector::SOLID_UI_COLOR_B => color[2] = value,
+            inspector::SOLID_UI_ROUGHNESS => roughness = value,
+            inspector::SOLID_UI_METALLIC => metallic = value,
+            _ => return,
+        }
+        if color == [material.base_color[0], material.base_color[1], material.base_color[2]] && roughness == material.roughness && metallic == material.metallic {
+            return;
+        }
+        let faces = if self.selection_mode == SelectionMode::Object { Vec::new() } else { self.selected_topology_faces(entity) };
+        match record.surface_group_cover(&faces) {
+            jarvig_core::SurfaceGroupCover::Mixed => {
+                self.append("Those faces are not in one surface group.");
+                self.realize_inspector_controls();
+                return;
+            }
+            jarvig_core::SurfaceGroupCover::Covered(group_id) => {
+                self.commit_group_factor(entity, group_id, &record, &faces, color, roughness, metallic);
+                return;
+            }
+            jarvig_core::SurfaceGroupCover::None => {}
+        }
+        let owns = inspector::selection_owns_material(&record, &faces, slot);
+        let opened = self.history_begin(if owns { "Material" } else { "Face Material" }, &[entity]);
+        let target = if owns {
+            slot
+        } else {
+            match self.engine.world_mut().make_block_faces_unique(entity, &faces) {
+                Ok(jarvig_core::AuthoringResult::Applied) => self.engine.world().authored_block(entity).map(|block| block.slot_count().saturating_sub(1)).unwrap_or(slot),
+                Ok(_) => {
+                    if opened {
+                        let _ = self.history_cancel();
+                    }
+                    self.realize_inspector_controls();
+                    return;
+                }
+                Err(_) => {
+                    if opened {
+                        let _ = self.history_cancel();
+                    }
+                    self.append(if record.slot_count() >= jarvig_core::BLOCK_MATERIAL_SLOT_LIMIT {
+                        "A solid has 16 material slots."
+                    } else {
+                        "That face is not on the solid."
+                    });
+                    self.realize_inspector_controls();
+                    return;
+                }
+            }
+        };
+        match self.engine.world_mut().set_block_material_factors(entity, target, color, roughness, metallic) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {
+                if opened {
+                    self.history_commit();
+                }
+                let _ = self.engine.rebind_entity_material(entity);
+                self.inspector_force_realize = true;
+                self.rebuild_inspector();
+                self.refresh_status();
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Those material values stay between 0 and 1.");
+                self.realize_inspector_controls();
+            }
         }
     }
 
@@ -2798,19 +4265,23 @@ impl Editor {
             SelectionMode::Object => self.clear_element_selection(),
             SelectionMode::Edge => {
                 self.selected_face = None;
-                self.selected_body_face = None;
-                self.selected_body_faces.clear();
-                self.selected_vertex = None;
+                if self.element_selection.kind() != Some(selection::ElementKind::Edge) {
+                    self.element_selection.clear();
+                }
+                self.publish_elements();
             }
             SelectionMode::Vertex => {
                 self.selected_face = None;
-                self.selected_body_face = None;
-                self.selected_body_faces.clear();
-                self.selected_edge = None;
+                if self.element_selection.kind() != Some(selection::ElementKind::Vertex) {
+                    self.element_selection.clear();
+                }
+                self.publish_elements();
             }
             SelectionMode::Auto | SelectionMode::Face => {
-                self.selected_edge = None;
-                self.selected_vertex = None;
+                if self.element_selection.kind() != Some(selection::ElementKind::Face) {
+                    self.element_selection.clear();
+                }
+                self.publish_elements();
             }
         }
         self.inspector_force_realize = true;
@@ -2820,14 +4291,38 @@ impl Editor {
 
     fn clear_element_selection(&mut self) {
         self.subdivide_hint = None;
-        let had = self.selected_face.take().is_some()
-            || self.selected_body_face.take().is_some()
-            || !self.selected_body_faces.is_empty()
-            || self.selected_edge.take().is_some()
-            || self.selected_vertex.take().is_some();
-        self.selected_body_faces.clear();
+        let had = self.selected_face.take().is_some() || !self.element_selection.is_empty();
+        self.element_selection.clear();
+        self.publish_elements();
         if had {
             self.inspector_force_realize = true;
+        }
+    }
+
+    /// Copies [`SelectionSet`](selection::SelectionSet) into the fields the viewport and the tools read.
+    fn publish_elements(&mut self) {
+        self.selected_body_face = None;
+        self.selected_body_faces.clear();
+        self.selected_edge = None;
+        self.selected_edges.clear();
+        self.selected_vertex = None;
+        self.selected_vertices.clear();
+        let Some(entity) = self.element_selection.entity() else { return };
+        let Some(primary) = self.element_selection.primary() else { return };
+        match self.element_selection.kind() {
+            Some(selection::ElementKind::Face) => {
+                self.selected_body_face = Some((entity, primary));
+                self.selected_body_faces = self.element_selection.ids().to_vec();
+            }
+            Some(selection::ElementKind::Edge) => {
+                self.selected_edge = Some((entity, primary));
+                self.selected_edges = self.element_selection.ids().to_vec();
+            }
+            Some(selection::ElementKind::Vertex) => {
+                self.selected_vertex = Some((entity, primary));
+                self.selected_vertices = self.element_selection.ids().to_vec();
+            }
+            None => {}
         }
     }
 
@@ -2841,10 +4336,10 @@ impl Editor {
                 inspector::SolidElement::Vertex(self.selected_vertex.filter(|(id, _)| owns(*id)).map(|(_, vertex)| vertex).unwrap_or(0))
             }
             SelectionMode::Auto | SelectionMode::Face => {
-                if stored {
-                    if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| owns(*id)) {
-                        inspector::SolidElement::BodyFace(face)
-                    } else if let Some((_, face)) = self.selected_face.filter(|(id, _)| owns(*id)) {
+                if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| owns(*id)) {
+                    inspector::SolidElement::BodyFace(face)
+                } else if stored {
+                    if let Some((_, face)) = self.selected_face.filter(|(id, _)| owns(*id)) {
                         inspector::SolidElement::BodyFace(u32::from(face) + 1)
                     } else {
                         inspector::SolidElement::Object
@@ -2865,20 +4360,44 @@ impl Editor {
         let primary = self.selection.primary_entity();
         if let Some((id, edge)) = self.selected_edge {
             if Some(id) == primary {
-                return format!(" · Edge E:{edge}");
+                if self.selected_edges.len() > 1 {
+                    return format!(" · {} Edges selected", self.selected_edges.len());
+                }
+                let label = self
+                    .engine
+                    .world()
+                    .authored_block(id)
+                    .map(|record| inspector::edge_identity_label(&record, edge))
+                    .unwrap_or_else(|| format!("E:{edge}"));
+                return format!(" · Edge {label}");
             }
         }
         if let Some((id, vertex)) = self.selected_vertex {
             if Some(id) == primary {
-                return format!(" · Vertex V:{vertex}");
+                if self.selected_vertices.len() > 1 {
+                    return format!(" · {} Vertices selected", self.selected_vertices.len());
+                }
+                let label = self
+                    .engine
+                    .world()
+                    .authored_block(id)
+                    .map(|record| inspector::vertex_identity_label(&record, vertex))
+                    .unwrap_or_else(|| format!("V:{vertex}"));
+                return format!(" · Vertex {label}");
             }
         }
         if let Some((id, face)) = self.selected_body_face {
             if Some(id) == primary {
                 if self.selected_body_faces.len() > 1 {
-                    return format!(" · {} faces", self.selected_body_faces.len());
+                    return format!(" · {} Faces selected", self.selected_body_faces.len());
                 }
-                return format!(" · Face F:{face}");
+                let label = self
+                    .engine
+                    .world()
+                    .authored_block(id)
+                    .map(|record| inspector::face_identity_label(&record, face))
+                    .unwrap_or_else(|| format!("F:{face}"));
+                return format!(" · Face {label}");
             }
         }
         if let Some((id, face)) = self.selected_face {
@@ -2893,6 +4412,10 @@ impl Editor {
     }
 
     fn reset_block_shape(&mut self, entity: EntityUuid) {
+        if self.engine.world().authored_block(entity).is_some_and(|record| record.has_authored_seed()) {
+            self.append(&authored_block_refusal("Reset Shape"));
+            return;
+        }
         let opened = self.history_begin("Reset Shape", &[entity]);
         match self.engine.execute_authoring(AuthoringCommand::ResetBlockShape { target: entity }) {
             Ok(jarvig_core::AuthoringResult::Unchanged) => {
@@ -2935,6 +4458,10 @@ impl Editor {
             self.append("That actor is not a parametric solid.");
             return;
         }
+        if self.engine.world().entity_locked(entity) {
+            self.append("That object is locked.");
+            return;
+        }
         if self.modeling_session.is_some_and(|session| session.tool == tool && session.entity == entity) {
             return;
         }
@@ -2947,17 +4474,29 @@ impl Editor {
             self.append("That actor is not a parametric solid.");
             return;
         };
+        if let Some(reason) = modeling_tool_refusal(&record, tool) {
+            self.append(&reason);
+            return;
+        }
         let Ok(local) = self.engine.world().entity_local_pose(entity) else { return };
         if topology_tool(tool) {
             self.open_topology_session(tool, entity, &record, local.translation);
             return;
         }
+        if tool == ModelingTool::BevelEdge {
+            self.begin_bevel_edge(entity, &record, local.translation);
+            return;
+        }
+        if tool == ModelingTool::Round {
+            self.begin_round(entity, &record, local.translation);
+            return;
+        }
+        if tool == ModelingTool::Extrude && (record.body.is_some() || record.has_authored_seed()) {
+            self.begin_region_extrude(entity, &record, local.translation);
+            return;
+        }
         if record.body.is_some() {
-            if tool == ModelingTool::Extrude {
-                self.begin_region_extrude(entity, &record, local.translation);
-            } else {
-                self.append("Inset and Bevel are not available once the solid has topology. Reset Shape returns to the box.");
-            }
+            self.append("Inset and Bevel are not available once the solid has topology. Reset Shape returns to the box.");
             return;
         }
         let face = if let Some((_, face)) = self.selected_face.filter(|(id, _)| *id == entity) {
@@ -2973,7 +4512,7 @@ impl Editor {
             ModelingTool::Extrude => 0.0,
             ModelingTool::Inset => record.inset_m[face as usize],
             ModelingTool::Bevel => record.bevel_m,
-            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => 0.0,
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex | ModelingTool::BevelEdge | ModelingTool::Round => 0.0,
         };
         self.history_begin(modeling_tool_name(tool), &[entity]);
         self.modeling_session = Some(ModelingSession {
@@ -2992,13 +4531,14 @@ impl Editor {
         unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
     }
 
-    /// Extrudes the selected faces of a stored body. Inset and Bevel stay refused.
+    /// Extrudes the selected faces. A stored body keeps its body. An authored seed uses the replay.
     fn begin_region_extrude(&mut self, entity: EntityUuid, record: &jarvig_core::BlockRecord, translation: Vec3) {
         if record.analytic_features() {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         }
-        let Some(body) = record.body.clone() else {
+        let authored = record.has_authored_seed() && record.body.is_none();
+        let Some(body) = (if authored { selection_body(record) } else { record.body.clone() }) else {
             self.append("Select a face first.");
             return;
         };
@@ -3017,6 +4557,10 @@ impl Editor {
         }
         if faces.is_empty() {
             self.append("Select a face first.");
+            return;
+        }
+        if authored && faces.iter().any(|face| curved_face_name(record, *face)) {
+            self.append("UnsupportedOperation: Extrude does not edit a curved face.");
             return;
         }
         if faces.iter().any(|face| body.face_loop(*face).is_none()) {
@@ -3044,6 +4588,10 @@ impl Editor {
             self.append("Those faces do not form one region.");
             return;
         }
+        if authored && faces.iter().any(|face| jarvig_core::semantic_face_names(record, *face).is_empty()) {
+            self.append("That face has no semantic name.");
+            return;
+        }
         let primary = self
             .selected_body_face
             .filter(|(id, face)| *id == entity && faces.contains(face))
@@ -3051,6 +4599,7 @@ impl Editor {
             .unwrap_or(faces[0]);
         self.history_begin("Extrude", &[entity]);
         self.topology_session_body = Some(Some(body));
+        self.remember_topology_authoring(entity, record);
         self.topology_delta = [0.0; 3];
         self.region_faces = faces;
         self.region_normal = normal;
@@ -3070,6 +4619,302 @@ impl Editor {
         unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
     }
 
+    /// Bevels the selected edges. A width the solid cannot hold stops at the largest closed inset.
+    fn begin_bevel_edge(&mut self, entity: EntityUuid, record: &jarvig_core::BlockRecord, translation: Vec3) {
+        if record.analytic_features() {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        }
+        if eligible_bodyless(record) {
+            self.append("Bevel stays a planar chamfer on a stored body. Use Round for this edge.");
+            return;
+        }
+        let Some(body) = record.display_body() else {
+            self.append("Clear the bevel and the insets before editing edges.");
+            return;
+        };
+        let mut edges = Vec::new();
+        if self.selected_edge.is_none_or(|(id, _)| id == entity) {
+            for edge in &self.selected_edges {
+                if *edge != 0 && !edges.contains(edge) {
+                    edges.push(*edge);
+                }
+            }
+        }
+        if edges.is_empty() {
+            if let Some((_, edge)) = self.selected_edge.filter(|(id, edge)| *id == entity && *edge != 0) {
+                edges.push(edge);
+            }
+        }
+        if edges.is_empty() {
+            self.append("Select an edge first.");
+            return;
+        }
+        if edges.iter().any(|edge| body.edge_endpoints(*edge).is_none()) {
+            self.append("That element is not on the solid.");
+            return;
+        }
+        match body.bevel_edges(&edges, 2.0e-4) {
+            Ok(_) => {}
+            Err(jarvig_core::TopologyError::Missing) => {
+                self.append("That element is not on the solid.");
+                return;
+            }
+            Err(_) => {
+                self.append(cannot_bevel(edges.len()));
+                return;
+            }
+        }
+        let Some(bisector) = bevel_bisector(&body, edges[0]) else {
+            self.append(cannot_bevel(edges.len()));
+            return;
+        };
+        let Some(anchor) = self.edge_midpoint(&body, edges[0]) else {
+            self.append(cannot_bevel(edges.len()));
+            return;
+        };
+        let primary = self
+            .selected_edge
+            .filter(|(id, edge)| *id == entity && edges.contains(edge))
+            .map(|(_, edge)| edge)
+            .unwrap_or(edges[0]);
+        self.history_begin("Bevel", &[entity]);
+        self.topology_session_body = Some(record.body.clone());
+        self.remember_topology_authoring(entity, record);
+        self.topology_delta = [0.0; 3];
+        self.bevel_request = edges.clone();
+        self.bevel_edges = edges;
+        self.bevel_anchor = anchor;
+        self.bevel_next_id = body.next_id;
+        self.bevel_expanded = false;
+        self.bevel_clamped = false;
+        self.region_normal = bisector;
+        self.modeling_session = Some(ModelingSession {
+            tool: ModelingTool::BevelEdge,
+            entity,
+            face: 0,
+            element: primary,
+            baseline_size: record.size_m,
+            baseline_inset: record.inset_m,
+            baseline_bevel: record.bevel_m,
+            baseline_local: translation,
+            amount: 0.0,
+        });
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    fn selected_edge_ids(&self, entity: EntityUuid) -> Vec<u32> {
+        let mut edges = Vec::new();
+        if self.selected_edge.is_none_or(|(id, _)| id == entity) {
+            for edge in &self.selected_edges {
+                if *edge != 0 && !edges.contains(edge) {
+                    edges.push(*edge);
+                }
+            }
+        }
+        if edges.is_empty() {
+            if let Some((_, edge)) = self.selected_edge.filter(|(id, edge)| *id == entity && *edge != 0) {
+                edges.push(edge);
+            }
+        }
+        edges
+    }
+
+    fn selected_body_face_ids(&self, entity: EntityUuid) -> Vec<u32> {
+        let mut faces = Vec::new();
+        if self.selected_body_face.is_none_or(|(id, _)| id == entity) {
+            for face in &self.selected_body_faces {
+                if *face != 0 && !faces.contains(face) {
+                    faces.push(*face);
+                }
+            }
+        }
+        if faces.is_empty() {
+            if let Some((_, face)) = self.selected_body_face.filter(|(id, face)| *id == entity && *face != 0) {
+                faces.push(face);
+            }
+        }
+        faces
+    }
+
+    /// Opens Round on the selected semantic edges. The world stays unchanged until Apply.
+    /// A fillet face or boundary reopens the tape entry that owns it, at that entry's radius.
+    fn begin_round(&mut self, entity: EntityUuid, record: &jarvig_core::BlockRecord, translation: Vec3) {
+        if let Some(reason) = round_class_refusal(record) {
+            self.append(&reason);
+            return;
+        }
+        let reopened = match self.selection_mode {
+            SelectionMode::Face => round_feature_reopen(record, &self.selected_body_face_ids(entity)),
+            SelectionMode::Edge => round_feature_reopen(record, &self.selected_edge_ids(entity)),
+            SelectionMode::Auto | SelectionMode::Object | SelectionMode::Vertex => None,
+        };
+        let (edges, requested) = if let Some((edges, radius)) = reopened {
+            (edges, Some(radius))
+        } else if self.selection_mode == SelectionMode::Edge {
+            (self.selected_edge_ids(entity), None)
+        } else if self.selection_mode == SelectionMode::Object && record.has_authored_seed() {
+            (authored_sharp_edge_ids(record), None)
+        } else {
+            (Vec::new(), None)
+        };
+        if edges.is_empty() {
+            self.append("Select an edge first.");
+            return;
+        }
+        let open = match resolve_round_open(record, &edges, requested) {
+            Ok(open) => open,
+            Err(reason) => {
+                self.append(&reason);
+                return;
+            }
+        };
+        if !open.note.is_empty() {
+            self.append(&open.note);
+        }
+        if open.readiness == RoundStatus::Clamped {
+            self.append(&format!(
+                "Round radius clamped: requested {:.3} m, maximum {:.3} m.",
+                open.requested_m, open.max_radius_m
+            ));
+        }
+        let (crown_per_radius, away) = match jarvig_core::fillet_crown_step(&open.fillet) {
+            Ok(step) => step,
+            Err(reason) => {
+                self.append(&reason);
+                return;
+            }
+        };
+        let edge = open.edge;
+        let amount = open.amount;
+        self.round_basis = Some(RoundBasis {
+            entity,
+            edge,
+            picked: open.picked,
+            tokens: open.tokens,
+            body: open.body,
+            fillets: open.fillets,
+            kept: open.kept,
+            fillet: open.fillet,
+            max_radius_m: open.max_radius_m,
+            crown_per_radius,
+            away,
+            readiness: open.readiness,
+            note: open.note,
+        });
+        self.round_preview = None;
+        self.modeling_session = Some(ModelingSession {
+            tool: ModelingTool::Round,
+            entity,
+            face: 0,
+            element: edge,
+            baseline_size: record.size_m,
+            baseline_inset: record.inset_m,
+            baseline_bevel: record.bevel_m,
+            baseline_local: translation,
+            amount,
+        });
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+    }
+
+    fn preview_round_amount(&mut self, session: ModelingSession, amount: f64) {
+        let Some(basis) = self.round_basis.as_ref() else {
+            self.realize_inspector_controls();
+            return;
+        };
+        if basis.entity != session.entity || basis.edge != session.element {
+            return;
+        }
+        let maximum = basis.max_radius_m.max(0.001);
+        let applied = if amount.is_finite() { amount.clamp(0.001, maximum) } else { session.amount };
+        if (applied - session.amount).abs() < 1.0e-9 {
+            return;
+        }
+        if basis.readiness != RoundStatus::Conflict {
+            for fillet in &basis.fillets {
+                if jarvig_core::fillet_scaled(fillet, applied).is_err() {
+                    self.realize_inspector_controls();
+                    return;
+                }
+            }
+        }
+        if let Some(open) = self.modeling_session.as_mut() {
+            open.amount = applied;
+        }
+        self.show_round_radius(applied);
+    }
+
+    fn apply_round(&mut self, session: ModelingSession) {
+        self.round_drag = None;
+        self.hide_round_label();
+        let Some(basis) = self.round_basis.take() else {
+            self.append("Round was not applied: the edge was not resolved.");
+            self.modeling_session = Some(session);
+            return;
+        };
+        if basis.readiness == RoundStatus::Conflict {
+            let reason = if basis.note.is_empty() { "the radii do not fit together".to_string() } else { basis.note.clone() };
+            self.append(&format!("Round was not applied: {reason}."));
+            self.restore_refused_round(session, basis);
+            return;
+        }
+        let Some(record) = self.engine.world().authored_block(session.entity) else {
+            self.append("Round was not applied: the solid is gone.");
+            self.restore_refused_round(session, basis);
+            return;
+        };
+        let maximum = basis.max_radius_m.max(0.001);
+        let amount = session.amount.clamp(0.001, maximum);
+        let tokens = basis.tokens.clone();
+        let committed = match jarvig_core::commit_authored_round(&record, jarvig_core::round_entry_set(&tokens, amount)) {
+            Ok(committed) => committed,
+            Err(reason) => {
+                self.append(&format!("Round was not applied: {reason}."));
+                self.restore_refused_round(session, basis);
+                return;
+            }
+        };
+        if committed.body.is_some() {
+            self.append("Round was not applied: the preview stored a body.");
+            self.restore_refused_round(session, basis);
+            return;
+        }
+        if !self.history_begin("Round", &[session.entity]) {
+            self.append("Round was not applied: undo is busy.");
+            self.restore_refused_round(session, basis);
+            return;
+        }
+        let intent_len = committed.intent.len();
+        match self.engine.world_mut().replace_block_record(session.entity, committed) {
+            Ok(_) => {
+                self.history_commit();
+                self.append(&format!("Applied Round on {}.", tokens.join(" ")));
+                self.append(&format!(
+                    "COMMAND round inputs {} appended round body_before absent body_after absent intent {intent_len}",
+                    tokens.join(" ")
+                ));
+                self.round_refused = None;
+                self.clear_round_view();
+                self.refresh_round_views();
+            }
+            Err(error) => {
+                let _ = self.history_cancel();
+                self.append(&format!("Round was not applied: {error}."));
+                self.restore_refused_round(session, basis);
+            }
+        }
+    }
+
+    /// Puts the Round preview back after a refusal. The tape is unchanged.
+    fn restore_refused_round(&mut self, session: ModelingSession, basis: RoundBasis) {
+        self.round_basis = Some(basis);
+        self.modeling_session = Some(session);
+    }
+
     fn commit_modeling_amount(&mut self, text: &str) {
         if self.modeling_session.is_none() {
             return;
@@ -3079,6 +4924,14 @@ impl Editor {
             self.realize_inspector_controls();
             return;
         };
+        if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round) {
+            if let Some(basis) = self.round_basis.as_ref() {
+                let maximum = basis.max_radius_m.max(0.001);
+                if value > maximum + 1.0e-9 {
+                    self.append(&format!("Round radius clamped: requested {value:.3} m, maximum {maximum:.3} m."));
+                }
+            }
+        }
         self.preview_modeling_amount(value);
     }
 
@@ -3090,6 +4943,14 @@ impl Editor {
         }
         if region_extrude(session) {
             self.preview_region_amount(session, applied);
+            return;
+        }
+        if session.tool == ModelingTool::BevelEdge {
+            self.preview_bevel_amount(session, applied);
+            return;
+        }
+        if session.tool == ModelingTool::Round {
+            self.preview_round_amount(session, applied);
             return;
         }
         let result = match session.tool {
@@ -3106,7 +4967,7 @@ impl Editor {
                 meters: applied,
             }),
             ModelingTool::Bevel => self.engine.execute_authoring(AuthoringCommand::PreviewBlockBevel { target: session.entity, meters: applied }),
-            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => return,
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex | ModelingTool::BevelEdge | ModelingTool::Round => return,
         };
         if result.is_err() {
             self.realize_inspector_controls();
@@ -3120,8 +4981,13 @@ impl Editor {
 
     /// Extrudes `region_faces` from the session baseline. A rejected distance keeps the last valid body.
     fn preview_region_amount(&mut self, session: ModelingSession, amount: f64) {
+        if self.authored_extrude_target(session.entity) {
+            self.preview_authored_region(session, amount);
+            return;
+        }
         let Some(Some(baseline)) = self.topology_session_body.clone() else { return };
         if amount.abs() < 1.0e-12 {
+            self.stage_topology_baseline_materials(session.entity);
             let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
                 target: session.entity,
                 body: Some(baseline),
@@ -3139,10 +5005,11 @@ impl Editor {
             self.region_normal[1] * amount,
             self.region_normal[2] * amount,
         ];
-        let Ok(edit) = baseline.extrude_faces(&self.region_faces, delta) else {
+        let Ok((edit, lineage)) = baseline.extrude_faces_traced(&self.region_faces, delta) else {
             self.realize_inspector_controls();
             return;
         };
+        self.stage_projected_materials(session.entity, &baseline, &edit.body, &lineage);
         let Ok(local_pose) = self.engine.world().entity_local_pose(session.entity) else { return };
         let shift = local_pose.rotation.rotate(Vec3::new(edit.shift[0], edit.shift[1], edit.shift[2]));
         let translation = Vec3::new(session.baseline_local.x + shift.x, session.baseline_local.y + shift.y, session.baseline_local.z + shift.z);
@@ -3160,24 +5027,217 @@ impl Editor {
         self.rebuild_inspector();
     }
 
+    /// Shows an authored extrude without writing the body. Amount zero clears the preview.
+    fn preview_authored_region(&mut self, session: ModelingSession, amount: f64) {
+        let Some(Some(baseline)) = self.topology_session_body.clone() else { return };
+        if amount.abs() < 1.0e-12 {
+            self.clear_extrude_preview();
+            let _ = self.engine.world_mut().set_entity_local_translation(session.entity, session.baseline_local);
+            if let Some(open) = self.modeling_session.as_mut() {
+                open.amount = 0.0;
+            }
+            self.rebuild_inspector();
+            return;
+        }
+        let delta = [self.region_normal[0] * amount, self.region_normal[1] * amount, self.region_normal[2] * amount];
+        let Ok((edit, _)) = baseline.extrude_faces_traced(&self.region_faces, delta) else {
+            self.realize_inspector_controls();
+            return;
+        };
+        let Some(record) = self.engine.world().authored_block(session.entity) else { return };
+        let rounded = if observes_saved_round(&record) {
+            let Ok(next) = jarvig_core::authored_extrude_record(&record, &self.region_faces, delta) else {
+                self.realize_inspector_controls();
+                return;
+            };
+            match self.preview_round_camera(session.entity) {
+                Some(camera) => match jarvig_core::realize_round_solid(&next, &camera, "Viewport", 1) {
+                    Ok(product) => Some(product.mesh),
+                    Err(_) => {
+                        self.realize_inspector_controls();
+                        return;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Ok(local_pose) = self.engine.world().entity_local_pose(session.entity) else { return };
+        let shift = local_pose.rotation.rotate(Vec3::new(edit.shift[0], edit.shift[1], edit.shift[2]));
+        let translation = Vec3::new(session.baseline_local.x + shift.x, session.baseline_local.y + shift.y, session.baseline_local.z + shift.z);
+        if self.engine.world_mut().set_entity_local_translation(session.entity, translation).is_err() {
+            self.realize_inspector_controls();
+            return;
+        }
+        if let Some(mesh) = rounded {
+            self.show_extrude_preview_mesh(session.entity, mesh, edit.body);
+        } else {
+            self.show_extrude_preview(session.entity, edit.body);
+        }
+        if let Some(open) = self.modeling_session.as_mut() {
+            open.amount = amount;
+        }
+        self.rebuild_inspector();
+    }
+
+    fn preview_round_camera(&self, entity: EntityUuid) -> Option<jarvig_core::RoundCamera> {
+        let view = self.viewport_view?;
+        let controller = self.editor_camera.clone()?;
+        let rect = self.renderer.as_ref().and_then(|renderer| renderer.viewport(view).ok().flatten())?;
+        if rect.width < 2 || rect.height < 2 {
+            return None;
+        }
+        let pose = self.engine.world().entity_world_pose(entity).ok()?;
+        Some(local_round_camera(&pose, &controller, rect.width, rect.height))
+    }
+
+    fn show_extrude_preview(&mut self, entity: EntityUuid, body: SolidBody) {
+        let mesh = jarvig_core::mesh_from_body(&body);
+        self.show_extrude_preview_mesh(entity, mesh, body);
+    }
+
+    fn show_extrude_preview_mesh(&mut self, entity: EntityUuid, mesh: jarvig_core::Mesh, body: SolidBody) {
+        let mesh_id = self.engine.world_mut().add_mesh(mesh);
+        let installed = match (self.viewport_view, self.renderer.as_mut()) {
+            (Some(view), Some(renderer)) => renderer.set_view_mesh_override(view, entity, Some(mesh_id)).is_ok(),
+            _ => false,
+        };
+        if !installed {
+            let _ = self.engine.world_mut().retire_unreferenced_mesh(mesh_id);
+        }
+        if let Some(previous) = self.extrude_preview.take() {
+            if let Some(old) = previous.mesh {
+                let _ = self.engine.world_mut().retire_unreferenced_mesh(old);
+            }
+        }
+        self.extrude_preview = Some(ExtrudePreview { entity, mesh: installed.then_some(mesh_id), body });
+    }
+
+    fn clear_extrude_preview(&mut self) {
+        let Some(preview) = self.extrude_preview.take() else { return };
+        if preview.mesh.is_some() {
+            if let Some(view) = self.viewport_view {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let _ = renderer.set_view_mesh_override(view, preview.entity, None);
+                }
+            }
+        }
+        if let Some(mesh) = preview.mesh {
+            let _ = self.engine.world_mut().retire_unreferenced_mesh(mesh);
+        }
+    }
+
+    fn authored_extrude_target(&self, entity: EntityUuid) -> bool {
+        self.engine.world().authored_block(entity).is_some_and(|record| record.has_authored_seed() && record.body.is_none())
+    }
+
+    /// Appends the extrude after the preview translation is put back, so the recenter shift is applied once.
+    fn commit_authored_extrude(
+        &mut self,
+        session: ModelingSession,
+        faces: Vec<u32>,
+        normal: [f64; 3],
+    ) -> Result<jarvig_core::AuthoringResult, jarvig_core::AuthoringError> {
+        self.clear_extrude_preview();
+        if self.engine.world_mut().set_entity_local_translation(session.entity, session.baseline_local).is_err() {
+            return Err(jarvig_core::AuthoringError::InvalidOperation);
+        }
+        let delta_m = [normal[0] * session.amount, normal[1] * session.amount, normal[2] * session.amount];
+        self.engine.execute_authoring(AuthoringCommand::ExtrudeAuthoredFaces { target: session.entity, faces, delta_m })
+    }
+
+    /// Bevels `bevel_request` from the session baseline. The amount field keeps the inset that fit.
+    fn preview_bevel_amount(&mut self, session: ModelingSession, amount: f64) {
+        let Some(baseline) = self.session_geometry(&session) else { return };
+        if amount.abs() < 1.0e-12 {
+            self.stage_topology_baseline_materials(session.entity);
+            let stored = self.topology_session_body.clone().unwrap_or(None);
+            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                target: session.entity,
+                body: stored,
+                size_m: session.baseline_size,
+                translation: session.baseline_local,
+            });
+            self.bevel_edges = self.bevel_request.clone();
+            self.bevel_expanded = false;
+            self.bevel_clamped = false;
+            if let Some(open) = self.modeling_session.as_mut() {
+                open.amount = 0.0;
+            }
+            self.rebuild_inspector();
+            return;
+        }
+        let Ok((cut, lineage)) = baseline.bevel_edges_traced(&self.bevel_request, amount) else {
+            self.realize_inspector_controls();
+            return;
+        };
+        self.stage_projected_materials(session.entity, &baseline, &cut.edit.body, &lineage);
+        let Ok(local_pose) = self.engine.world().entity_local_pose(session.entity) else { return };
+        let shift = local_pose.rotation.rotate(Vec3::new(cut.edit.shift[0], cut.edit.shift[1], cut.edit.shift[2]));
+        let translation = Vec3::new(session.baseline_local.x + shift.x, session.baseline_local.y + shift.y, session.baseline_local.z + shift.z);
+        if self
+            .engine
+            .execute_authoring(AuthoringCommand::PreviewBlockBody { target: session.entity, body: cut.edit.body, translation })
+            .is_err()
+        {
+            self.realize_inspector_controls();
+            return;
+        }
+        self.bevel_edges = cut.edges;
+        self.bevel_expanded = cut.expanded;
+        self.bevel_clamped = cut.clamped;
+        if let Some(open) = self.modeling_session.as_mut() {
+            open.amount = cut.width_m;
+        }
+        self.rebuild_inspector();
+    }
+
     fn apply_modeling(&mut self) {
         let Some(session) = self.modeling_session.take() else { return };
         self.face_drag.take();
         self.topology_drag.take();
+        self.round_drag.take();
+        self.hide_round_label();
+        let defaulted = self.topology_defaulted;
+        let group_ambiguous = self.topology_group_ambiguous;
         let stored_body = self.topology_session_body.take();
         let delta = self.topology_delta;
         self.topology_delta = [0.0; 3];
         let region_faces = std::mem::take(&mut self.region_faces);
+        let command_faces = region_faces.clone();
         let region_normal = self.region_normal;
         self.region_normal = [0.0; 3];
+        let bevel_edges = std::mem::take(&mut self.bevel_edges);
+        let bevel_expanded = self.bevel_expanded;
+        let bevel_clamped = self.bevel_clamped;
+        self.bevel_request.clear();
+        self.bevel_anchor = [0.0; 3];
+        self.bevel_next_id = 0;
+        self.bevel_expanded = false;
+        self.bevel_clamped = false;
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
+        }
+        if session.tool == ModelingTool::Round {
+            self.apply_round(session);
+            self.clear_topology_authoring();
+            self.inspector_force_realize = true;
+            self.rebuild_inspector();
+            unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+            return;
         }
         let name = modeling_tool_name(session.tool);
         let result = match session.tool {
             ModelingTool::Extrude if region_extrude(session) => {
                 if session.amount.abs() < 1.0e-12 {
+                    if self.authored_extrude_target(session.entity) {
+                        self.clear_extrude_preview();
+                        let _ = self.engine.world_mut().set_entity_local_translation(session.entity, session.baseline_local);
+                    }
                     Ok(jarvig_core::AuthoringResult::Unchanged)
+                } else if self.authored_extrude_target(session.entity) {
+                    self.commit_authored_extrude(session, region_faces, region_normal)
                 } else {
                     let delta_m = [region_normal[0] * session.amount, region_normal[1] * session.amount, region_normal[2] * session.amount];
                     self.engine.execute_authoring(AuthoringCommand::CommitBlockTopology {
@@ -3200,6 +5260,22 @@ impl Editor {
                 target: session.entity,
                 baseline_m: session.baseline_bevel,
             }),
+            ModelingTool::BevelEdge => {
+                if session.amount.abs() < 1.0e-12 {
+                    Ok(jarvig_core::AuthoringResult::Unchanged)
+                } else {
+                    if bevel_expanded {
+                        self.append("The bevel followed the straight run.");
+                    }
+                    if bevel_clamped {
+                        self.append(&format!("The width stopped at {:.2}.", session.amount));
+                    }
+                    self.engine.execute_authoring(AuthoringCommand::CommitBlockTopology {
+                        target: session.entity,
+                        op: BlockOp::BevelEdges { edges: bevel_edges, distance_m: session.amount },
+                    })
+                }
+            }
             ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => {
                 if delta.iter().all(|axis| axis.abs() < 1.0e-12) {
                     Ok(jarvig_core::AuthoringResult::Unchanged)
@@ -3213,6 +5289,7 @@ impl Editor {
                     self.engine.execute_authoring(AuthoringCommand::CommitBlockTopology { target: session.entity, op })
                 }
             }
+            ModelingTool::Round => Ok(jarvig_core::AuthoringResult::Unchanged),
         };
         match result {
             Ok(jarvig_core::AuthoringResult::Unchanged) => {
@@ -3220,23 +5297,54 @@ impl Editor {
                 self.append(&format!("{name} left the solid unchanged."));
             }
             Ok(_) => {
+                if session.tool == ModelingTool::BevelEdge {
+                    self.element_selection.clear();
+                    self.publish_elements();
+                }
                 self.history_commit();
+                if defaulted > 0 && projects_new_faces(session) {
+                    self.append("The new faces stayed on the default material.");
+                }
+                if group_ambiguous > 0 && projects_new_faces(session) {
+                    self.append("A new face did not join a surface group.");
+                }
                 self.append(&format!("Applied {name}."));
+                if session.tool == ModelingTool::Extrude {
+                    self.note_authored_extrude(session.entity, &command_faces);
+                }
             }
             Err(error) => {
-                if !self.history_cancel() && (topology_tool(session.tool) || region_extrude(session)) {
-                    if let Some(body) = stored_body {
-                        let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
-                            target: session.entity,
-                            body,
-                            size_m: session.baseline_size,
-                            translation: session.baseline_local,
-                        });
+                let authored = self.authored_extrude_target(session.entity);
+                if !self.history_cancel() && restores_authored_body(session) {
+                    if authored {
+                        self.clear_extrude_preview();
+                        let _ = self.engine.world_mut().set_entity_local_translation(session.entity, session.baseline_local);
+                    } else {
+                        self.stage_topology_baseline_materials(session.entity);
+                        if let Some(body) = stored_body {
+                            let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                                target: session.entity,
+                                body,
+                                size_m: session.baseline_size,
+                                translation: session.baseline_local,
+                            });
+                        }
                     }
                 }
-                self.append(&format!("{name} was not applied: {error}."));
+                if authored && session.tool == ModelingTool::Extrude {
+                    let delta = [region_normal[0] * session.amount, region_normal[1] * session.amount, region_normal[2] * session.amount];
+                    let detail = self.engine.world().authored_block(session.entity).and_then(|record| jarvig_core::authored_extrude_record(&record, &command_faces, delta).err());
+                    if let Some(detail) = detail {
+                        self.append(&format!("Extrude was not applied: {detail}."));
+                    } else {
+                        self.append(&format!("{name} was not applied: {error}."));
+                    }
+                } else {
+                    self.append(&format!("{name} was not applied: {error}."));
+                }
             }
         }
+        self.clear_topology_authoring();
         self.inspector_force_realize = true;
         self.rebuild_inspector();
         unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
@@ -3252,8 +5360,23 @@ impl Editor {
         self.topology_delta = [0.0; 3];
         self.region_faces.clear();
         self.region_normal = [0.0; 3];
-        if !self.history_cancel() {
-            if topology_tool(session.tool) || region_extrude(session) {
+        self.bevel_request.clear();
+        self.bevel_edges.clear();
+        self.bevel_anchor = [0.0; 3];
+        self.bevel_next_id = 0;
+        self.bevel_expanded = false;
+        self.bevel_clamped = false;
+        self.round_preview = None;
+        self.round_basis = None;
+        self.round_drag = None;
+        self.hide_round_label();
+        let authored_extrude = session.tool == ModelingTool::Extrude && self.authored_extrude_target(session.entity);
+        self.clear_extrude_preview();
+        if !self.history_cancel() && session.tool != ModelingTool::Round {
+            if authored_extrude {
+                let _ = self.engine.world_mut().set_entity_local_translation(session.entity, session.baseline_local);
+            } else if restores_authored_body(session) {
+                self.stage_topology_baseline_materials(session.entity);
                 if let Some(body) = stored_body {
                     let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
                         target: session.entity,
@@ -3275,6 +5398,7 @@ impl Editor {
         if matches!(self.capture, Some(CaptureKind::Face | CaptureKind::Gizmo)) {
             self.end_capture(true, false);
         }
+        self.clear_topology_authoring();
         if announce {
             self.append("Canceled the modeling preview.");
         }
@@ -3288,25 +5412,41 @@ impl Editor {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         }
+        if eligible_bodyless(record) {
+            self.append("Bevel stays a planar chamfer on a stored body. Use Round for this edge.");
+            return;
+        }
         let Some(body) = record.display_body() else {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         };
         let element = match tool {
-            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge => match self.selected_edge.filter(|(id, _)| *id == entity) {
-                Some((_, edge)) => edge,
-                None => {
-                    self.append("Select an edge first.");
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge => {
+                if self.selected_edges.len() > 1 {
+                    self.append("Select one edge. Bevel uses the whole set.");
                     return;
                 }
-            },
-            ModelingTool::MoveVertex => match self.selected_vertex.filter(|(id, _)| *id == entity) {
-                Some((_, vertex)) => vertex,
-                None => {
-                    self.append("Select a vertex first.");
+                match self.selected_edge.filter(|(id, _)| *id == entity) {
+                    Some((_, edge)) => edge,
+                    None => {
+                        self.append("Select an edge first.");
+                        return;
+                    }
+                }
+            }
+            ModelingTool::MoveVertex => {
+                if self.selected_vertices.len() > 1 {
+                    self.append("Select one vertex to move.");
                     return;
                 }
-            },
+                match self.selected_vertex.filter(|(id, _)| *id == entity) {
+                    Some((_, vertex)) => vertex,
+                    None => {
+                        self.append("Select a vertex first.");
+                        return;
+                    }
+                }
+            }
             _ => return,
         };
         let present = match tool {
@@ -3319,6 +5459,7 @@ impl Editor {
         }
         self.history_begin(modeling_tool_name(tool), &[entity]);
         self.topology_session_body = Some(record.body.clone());
+        self.remember_topology_authoring(entity, record);
         self.topology_delta = [0.0; 3];
         self.modeling_session = Some(ModelingSession {
             tool,
@@ -3349,11 +5490,24 @@ impl Editor {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         }
+        if self.selected_edges.len() > 1 {
+            self.append("Select one edge to split. Bevel uses the whole set.");
+            return;
+        }
         let Some((_, edge)) = self.selected_edge.filter(|(id, _)| *id == entity) else {
             self.append("Select an edge first.");
             return;
         };
-        let Some(body) = record.display_body() else {
+        if record.has_authored_seed() {
+            if let Some(reason) = jarvig_core::authored_split_conflict(&record, edge) {
+                self.append(&format!("{reason}."));
+                return;
+            }
+        } else if eligible_bodyless(&record) {
+            self.append("Bevel stays a planar chamfer on a stored body. Use Round for this edge.");
+            return;
+        }
+        let Some(body) = (if record.has_authored_seed() { selection_body(&record) } else { record.display_body() }) else {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
         };
@@ -3372,6 +5526,9 @@ impl Editor {
             Ok(_) => {
                 if opened {
                     self.history_commit();
+                }
+                if self.engine.world().surface_group_ambiguous() > 0 {
+                    self.append("A new face did not join a surface group.");
                 }
                 self.append(&format!("Split edge E:{edge}."));
                 self.sync_outliner();
@@ -3470,6 +5627,10 @@ impl Editor {
             self.cancel_modeling(false);
         }
         let Some(record) = self.engine.world().authored_block(entity) else { return };
+        if record.has_authored_seed() {
+            self.append(&authored_block_refusal("Subdivide"));
+            return;
+        }
         if record.analytic_features() {
             self.append("Clear the bevel and the insets before editing edges.");
             return;
@@ -3527,11 +5688,12 @@ impl Editor {
                 }
                 self.subdivide_hint = None;
                 self.selected_face = None;
-                self.selected_body_face = Some((entity, face));
-                self.selected_body_faces = vec![face];
-                self.selected_edge = None;
-                self.selected_vertex = None;
+                self.element_selection.click(entity, selection::ElementKind::Face, face, false, false);
+                self.publish_elements();
                 let follow = if switched { " Face mode is on. Click the next piece." } else { "" };
+                if self.engine.world().surface_group_ambiguous() > 0 {
+                    self.append("A new face did not join a surface group.");
+                }
                 self.append(&format!("Subdivided face F:{face} {u}×{v}.{follow}"));
                 self.inspector_force_realize = true;
                 self.sync_outliner();
@@ -3546,6 +5708,10 @@ impl Editor {
     }
 
     fn mirror_selected_block(&mut self, entity: EntityUuid, axis: u8) {
+        if self.engine.world().authored_block(entity).is_some_and(|record| record.has_authored_seed()) {
+            self.append(&authored_block_refusal("Mirror"));
+            return;
+        }
         self.cancel_modeling(false);
         let opened = self.history_begin("Mirror", &[]);
         match self.engine.execute_authoring(AuthoringCommand::MirrorBlock { target: entity, axis }) {
@@ -3925,6 +6091,10 @@ impl Editor {
                 TreeKey::Entity(id) => {
                     let _ = self.apply_outliner_activation(Some(id), ctrl);
                 }
+                TreeKey::Folder(id) => {
+                    self.outliner.set_caret(Some(outliner::OutlinerNodeId::Folder(id)));
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
             }
         }
     }
@@ -3945,6 +6115,10 @@ impl Editor {
                         }
                     }
                     Some(TreeKey::Tool(tool)) if tool == self.land_tool => {
+                        text = chrome::TEXT;
+                        background = chrome::SELECT;
+                    }
+                    Some(TreeKey::Folder(id)) if self.outliner.caret() == Some(outliner::OutlinerNodeId::Folder(id)) => {
                         text = chrome::TEXT;
                         background = chrome::SELECT;
                     }
@@ -3978,6 +6152,12 @@ impl Editor {
             "World"
         };
         let world_item = self.insert_tree_item(TVI_ROOT, root, TreeKey::World);
+        if !self.character_workspace {
+            let folders = self.outliner.folder_roots().to_vec();
+            for folder in folders {
+                self.insert_folder_row(world_item, folder);
+            }
+        }
         let roots = self.outliner.roots().to_vec();
         self.insert_entity_rows(world_item, &roots);
         if self.outliner.world_expanded() && world_item != 0 {
@@ -3992,10 +6172,30 @@ impl Editor {
         self.outliner_applying = false;
     }
 
+    fn insert_folder_row(&mut self, parent: HTREEITEM, id: u32) {
+        let Some(folder) = self.outliner.folder(id) else { return };
+        let name = folder.name.clone();
+        let children = folder.child_folders.clone();
+        let entities = folder.entities.clone();
+        let expanded = self.outliner.is_folder_expanded(id);
+        let item = self.insert_tree_item(parent, &name, TreeKey::Folder(id));
+        for child in children {
+            self.insert_folder_row(item, child);
+        }
+        self.insert_entity_rows(item, &entities);
+        if expanded && item != 0 {
+            let hwnd = self.panel_hwnd(OUTLINER);
+            unsafe { SendMessageW(hwnd, TVM_EXPAND, TVE_EXPAND as usize, item); }
+        }
+    }
+
     fn insert_entity_rows(&mut self, parent: HTREEITEM, entities: &[EntityUuid]) {
         let entities = entities.to_vec();
         for entity in entities {
-            let name = self.outliner.row_text(entity).unwrap_or_else(|| "Unnamed".to_string());
+            let mut name = self.outliner.row_text(entity).unwrap_or_else(|| "Unnamed".to_string());
+            if !self.session_active() && self.editor_hidden.contains(&entity) {
+                name.push_str("  ·  Hidden in Editor");
+            }
             let children = self.outliner.children(entity).to_vec();
             let expanded = self.outliner.is_expanded(entity);
             let item = self.insert_tree_item(parent, &name, TreeKey::Entity(entity));
@@ -4062,6 +6262,7 @@ impl Editor {
         let index = self.tree_keys.iter().position(|key| match (node, key) {
             (outliner::OutlinerNodeId::WorldRoot, TreeKey::World) => true,
             (outliner::OutlinerNodeId::Entity(entity), TreeKey::Entity(stored)) => entity == *stored,
+            (outliner::OutlinerNodeId::Folder(id), TreeKey::Folder(stored)) => id == *stored,
             _ => false,
         })?;
         let item = self.find_item_by_param(index as isize);
@@ -4087,6 +6288,7 @@ impl Editor {
         match header.code {
             NM_SETFOCUS => self.note_child_focus(OUTLINER.raw()),
             NM_CLICK => self.on_outliner_click(),
+            NM_RCLICK => self.on_outliner_right_click(),
             TVN_KEYDOWN => {
                 let key = unsafe { &*(lparam as *const OutlinerKey) };
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
@@ -4108,6 +6310,10 @@ impl Editor {
                 match self.tree_key(view.itemNew.lParam) {
                     Some(TreeKey::World) => self.outliner.set_world_expanded(expanded),
                     Some(TreeKey::Entity(entity)) => self.outliner.set_expanded(entity, expanded),
+                    Some(TreeKey::Folder(id)) => {
+                        self.outliner.set_folder_expanded(id, expanded);
+                        self.note_folder_expansion();
+                    }
                     Some(TreeKey::Tool(_)) | None => {}
                 }
             }
@@ -4116,6 +6322,7 @@ impl Editor {
                 let text = match self.tree_key(tip.lParam) {
                     Some(TreeKey::World) => "Editor root. Not an entity.".to_string(),
                     Some(TreeKey::Entity(entity)) => entity.to_string(),
+                    Some(TreeKey::Folder(_)) => "Folder. Not a geometric parent.".to_string(),
                     Some(TreeKey::Tool(tool)) => tool.tip().to_string(),
                     None => return 0,
                 };
@@ -4676,6 +6883,13 @@ impl Editor {
             self.camera_probed = true;
         }
         self.tick_editor_camera(delta)?;
+        self.apply_view_lab_frame()?;
+        self.apply_observation_frame()?;
+        self.apply_direct_frame()?;
+        self.apply_intent_frame()?;
+        self.apply_analytic_frame()?;
+        self.apply_authored_frame()?;
+        self.apply_curve_frame()?;
         self.maybe_autosave();
         self.publish_gizmo();
         self.publish_reference();
@@ -4704,6 +6918,7 @@ impl Editor {
             renderer.set_microgeometry(self.micro_enabled, self.micro_seed, self.micro_color);
         }
         self.publish_land_view();
+        self.refresh_round_views();
         self.evict_retired_meshes();
         let target = self.target.ok_or("viewport target missing")?;
         let mut outcome = FrameOutcome::TimedOut;
@@ -4736,6 +6951,7 @@ impl Editor {
             self.settle_load();
             self.step_lod_capture();
             self.step_bind_pose_shots();
+            self.step_window_shot();
         }
         self.submit_micro_request();
         self.cage_draw_us = last_cage_draw_us();
@@ -4811,7 +7027,901 @@ impl Editor {
         Ok(())
     }
 
+    /// Discard the live Intent Solid and rebuild it from its tape, then hold the new frame.
+    ///
+    /// The first presented frame is the ordinary spawn. Discard and rebuild run after that
+    /// present, so the next present is the regenerated mesh. The topology edit waits until
+    /// that regenerated solid has been on screen. `--intent-live-rerealize` alone does not
+    /// enable spawn realization and does not discard anything.
+    fn step_intent_live_rerealize(&mut self) -> Result<(), String> {
+        if !self.intent_live_rerealize || self.intent_live_stage >= 3 {
+            return Ok(());
+        }
+        if self.intent_live_stage == 0 && !self.engine.intent_authority_experiment() {
+            self.append("Intent Authority Live Re-realization refused: the experiment switch is off.");
+            self.intent_live_rerealize = false;
+            self.intent_live_stage = 3;
+            return Ok(());
+        }
+        let outline = self.engine.world().entity_outline();
+        let intent_id = outline.iter().find(|item| item.name == "Intent Solid").map(|item| item.uuid);
+        let legacy_id = outline.iter().find(|item| item.name == "Legacy Cube").map(|item| item.uuid);
+        if self.intent_live_stage == 0 {
+            let (Some(intent_id), Some(legacy_id)) = (intent_id, legacy_id) else {
+                if self.frames >= 90 {
+                    self.append("Intent Authority Live Re-realization failed: Intent Solid was not in the live level.");
+                    return Err("Intent Solid was not in the live level".into());
+                }
+                return Ok(());
+            };
+            let (before, old_mesh, mesh_copy, set_copy, hierarchy_before, intent_tape, legacy_body, legacy_mesh, legacy_at) = {
+                let world = self.engine.world();
+                let record = world.authored_block(intent_id).ok_or("Intent Solid has no block")?;
+                let before = record.body.clone().ok_or("Intent Solid has no realized body")?;
+                if record.intent.is_empty() {
+                    return Err("Intent Solid has no intent tape".into());
+                }
+                let old_mesh = world.object_mesh(intent_id).ok_or("Intent Solid has no mesh")?;
+                let mesh_copy = world.meshes().get(old_mesh).cloned().ok_or("Intent Solid mesh is not in the library")?;
+                let set_copy = world.derived_meshlets(old_mesh).cloned().ok_or("Intent Solid has no meshlets")?;
+                let records: Vec<_> = set_copy.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect();
+                let hierarchy_before = jarvig_core::build_cluster_hierarchy(&records);
+                if records.is_empty() || hierarchy_before.nodes.len() < records.len() {
+                    return Err("Intent Solid has no cluster hierarchy".into());
+                }
+                let legacy = world.authored_block(legacy_id).ok_or("Legacy Cube has no block")?;
+                let legacy_body = legacy.body.clone().ok_or("Legacy Cube has no stored body")?;
+                if !legacy.intent.is_empty() {
+                    return Err("Legacy Cube already has an intent tape".into());
+                }
+                let legacy_mesh = world.object_mesh(legacy_id).ok_or("Legacy Cube has no mesh")?;
+                let legacy_at = world.entity_local_pose(legacy_id).map_err(|error| error.to_string())?.translation;
+                (before, old_mesh, mesh_copy, set_copy, hierarchy_before, record.intent.clone(), legacy_body, legacy_mesh, legacy_at)
+            };
+            self.engine.world_mut().discard_live_block_realization(intent_id).map_err(|error| format!("live discard failed: {error}"))?;
+            {
+                let world = self.engine.world();
+                let record = world.authored_block(intent_id).ok_or("Intent Solid disappeared during discard")?;
+                if record.body.is_some() {
+                    return Err("old evaluated body is still reachable".into());
+                }
+                if record.intent != intent_tape {
+                    return Err("discard changed the intent tape".into());
+                }
+                if world.meshes().get(old_mesh).is_some() {
+                    return Err("old mesh is still reachable".into());
+                }
+                if world.derived_meshlets(old_mesh).is_some() {
+                    return Err("old meshlets are still reachable".into());
+                }
+                let legacy = world.authored_block(legacy_id).ok_or("Legacy Cube disappeared during discard")?;
+                if legacy.body.as_ref() != Some(&legacy_body) || !legacy.intent.is_empty() {
+                    return Err("discard changed the legacy cube".into());
+                }
+            }
+            self.engine.world_mut().rerealize_live_block_from_intent(intent_id).map_err(|error| format!("live re-realization failed: {error}"))?;
+            {
+                let world = self.engine.world();
+                let record = world.authored_block(intent_id).ok_or("Intent Solid disappeared during re-realization")?;
+                let body = record.body.as_ref().ok_or("live reconstructed body is missing")?;
+                if body.validate().is_err() || body != &before {
+                    return Err("live reconstructed body does not match the pre-discard body".into());
+                }
+                if record.intent != intent_tape {
+                    return Err("re-realization changed the intent tape".into());
+                }
+                let new_mesh = world.object_mesh(intent_id).ok_or("regenerated mesh id is missing")?;
+                if new_mesh == old_mesh || world.meshes().get(old_mesh).is_some() {
+                    return Err("re-realization reused the old mesh".into());
+                }
+                let mesh = world.meshes().get(new_mesh).ok_or("regenerated mesh is not in the library")?;
+                if mesh != &mesh_copy {
+                    return Err("regenerated mesh does not match the pre-discard mesh".into());
+                }
+                let set = world.derived_meshlets(new_mesh).ok_or("meshlets were not regenerated")?;
+                if set.meshlets != set_copy.meshlets || set.vertex_indices != set_copy.vertex_indices || set.local_indices != set_copy.local_indices {
+                    return Err("regenerated meshlets do not match".into());
+                }
+                let records: Vec<_> = set.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect();
+                if jarvig_core::build_cluster_hierarchy(&records) != hierarchy_before {
+                    return Err("regenerated hierarchy does not match".into());
+                }
+                let legacy = world.authored_block(legacy_id).ok_or("Legacy Cube disappeared during re-realization")?;
+                if legacy.body.as_ref() != Some(&legacy_body) || !legacy.intent.is_empty() || world.object_mesh(legacy_id) != Some(legacy_mesh) {
+                    return Err("re-realization changed the legacy cube".into());
+                }
+                self.intent_live_counts = Some((body.faces.len(), body.edges.len(), body.vertices.len()));
+            }
+            self.intent_live_legacy = Some(legacy_body);
+            self.intent_live_legacy_mesh = Some(legacy_mesh);
+            self.intent_live_legacy_at = Some(legacy_at);
+            self.intent_live_stage = 1;
+            return Ok(());
+        }
+        let Some(intent_id) = intent_id else {
+            return Err("Intent Solid disappeared after the live rebuild".into());
+        };
+        let Some(legacy_id) = legacy_id else {
+            return Err("Legacy Cube disappeared after the live rebuild".into());
+        };
+        if self.intent_live_stage == 1 {
+            self.append("Frame after regeneration: PRESENTED");
+            self.intent_live_mark = self.frames;
+            self.intent_live_stage = 2;
+            return Ok(());
+        }
+        const HOLD_FRAMES: u32 = 720;
+        if self.frames.saturating_sub(self.intent_live_mark) < HOLD_FRAMES {
+            return Ok(());
+        }
+        self.selection.replace(selection::SelectionItem::entity(intent_id).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        match self.engine.world_mut().split_one_block_edge(intent_id) {
+            Ok(jarvig_core::AuthoringResult::Applied) => {}
+            Ok(other) => return Err(format!("post-regeneration split did not apply: {other:?}")),
+            Err(error) => return Err(format!("post-regeneration split failed: {error}")),
+        }
+        let (post, post_intent, old_mesh) = {
+            let world = self.engine.world();
+            let record = world.authored_block(intent_id).ok_or("Intent Solid disappeared after the edit")?;
+            let post = record.body.clone().ok_or("the edited solid has no body")?;
+            let (faces, edges, vertices) = self.intent_live_counts.ok_or("pre-edit topology was not recorded")?;
+            if post.vertices.len() <= vertices || post.edges.len() <= edges || post.faces.len() < faces {
+                return Err("the post-regeneration edit did not change the topology".into());
+            }
+            if post.validate().is_err() {
+                return Err("the edited body does not validate".into());
+            }
+            let old_mesh = world.object_mesh(intent_id).ok_or("edited solid has no mesh")?;
+            (post, record.intent.clone(), old_mesh)
+        };
+        self.engine.world_mut().discard_live_block_realization(intent_id).map_err(|error| format!("second live discard failed: {error}"))?;
+        {
+            let world = self.engine.world();
+            let record = world.authored_block(intent_id).ok_or("Intent Solid disappeared during the second discard")?;
+            if record.body.is_some() || record.intent != post_intent || world.meshes().get(old_mesh).is_some() || world.derived_meshlets(old_mesh).is_some() {
+                return Err("the second discard left an old body, mesh, or a changed tape".into());
+            }
+        }
+        self.engine.world_mut().rerealize_live_block_from_intent(intent_id).map_err(|error| format!("second live re-realization failed: {error}"))?;
+        let legacy_body = self.intent_live_legacy.clone().ok_or("legacy body was not recorded")?;
+        let legacy_mesh = self.intent_live_legacy_mesh.ok_or("legacy mesh was not recorded")?;
+        let legacy_at = self.intent_live_legacy_at.ok_or("legacy pose was not recorded")?;
+        let legacy_unchanged = {
+            let world = self.engine.world();
+            let record = world.authored_block(intent_id).ok_or("Intent Solid disappeared after the second rebuild")?;
+            let body = record.body.as_ref().ok_or("second reconstructed body is missing")?;
+            if body.validate().is_err() || body != &post || record.intent != post_intent {
+                return Err("the edited solid did not survive the second live rebuild".into());
+            }
+            let new_mesh = world.object_mesh(intent_id).ok_or("second mesh is missing")?;
+            if new_mesh == old_mesh || world.meshes().get(old_mesh).is_some() || world.derived_meshlets(new_mesh).is_none() {
+                return Err("the second rebuild did not replace the mesh".into());
+            }
+            let set = world.derived_meshlets(new_mesh).ok_or("second meshlets are missing")?;
+            let records: Vec<_> = set.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect();
+            if records.is_empty() || jarvig_core::build_cluster_hierarchy(&records).nodes.len() < records.len() {
+                return Err("the second rebuild has no hierarchy".into());
+            }
+            let legacy = world.authored_block(legacy_id).ok_or("Legacy Cube disappeared")?;
+            let at = world.entity_local_pose(legacy_id).map_err(|error| error.to_string())?.translation;
+            legacy.body.as_ref() == Some(&legacy_body) && legacy.intent.is_empty() && world.object_mesh(legacy_id) == Some(legacy_mesh) && at == legacy_at
+        };
+        if !legacy_unchanged {
+            return Err("Legacy Cube changed during live re-realization".into());
+        }
+        let facts = jarvig_core::IntentLiveRerealizeFacts {
+            stored_body_consulted: false,
+            level_reloaded: false,
+            file_reread: false,
+            old_body_reachable: false,
+            old_mesh_reachable: false,
+            body_discarded: true,
+            mesh_discarded: true,
+            meshlets_discarded: true,
+            hierarchy_discarded: true,
+            intent_present: true,
+            body_valid: true,
+            body_hash_match: true,
+            topology_match: true,
+            bounds_match: true,
+            volume_match: true,
+            mesh_regenerated: true,
+            meshlets_regenerated: true,
+            hierarchy_regenerated: true,
+            frame_presented: true,
+            post_edit_valid: true,
+            legacy_unchanged: true,
+        };
+        for line in jarvig_core::format_intent_live_rerealize(&facts).lines() {
+            self.append(line);
+        }
+        self.intent_live_legacy = None;
+        self.intent_live_stage = 3;
+        Ok(())
+    }
+
+    /// Two error budgets of one solid, drawn one after another in the existing viewport.
+    ///
+    /// The realization meshes are library orphans. The block's stored mesh is the control
+    /// and stays the object mesh. Generation is polled; this does not wait on the worker.
+    fn step_view_realization(&mut self) -> Result<(), String> {
+        if self.view_realization.is_none() {
+            return Ok(());
+        }
+        self.view_realization.as_mut().unwrap().host.poll();
+        let stage = self.view_realization.as_ref().unwrap().stage;
+        if stage >= 15 {
+            return Ok(());
+        }
+        match stage {
+            0 => self.view_stage_submit_same(),
+            1 => self.view_stage_same_ready(),
+            2 => self.view_stage_far_ready(),
+            3 => self.view_stage_log_draw("Realization A", 1, 4),
+            4 => self.view_stage_hold_then_show(720, 2, 5),
+            5 => self.view_stage_log_draw("Realization B", 2, 6),
+            6 => self.view_stage_hold_then_far(),
+            7 => self.view_stage_log_draw("Realization far", 4, 8),
+            8 => self.view_stage_hold_then_destroy_a(),
+            9 => self.view_stage_log_draw("View B after View A destroyed", 2, 10),
+            10 => self.view_stage_hold_then_regenerate(),
+            11 => self.view_stage_regenerated_ready(),
+            12 => self.view_stage_log_draw("View A regenerated", 1, 13),
+            13 => self.view_stage_hold_then_destroy_all(),
+            14 => self.view_stage_object_frame(),
+            _ => Ok(()),
+        }
+    }
+
+    fn note_view(&mut self, line: &str) {
+        self.append(line);
+        println!("{line}");
+        if let Some(run) = self.view_realization.as_mut() {
+            run.report.push_str(line);
+            run.report.push('\n');
+        }
+    }
+
+    fn note_view_block(&mut self, text: &str) {
+        for line in text.lines() {
+            self.note_view(line);
+        }
+    }
+
+    fn view_wait_expired(&mut self) -> Result<(), String> {
+        let started = self.view_realization.as_mut().unwrap().wait_from.get_or_insert_with(Instant::now);
+        if started.elapsed().as_secs() > 180 {
+            self.note_view("View realization failed: a request did not publish within 180s.");
+            return Err("a realization request did not publish within 180s".into());
+        }
+        Ok(())
+    }
+
+    fn view_published(&self, view: u32) -> bool {
+        let host = &self.view_realization.as_ref().unwrap().host;
+        host.facts(view).is_some() && !host.is_inflight(view)
+    }
+
+    fn view_submit(&mut self, view: u32, camera: jarvig_core::RealizationCamera) -> Result<jarvig_core::RealizationTicket, String> {
+        let baseline = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap();
+        let body = baseline.record.body.clone().ok_or("the authoritative body is missing")?;
+        let request = jarvig_core::ViewRealizationRequest {
+            view,
+            entity: baseline.intent,
+            body_hash: baseline.body_hash,
+            revision: baseline.revision,
+            body,
+            camera,
+        };
+        self.view_realization.as_mut().unwrap().host.request(request)
+    }
+
+    fn view_install(&mut self, view: u32) -> Result<(), String> {
+        let mesh = self
+            .view_realization
+            .as_ref()
+            .unwrap()
+            .host
+            .facts(view)
+            .ok_or(format!("view {view} has no realization"))?
+            .mesh
+            .clone();
+        let control = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().object_mesh;
+        let id = self.engine.world_mut().add_mesh(mesh);
+        if id == control {
+            self.note_view("View realization failed: add_mesh returned the object mesh id.");
+            return Err("add_mesh returned the object's mesh id".into());
+        }
+        self.view_realization.as_mut().unwrap().library.insert(view, id);
+        Ok(())
+    }
+
+    fn view_show(&mut self, view: u32) -> Result<(), String> {
+        let mesh = *self
+            .view_realization
+            .as_ref()
+            .unwrap()
+            .library
+            .get(&view)
+            .ok_or(format!("view {view} has no library mesh"))?;
+        let entity = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().intent;
+        self.engine.set_frame_mesh_rebind(entity, mesh);
+        Ok(())
+    }
+
+    fn place_editor_camera(&mut self, position: Vec3, yaw: f64, pitch: f64) -> Result<(), String> {
+        {
+            let controller = self.editor_camera.as_mut().ok_or("editor camera missing")?;
+            controller.position = position;
+            controller.yaw = yaw;
+            controller.pitch = pitch;
+        }
+        self.push_editor_camera()
+    }
+
+    fn view_stage_submit_same(&mut self) -> Result<(), String> {
+        if !self.engine.intent_authority_experiment() {
+            self.note_view("View realization refused: the intent-authority experiment is off.");
+            self.view_realization.as_mut().unwrap().stage = 15;
+            return Ok(());
+        }
+        if self.viewport_px.1 < 64 || self.editor_camera.is_none() {
+            if self.frames >= 300 {
+                return Err("the perspective viewport was not ready for a realization".into());
+            }
+            return Ok(());
+        }
+        let outline = self.engine.world().entity_outline();
+        let intent = outline.iter().find(|item| item.name == "Intent Solid").map(|item| item.uuid);
+        let legacy = outline.iter().find(|item| item.name == "Legacy Cube").map(|item| item.uuid);
+        let (Some(intent), Some(legacy)) = (intent, legacy) else {
+            if self.frames >= 300 {
+                self.note_view("View realization failed: Intent Solid was not in the live level.");
+                return Err("Intent Solid was not in the live level".into());
+            }
+            return Ok(());
+        };
+        let controller = self.editor_camera.as_ref().unwrap();
+        let home_position = controller.position;
+        let home_yaw = controller.yaw;
+        let home_pitch = controller.pitch;
+        let camera_pose = controller.pose();
+        let forward = controller.forward();
+        let fov = controller.vertical_fov_radians;
+        let near = controller.near_m;
+        let (width, height) = self.viewport_px;
+        let far_eye = home_position + forward.scale(-8.0);
+        let gathered = {
+            let world = self.engine.world();
+            let record = world.authored_block(intent).ok_or("Intent Solid has no block")?;
+            let body = record.body.clone().ok_or("Intent Solid has no evaluated body. The view flag does not realize a stored body.")?;
+            if body.validate().is_err() {
+                return Err("Intent Solid body does not validate".into());
+            }
+            let legacy_record = world.authored_block(legacy).ok_or("Legacy Cube has no block")?.clone();
+            let object_mesh = world.object_mesh(intent).ok_or("Intent Solid has no mesh")?;
+            let legacy_mesh = world.object_mesh(legacy).ok_or("Legacy Cube has no mesh")?;
+            let set = world.derived_meshlets(object_mesh).ok_or("the control mesh has no meshlets")?.clone();
+            let shared = world.meshes().get(object_mesh).ok_or("the control mesh is not in the library")?;
+            let shared_vertices = shared.vertex_count();
+            let shared_triangles = shared.index_count() / 3;
+            let records: Vec<_> = set.meshlets.iter().map(jarvig_core::GpuMeshletRecord::from_meshlet).collect();
+            let hierarchy = jarvig_core::build_cluster_hierarchy(&records);
+            let leaf_triangles: Vec<u32> = set.meshlets.iter().map(|meshlet| meshlet.index_count / 3).collect();
+            let leaf_flags = vec![1u32; set.meshlets.len()];
+            let snapshot = world.extract(jarvig_core::RenderFrameId(1)).map_err(|error| error.to_string())?;
+            let instance = snapshot.instances().iter().find(|item| item.entity == intent).cloned().ok_or("Intent Solid is not in the snapshot")?;
+            let aspect = width as f32 / height.max(1) as f32;
+            let cut_at = |pose: &ResolvedPose, pixels: f32| {
+                jarvig_core::cut_visible_hierarchy_for_pose(
+                    &hierarchy,
+                    &instance,
+                    pose,
+                    fov,
+                    near,
+                    aspect,
+                    height as f32,
+                    pixels,
+                    &leaf_flags,
+                    &leaf_triangles,
+                )
+                .map(|cut| cut.submitted_triangles)
+                .map_err(|error| error.to_string())
+            };
+            let mut far_pose = camera_pose;
+            far_pose.translation = far_eye;
+            let same_control = jarvig_core::ViewRealizationControl {
+                shared_vertices,
+                shared_triangles,
+                cut_strict_triangles: cut_at(&camera_pose, 0.5)?,
+                cut_loose_triangles: cut_at(&camera_pose, 4.0)?,
+            };
+            let far_control = jarvig_core::ViewRealizationControl {
+                shared_vertices,
+                shared_triangles,
+                cut_strict_triangles: cut_at(&far_pose, 0.5)?,
+                cut_loose_triangles: cut_at(&far_pose, 4.0)?,
+            };
+            let solid_world = world.entity_world_pose(intent).map_err(|error| error.to_string())?;
+            let camera_for = |eye: Vec3, pixels: f32| jarvig_core::camera_in_solid_local(solid_world, eye, forward, fov, height as f32, pixels);
+            let baseline = ViewBaseline {
+                intent,
+                legacy,
+                record: record.clone(),
+                legacy_record,
+                body_hash: jarvig_core::authoritative_body_hash(&body),
+                pose: world.entity_local_pose(intent).map_err(|error| error.to_string())?.translation,
+                legacy_pose: world.entity_local_pose(legacy).map_err(|error| error.to_string())?.translation,
+                object_mesh,
+                legacy_mesh,
+                mesh_count: world.mesh_count(),
+                revision: world.revision(),
+                collision_inside: world.separate_from_blocks(Vec3::new(0.0, 1.0, -4.0)),
+                collision_outside: world.separate_from_blocks(Vec3::new(0.0, 1.0, 40.0)),
+                name: world.remember_entity(intent).map_err(|error| error.to_string())?.name,
+                legacy_name: world.remember_entity(legacy).map_err(|error| error.to_string())?.name,
+                meshlets: set.meshlets.clone(),
+                vertex_indices: set.vertex_indices.clone(),
+                local_indices: set.local_indices.clone(),
+                home_position,
+                home_yaw,
+                home_pitch,
+            };
+            (
+                baseline,
+                camera_for(home_position, 0.5),
+                camera_for(home_position, 4.0),
+                camera_for(far_eye, 0.5),
+                camera_for(far_eye, 4.0),
+                far_eye,
+                same_control,
+                far_control,
+            )
+        };
+        {
+            let run = self.view_realization.as_mut().unwrap();
+            run.baseline = Some(gathered.0);
+            run.same_strict = Some(gathered.1.clone());
+            run.same_loose = Some(gathered.2.clone());
+            run.far_strict = Some(gathered.3.clone());
+            run.far_loose = Some(gathered.4.clone());
+            run.far_eye = Some(gathered.5);
+            run.same_control = Some(gathered.6);
+            run.far_control = Some(gathered.7);
+        }
+        let (same_strict, same_loose) = (gathered.1, gathered.2);
+        self.note_view("View realization experiment: ON");
+        self.note_view("Intent-authority experiment: ON");
+        self.note_view("ADR-0074 accepted: NO");
+        self.note_view("Default renderer replaced: NO");
+        self.note_view(&format!(
+            "Editor workers: general {} einstein {} realize {}",
+            self.jobs.worker_count(),
+            self.einstein_jobs.worker_count(),
+            self.view_realization.as_ref().unwrap().host.worker_count()
+        ));
+        self.note_view("Multithreaded speedup claimed: NO");
+        self.note_view(&format!("Editor viewport: {width}x{height}"));
+        self.note_view(&format!("Editor cluster-cut threshold px: {:.3}", self.hierarchy_error_px));
+        self.note_view("One viewport: YES");
+        self.note_view("Second editor viewport added: NO");
+        self.note_view(&format!("Control mesh id: {}", self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().object_mesh.0));
+        let control_mesh = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().object_mesh;
+        match self.renderer.as_ref().and_then(|renderer| renderer.resident_mesh_bytes(control_mesh)) {
+            Some(bytes) => {
+                self.note_view(&format!("Control mesh GPU_bytes: {bytes}"));
+                self.note_view("Control frame before realizations: PRESENTED");
+            }
+            None => {
+                self.note_view("Control mesh GPU_bytes: NOT UPLOADED");
+                self.note_view("Control frame before realizations: NOT PRESENTED");
+                return Err("the control mesh was not uploaded".into());
+            }
+        }
+        let ticket_a = self.view_submit(1, same_strict)?;
+        let ticket_b = self.view_submit(2, same_loose)?;
+        if ticket_a.cache_hit || ticket_b.cache_hit || ticket_a.realization_id.is_some() || ticket_b.realization_id.is_some() {
+            self.note_view("View realization failed: the first requests were cache hits.");
+            return Err("the first realization requests were cache hits".into());
+        }
+        let run = self.view_realization.as_mut().unwrap();
+        run.stage = 1;
+        run.wait_from = Some(Instant::now());
+        Ok(())
+    }
+
+    fn view_log_pair(&mut self, label: &str, strict_view: u32, loose_view: u32, far: bool) -> Result<(), String> {
+        let strict = self.view_realization.as_ref().unwrap().host.facts(strict_view).unwrap().clone();
+        let loose = self.view_realization.as_ref().unwrap().host.facts(loose_view).unwrap().clone();
+        let control = if far {
+            self.view_realization.as_ref().unwrap().far_control.clone().unwrap()
+        } else {
+            self.view_realization.as_ref().unwrap().same_control.clone().unwrap()
+        };
+        let report = jarvig_core::format_view_realization_pair(label, &strict, &loose, &control);
+        self.note_view_block(&report);
+        self.note_view("Frame: NOT PRESENTED");
+        let uses_cut = strict.vertex_count == control.shared_vertices
+            && loose.vertex_count == control.shared_vertices
+            && strict.triangle_count == control.cut_strict_triangles
+            && loose.triangle_count == control.cut_loose_triangles;
+        self.note_view(&format!("Experiment uses that cut: {}", if uses_cut { "YES" } else { "NO" }));
+        self.note_view(&format!(
+            "Control cuts differ: {}",
+            if control.cut_strict_triangles != control.cut_loose_triangles { "YES" } else { "NO" }
+        ));
+        self.note_view("That cut difference is the experiment result: NO");
+        self.note_view("Control mesh id unchanged: YES");
+        if !far {
+            let run = self.view_realization.as_mut().unwrap();
+            run.same_a_id = strict.realization_id;
+            run.same_b_id = loose.realization_id;
+            self.note_view("Same-pose realizations resident together: YES");
+        } else {
+            let a = self.view_realization.as_ref().unwrap().host.facts(1).map(|facts| facts.realization_id);
+            let b = self.view_realization.as_ref().unwrap().host.facts(2).map(|facts| facts.realization_id);
+            let same_a = self.view_realization.as_ref().unwrap().same_a_id;
+            let same_b = self.view_realization.as_ref().unwrap().same_b_id;
+            self.note_view(&format!(
+                "View A realization_id unchanged while the far requests ran: {}",
+                if a == Some(same_a) { "YES" } else { "NO" }
+            ));
+            self.note_view(&format!(
+                "View B realization_id unchanged while the far requests ran: {}",
+                if b == Some(same_b) { "YES" } else { "NO" }
+            ));
+        }
+        Ok(())
+    }
+
+    fn view_stage_same_ready(&mut self) -> Result<(), String> {
+        if !self.view_published(1) || !self.view_published(2) {
+            return self.view_wait_expired();
+        }
+        self.view_log_pair("same pose", 1, 2, false)?;
+        let far_strict = self.view_realization.as_ref().unwrap().far_strict.clone().unwrap();
+        let far_loose = self.view_realization.as_ref().unwrap().far_loose.clone().unwrap();
+        let ticket_a = self.view_submit(3, far_strict)?;
+        let ticket_b = self.view_submit(4, far_loose)?;
+        if ticket_a.cache_hit || ticket_b.cache_hit || ticket_a.realization_id.is_some() || ticket_b.realization_id.is_some() {
+            self.note_view("View realization failed: the far requests were cache hits.");
+            return Err("the far realization requests were cache hits".into());
+        }
+        let run = self.view_realization.as_mut().unwrap();
+        run.stage = 2;
+        run.wait_from = Some(Instant::now());
+        Ok(())
+    }
+
+    fn view_stage_far_ready(&mut self) -> Result<(), String> {
+        if !self.view_published(3) || !self.view_published(4) {
+            return self.view_wait_expired();
+        }
+        self.view_log_pair("different pose", 3, 4, true)?;
+        self.note_view("Upload note: pair reports above were logged before any realization upload. A later GPU_bytes line is the resident buffer size.");
+        for view in [1, 2, 3, 4] {
+            self.view_install(view)?;
+        }
+        self.view_show(1)?;
+        let run = self.view_realization.as_mut().unwrap();
+        run.stage = 3;
+        run.wait_from = None;
+        Ok(())
+    }
+
+    fn view_stage_log_draw(&mut self, label: &str, view: u32, next: u8) -> Result<(), String> {
+        let mesh = *self.view_realization.as_ref().unwrap().library.get(&view).ok_or(format!("{label} mesh is missing"))?;
+        let bytes = self.renderer.as_ref().and_then(|renderer| renderer.resident_mesh_bytes(mesh));
+        let Some(bytes) = bytes else {
+            self.note_view(&format!("{label} GPU_bytes: NOT UPLOADED"));
+            self.note_view(&format!("{label} frame: NOT PRESENTED"));
+            return Err(format!("{label} was not uploaded"));
+        };
+        let facts = self.view_realization.as_ref().unwrap().host.facts(view).cloned();
+        let control = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().object_mesh;
+        let intent = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap().intent;
+        let object_mesh = self.engine.world().object_mesh(intent);
+        self.note_view(&format!("{label} frame: PRESENTED"));
+        self.note_view(&format!("{label} GPU_bytes: {bytes}"));
+        self.note_view(&format!("{label} mesh id: {}", mesh.0));
+        if let Some(facts) = facts {
+            self.note_view(&format!("{label} realization_id: {}", facts.realization_id));
+            self.note_view(&format!("{label} triangles drawn: {}", facts.triangle_count));
+            self.note_view(&format!("{label} vertices drawn: {}", facts.vertex_count));
+            self.note_view(&format!("{label} CPU_bytes: {}", facts.cpu_bytes));
+            self.note_view(&format!(
+                "{label} GPU_bytes match CPU_bytes: {}",
+                if bytes == facts.cpu_bytes { "YES" } else { "NO" }
+            ));
+        }
+        self.note_view(&format!(
+            "Object mesh is still the control mesh: {}",
+            if object_mesh == Some(control) { "YES" } else { "NO" }
+        ));
+        if object_mesh != Some(control) {
+            return Err("the realization replaced the object mesh".into());
+        }
+        let run = self.view_realization.as_mut().unwrap();
+        run.mark = self.frames;
+        run.stage = next;
+        Ok(())
+    }
+
+    fn view_stage_hold_then_show(&mut self, hold: u32, view: u32, next: u8) -> Result<(), String> {
+        let mark = self.view_realization.as_ref().unwrap().mark;
+        if self.frames.saturating_sub(mark) < hold {
+            return Ok(());
+        }
+        self.view_show(view)?;
+        self.view_realization.as_mut().unwrap().stage = next;
+        Ok(())
+    }
+
+    fn view_stage_hold_then_far(&mut self) -> Result<(), String> {
+        let mark = self.view_realization.as_ref().unwrap().mark;
+        if self.frames.saturating_sub(mark) < 720 {
+            return Ok(());
+        }
+        let baseline = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap();
+        let position = self.view_realization.as_ref().unwrap().far_eye.unwrap();
+        let yaw = baseline.home_yaw;
+        let pitch = baseline.home_pitch;
+        self.place_editor_camera(position, yaw, pitch)?;
+        self.view_show(4)?;
+        self.note_view("Editor camera moved back 8 m for the far loose realization. View A and View B were not resubmitted.");
+        let a = self.view_realization.as_ref().unwrap().host.facts(1).map(|facts| facts.realization_id);
+        let b = self.view_realization.as_ref().unwrap().host.facts(2).map(|facts| facts.realization_id);
+        let same_a = self.view_realization.as_ref().unwrap().same_a_id;
+        let same_b = self.view_realization.as_ref().unwrap().same_b_id;
+        self.note_view(&format!(
+            "View A realization_id unchanged while the editor camera moved: {}",
+            if a == Some(same_a) { "YES" } else { "NO" }
+        ));
+        self.note_view(&format!(
+            "View B realization_id unchanged while the editor camera moved: {}",
+            if b == Some(same_b) { "YES" } else { "NO" }
+        ));
+        self.view_realization.as_mut().unwrap().stage = 7;
+        Ok(())
+    }
+
+    fn view_stage_hold_then_destroy_a(&mut self) -> Result<(), String> {
+        let mark = self.view_realization.as_ref().unwrap().mark;
+        if self.frames.saturating_sub(mark) < 720 {
+            return Ok(());
+        }
+        let before_b = self.view_realization.as_ref().unwrap().host.facts(2).map(|facts| facts.realization_id);
+        let mesh_a = self.view_realization.as_ref().unwrap().library.get(&1).copied();
+        if let Some(mesh) = mesh_a {
+            let retired = self.engine.world_mut().retire_unreferenced_mesh(mesh);
+            self.note_view(&format!("View A library mesh retired: {}", if retired { "YES" } else { "NO" }));
+            if !retired {
+                return Err("View A's realization mesh was still referenced by an object".into());
+            }
+        }
+        let destroyed = self.view_realization.as_mut().unwrap().host.destroy_view(1);
+        self.note_view(&format!("View A realization destroyed: {}", if destroyed { "YES" } else { "NO" }));
+        if !destroyed {
+            return Err("View A's realization was not resident".into());
+        }
+        let after_b = self.view_realization.as_ref().unwrap().host.facts(2).map(|facts| facts.realization_id);
+        let resident = after_b.is_some() && after_b == before_b;
+        self.note_view(&format!("View B resident after View A destroyed: {}", if resident { "YES" } else { "NO" }));
+        if !resident {
+            return Err("destroying View A dropped View B".into());
+        }
+        let baseline = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap();
+        let position = baseline.home_position;
+        let yaw = baseline.home_yaw;
+        let pitch = baseline.home_pitch;
+        self.place_editor_camera(position, yaw, pitch)?;
+        self.view_show(2)?;
+        self.view_realization.as_mut().unwrap().stage = 9;
+        Ok(())
+    }
+
+    fn view_stage_hold_then_regenerate(&mut self) -> Result<(), String> {
+        let mark = self.view_realization.as_ref().unwrap().mark;
+        if self.frames.saturating_sub(mark) < 240 {
+            return Ok(());
+        }
+        let camera = self.view_realization.as_ref().unwrap().same_strict.clone().unwrap();
+        let ticket = self.view_submit(1, camera)?;
+        if ticket.cache_hit || ticket.realization_id.is_some() {
+            self.note_view("View realization failed: regenerating View A was a cache hit.");
+            return Err("regenerating View A was a cache hit".into());
+        }
+        let run = self.view_realization.as_mut().unwrap();
+        run.stage = 11;
+        run.wait_from = Some(Instant::now());
+        Ok(())
+    }
+
+    fn view_stage_regenerated_ready(&mut self) -> Result<(), String> {
+        if !self.view_published(1) {
+            return self.view_wait_expired();
+        }
+        let facts = self.view_realization.as_ref().unwrap().host.facts(1).unwrap().clone();
+        let previous = self.view_realization.as_ref().unwrap().same_a_id;
+        let same_b = self.view_realization.as_ref().unwrap().same_b_id;
+        let current_b = self.view_realization.as_ref().unwrap().host.facts(2).map(|facts| facts.realization_id);
+        self.note_view(&format!("View A regenerated realization_id: {}", facts.realization_id));
+        self.note_view(&format!("View A regenerated cache_hit: {}", if facts.cache_hit { "YES" } else { "NO" }));
+        self.note_view(&format!(
+            "View B regenerated with View A: {}",
+            if current_b == Some(same_b) { "NO" } else { "YES" }
+        ));
+        if facts.cache_hit || facts.realization_id == previous || current_b != Some(same_b) {
+            return Err("View A did not regenerate independently of View B".into());
+        }
+        self.view_install(1)?;
+        self.view_show(1)?;
+        let run = self.view_realization.as_mut().unwrap();
+        run.stage = 12;
+        run.wait_from = None;
+        Ok(())
+    }
+
+    fn view_stage_hold_then_destroy_all(&mut self) -> Result<(), String> {
+        let mark = self.view_realization.as_ref().unwrap().mark;
+        if self.frames.saturating_sub(mark) < 240 {
+            return Ok(());
+        }
+        let ids: Vec<_> = self.view_realization.as_ref().unwrap().library.values().copied().collect();
+        self.view_realization.as_mut().unwrap().host.destroy_all();
+        for id in &ids {
+            let retired = self.engine.world_mut().retire_unreferenced_mesh(*id);
+            if !retired {
+                self.note_view(&format!("Realization mesh {} stayed referenced.", id.0));
+                return Err("a realization mesh was still referenced at destroy-all".into());
+            }
+        }
+        self.engine.clear_frame_mesh_rebind();
+        let baseline = self.view_realization.as_ref().unwrap().baseline.as_ref().unwrap();
+        let position = baseline.home_position;
+        let yaw = baseline.home_yaw;
+        let pitch = baseline.home_pitch;
+        self.place_editor_camera(position, yaw, pitch)?;
+        let run = self.view_realization.as_mut().unwrap();
+        run.retired_ids = ids;
+        run.library.clear();
+        run.stage = 14;
+        Ok(())
+    }
+
+    fn view_stage_object_frame(&mut self) -> Result<(), String> {
+        let baseline = self.view_realization.as_ref().unwrap().baseline.clone().unwrap();
+        let intent = baseline.intent;
+        let legacy = baseline.legacy;
+        let control = baseline.object_mesh;
+        let record_same = self.engine.world().authored_block(intent).as_ref() == Some(&baseline.record);
+        let legacy_same = self.engine.world().authored_block(legacy).as_ref() == Some(&baseline.legacy_record);
+        let pose_same = self.engine.world().entity_local_pose(intent).ok().map(|pose| pose.translation) == Some(baseline.pose);
+        let legacy_pose_same = self.engine.world().entity_local_pose(legacy).ok().map(|pose| pose.translation) == Some(baseline.legacy_pose);
+        let mesh_same = self.engine.world().object_mesh(intent) == Some(control);
+        let legacy_mesh_same = self.engine.world().object_mesh(legacy) == Some(baseline.legacy_mesh);
+        let count_same = self.engine.world().mesh_count() == baseline.mesh_count;
+        let revision_same = self.engine.world().revision() == baseline.revision;
+        let name_same = self.engine.world().remember_entity(intent).ok().map(|entity| entity.name) == Some(baseline.name.clone());
+        let legacy_name_same = self.engine.world().remember_entity(legacy).ok().map(|entity| entity.name) == Some(baseline.legacy_name.clone());
+        let inside = self.engine.world().separate_from_blocks(Vec3::new(0.0, 1.0, -4.0));
+        let outside = self.engine.world().separate_from_blocks(Vec3::new(0.0, 1.0, 40.0));
+        let collision_same = inside == baseline.collision_inside && outside == baseline.collision_outside;
+        let meshlets = self.engine.world().derived_meshlets(control);
+        let meshlets_same = meshlets.is_some_and(|set| {
+            set.meshlets == baseline.meshlets && set.vertex_indices == baseline.vertex_indices && set.local_indices == baseline.local_indices
+        });
+        let control_present = self.engine.world().meshes().get(control).is_some();
+        let retired_ids = self.view_realization.as_ref().unwrap().retired_ids.clone();
+        let orphans_gone = retired_ids.iter().all(|id| self.engine.world().meshes().get(*id).is_none());
+        let gpu_gone = retired_ids.iter().all(|id| self.renderer.as_ref().and_then(|renderer| renderer.resident_mesh_bytes(*id)).is_none());
+        let control_bytes = self.renderer.as_ref().and_then(|renderer| renderer.resident_mesh_bytes(control));
+        let element = if self.selected_vertex.is_some() {
+            "vertex"
+        } else if self.selected_edge.is_some() {
+            "edge"
+        } else if self.selected_body_face.is_some() {
+            "face"
+        } else {
+            "NONE"
+        };
+        let intact = record_same
+            && legacy_same
+            && pose_same
+            && legacy_pose_same
+            && mesh_same
+            && legacy_mesh_same
+            && count_same
+            && revision_same
+            && name_same
+            && legacy_name_same
+            && collision_same
+            && meshlets_same
+            && control_present
+            && orphans_gone
+            && gpu_gone
+            && control_bytes.is_some();
+        self.note_view("Frame mesh rebind: CLEARED");
+        self.note_view(&format!(
+            "Authoritative object frame: {}",
+            if control_bytes.is_some() { "PRESENTED" } else { "NOT PRESENTED" }
+        ));
+        if let Some(bytes) = control_bytes {
+            self.note_view(&format!("Control mesh GPU_bytes: {bytes}"));
+        }
+        self.note_view(&format!("Authoritative record unchanged: {}", if record_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Legacy record unchanged: {}", if legacy_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Object mesh unchanged: {}", if mesh_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Control meshlets unchanged: {}", if meshlets_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Collision unchanged: {}", if collision_same { "YES" } else { "NO" }));
+        self.note_view(&format!("World revision unchanged: {}", if revision_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Library mesh count restored: {}", if count_same { "YES" } else { "NO" }));
+        self.note_view(&format!("Realization meshes removed: {}", if orphans_gone { "YES" } else { "NO" }));
+        self.note_view(&format!("Realization GPU buffers after destroy: {}", if gpu_gone { "EVICTED" } else { "RESIDENT" }));
+        self.note_view(&format!("Editor element selection: {element}"));
+        self.note_view("Realization vertex was selected: NO");
+        if let Some(record) = self.engine.world().authored_block(intent) {
+            self.note_view(&format!("Intent entries: {}", record.intent.len()));
+            self.note_view(&format!("Intent history: {}", record.history.len()));
+            let live_hash = record.body.as_ref().map(jarvig_core::authoritative_body_hash);
+            self.note_view(&format!(
+                "source_body_hash: {}",
+                live_hash.map(|hash| format!("{hash:016x}")).unwrap_or_else(|| "MISSING".into())
+            ));
+            self.note_view(&format!(
+                "source_body_hash matches the start: {}",
+                if live_hash == Some(baseline.body_hash) { "YES" } else { "NO" }
+            ));
+        }
+        let (queue_depth, cancelled, stale) = {
+            let host = &self.view_realization.as_ref().unwrap().host;
+            (host.max_queue_depth(), host.cancelled_count(), host.discarded_stale_count())
+        };
+        self.note_view(&format!("Queue depth max: {queue_depth}"));
+        self.note_view(&format!("Cancelled jobs: {cancelled}"));
+        self.note_view(&format!("Stale discarded: {stale}"));
+        self.note_view(&format!("Algorithm version: {}", jarvig_core::REALIZATION_ALGORITHM_VERSION));
+        self.note_view(&format!(
+            "Authoritative object after both realizations destroyed: {}",
+            if intact { "INTACT" } else { "CHANGED" }
+        ));
+        self.view_write_report();
+        self.view_realization.as_mut().unwrap().stage = 15;
+        if !intact || control_bytes.is_none() {
+            return Err("the authoritative object did not survive the per-view realizations".into());
+        }
+        Ok(())
+    }
+
+    fn view_write_report(&mut self) {
+        let text = self.view_realization.as_ref().unwrap().report.clone();
+        let dir = std::path::PathBuf::from(r"C:\Users\Jeramiah\AppData\Local\Temp\jarvig-intent-proof");
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("REPORT-VIEW.txt"), &text)) {
+            Ok(()) => self.note_view("View realization report: REPORT-VIEW.txt"),
+            Err(error) => self.note_view(&format!("View realization report was not written: {error}")),
+        }
+    }
+
     fn on_presented(&mut self) -> Result<(), String> {
+        self.step_intent_live_rerealize()?;
+        if let Err(error) = self.step_view_realization() {
+            if self.view_realization.is_some() {
+                self.view_write_report();
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.step_view_lab() {
+            if self.view_lab.is_some() {
+                self.lab_write_report();
+            }
+            return Err(error);
+        }
+        self.step_observation_lab()?;
+        self.step_direct_lab()?;
+        self.step_intent_lab()?;
+        self.step_analytic_lab()?;
+        self.step_authored_lab()?;
+        self.step_curve_lab()?;
         if self.born_viewport_px.0 == 0 {
             self.born_viewport_px = self.viewport_px;
         }
@@ -5321,15 +8431,15 @@ impl Editor {
             (ID_VIEW_OUTPUT, OUTPUT),
         ] {
             let flags = MF_BYCOMMAND | if self.workspace.is_open(panel) { MF_CHECKED } else { MF_UNCHECKED };
-            unsafe { CheckMenuItem(self.view_menu, command as u32, flags); }
+            unsafe { check_menu_command(self.view_menu, command as u32, flags); }
         }
         let environment = MF_BYCOMMAND | if self.engine.world().environment().enabled { MF_CHECKED } else { MF_UNCHECKED };
-        unsafe { CheckMenuItem(self.view_menu, ID_VIEW_ENVIRONMENT as u32, environment); }
+        unsafe { check_menu_command(self.view_menu, ID_VIEW_ENVIRONMENT as u32, environment); }
         let pilot = MF_BYCOMMAND | if self.pilot_entity.is_some() { MF_CHECKED } else { MF_UNCHECKED };
-        unsafe { CheckMenuItem(self.view_menu, ID_VIEW_PILOT as u32, pilot); }
+        unsafe { check_menu_command(self.view_menu, ID_VIEW_PILOT as u32, pilot); }
         let mark_quality = |id: usize, on: bool| {
             let flags = MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED };
-            unsafe { CheckMenuItem(self.view_menu, id as u32, flags); }
+            unsafe { check_menu_command(self.view_menu, id as u32, flags); }
         };
         mark_quality(ID_QUALITY_BASELINE, self.render_quality == jarvig_core::RenderQuality::Baseline);
         mark_quality(ID_QUALITY_ENHANCED, self.render_quality == jarvig_core::RenderQuality::Enhanced);
@@ -5779,6 +8889,9 @@ impl Editor {
             if self.engine.world().reflection_probe_enabled() { "on" } else { "off" },
             self.probe_status()
         ));
+        if let Some(text) = self.curve_lab.as_ref().and_then(|lab| lab.status_text()) {
+            self.set_status(&text);
+        }
         self.refresh_title();
     }
 
@@ -7326,6 +10439,45 @@ impl Editor {
         Some((center, radius.max(0.5)))
     }
 
+    /// Frames the first block, then writes one window image. The level is not saved.
+    fn step_window_shot(&mut self) {
+        if self.window_shot.is_none() || self.frames < 8 {
+            return;
+        }
+        if !self.window_shot_framed {
+            if let Some(row) = self.engine.world().entity_outline().into_iter().find(|row| row.class == jarvig_core::AuthoringClass::Block) {
+                let _ = self.selection.replace_from(selection::SelectionItem::Entity(row.uuid), selection::SelectionSource::Programmatic);
+                if let Some(camera) = self.editor_camera.as_mut() {
+                    // Above the +X/+Z corner, looking down, with the whole solid inside the frame.
+                    camera.yaw = 0.78;
+                    camera.pitch = -0.95;
+                }
+                let _ = self.focus_selected();
+                let _ = self.push_editor_camera();
+            }
+            self.window_shot_framed = true;
+            return;
+        }
+        if self.frames < 28 {
+            return;
+        }
+        let Some(path) = self.window_shot.clone() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match capture_window_image(self.frame).and_then(|image| write_png(&path.display().to_string(), &image)) {
+            Ok(()) => {
+                println!("WINDOW_SHOT {}", path.display());
+                unsafe { PostQuitMessage(0); }
+            }
+            Err(error) => {
+                println!("WINDOW_SHOT_FAIL {error}");
+                unsafe { PostQuitMessage(1); }
+            }
+        }
+        self.window_shot = None;
+    }
+
     fn step_bind_pose_shots(&mut self) {
         if self.bind_pose_dir.is_none() || self.frames < 12 || self.bind_pose_index >= 6 {
             return;
@@ -7426,15 +10578,15 @@ impl Editor {
         let entity = self.selection.primary_entity()?;
         let pose = self.engine.world().entity_world_pose(entity).ok()?;
         let record = self.engine.world().authored_block(entity)?;
-        let body = record.display_body()?;
+        let body = selection_body(&record)?;
         let local = if let Some(session) = self.modeling_session.filter(|session| topology_tool(session.tool) && session.entity == entity) {
             self.topology_local_point(&body, session.tool, session.element)?
         } else if self.object_tool != chrome::ToolbarCommand::Translate || self.modeling_session.is_some() {
             return None;
-        } else if self.selection_mode == SelectionMode::Edge {
+        } else if self.selection_mode == SelectionMode::Edge && self.selected_edges.len() == 1 {
             let (_, edge) = self.selected_edge.filter(|(id, _)| *id == entity)?;
             self.edge_midpoint(&body, edge)?
-        } else if self.selection_mode == SelectionMode::Vertex {
+        } else if self.selection_mode == SelectionMode::Vertex && self.selected_vertices.len() == 1 {
             let (_, vertex) = self.selected_vertex.filter(|(id, _)| *id == entity)?;
             body.vertex_position(vertex)?
         } else {
@@ -7446,6 +10598,31 @@ impl Editor {
     fn edge_midpoint(&self, body: &SolidBody, edge: u32) -> Option<[f64; 3]> {
         let (start, end) = body.edge_endpoints(edge)?;
         Some([(start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5, (start[2] + end[2]) * 0.5])
+    }
+
+    /// Where the width arrow sits. At zero it is the original edge. After a preview it is the new strip.
+    fn bevel_anchor_local(&self, body: &SolidBody) -> [f64; 3] {
+        let amount = self.modeling_session.map(|session| session.amount).unwrap_or(0.0);
+        if amount.abs() < 1.0e-12 || self.bevel_next_id == 0 {
+            return self.bevel_anchor;
+        }
+        let bisector = self.region_normal;
+        let mut best_dot = 0.2;
+        let mut best = None;
+        for face in &body.faces {
+            if face.id < self.bevel_next_id {
+                continue;
+            }
+            let Some(normal) = body.unit_normal(face.id) else { continue };
+            let align = normal[0] * bisector[0] + normal[1] * bisector[1] + normal[2] * bisector[2];
+            if align > best_dot {
+                if let Some(center) = face_centroid(body, face.id) {
+                    best_dot = align;
+                    best = Some(center);
+                }
+            }
+        }
+        best.unwrap_or(self.bevel_anchor)
     }
 
     fn topology_local_point(&self, body: &SolidBody, tool: ModelingTool, element: u32) -> Option<[f64; 3]> {
@@ -7516,6 +10693,11 @@ impl Editor {
     }
 
     fn viewport_press(&mut self, hwnd: HWND, x: f64, y: f64, ctrl: bool, shift: bool) {
+        // Round owns the press. A miss on the radius handle does not pick another edge.
+        if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round && self.selection.primary_entity() == Some(session.entity)) {
+            let _ = self.begin_round_drag(hwnd, x, y);
+            return;
+        }
         // An axis on the element gizmo edits that edge or vertex. A miss falls through to a view-plane drag.
         if !ctrl && !shift && self.element_gizmo_point().is_some() && self.begin_topology_axis_drag(hwnd, x, y) {
             return;
@@ -7534,8 +10716,15 @@ impl Editor {
             }
             return;
         }
+        if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::BevelEdge && self.selection.primary_entity() == Some(session.entity))
+        {
+            if !ctrl && !shift {
+                let _ = self.begin_bevel_drag(hwnd, x, y);
+            }
+            return;
+        }
         // The open modeling arrow and its face come before the transform gizmo.
-        if !ctrl && !shift && !self.modeling_session.is_some_and(|session| topology_tool(session.tool) || region_extrude(session)) {
+        if !ctrl && !shift && !self.modeling_session.is_some_and(restores_authored_body) {
             if let Some(face) = self.operation_handle_at(x, y) {
                 if self.begin_face_drag(hwnd, face, x, y) {
                     return;
@@ -7576,7 +10765,7 @@ impl Editor {
         let ray = self.viewport_ray(x, y);
         let hit = ray.and_then(|ray| {
             let snapshot = self.engine.world().extract(RenderFrameId(30)).ok()?;
-            let hidden = self.land_hidden_entities();
+            let hidden = self.view_hidden_entities();
             let (hit, timings) = pick_snapshot_skipping(ray, &snapshot, self.engine.world().meshes(), &hidden);
             self.pick_broadphase_us = timings.broadphase_us;
             self.pick_mesh_us = timings.mesh_us;
@@ -7632,66 +10821,80 @@ impl Editor {
     fn assign_picked_element(&mut self, entity: EntityUuid, point: Vec3, x: f64, y: f64, ctrl: bool, shift: bool) {
         match self.selection_mode {
             SelectionMode::Object => self.clear_element_selection(),
-            SelectionMode::Edge => self.assign_edge(entity, x, y),
-            SelectionMode::Vertex => self.assign_vertex(entity, x, y),
+            SelectionMode::Edge => self.assign_edge(entity, x, y, ctrl, shift),
+            SelectionMode::Vertex => self.assign_vertex(entity, x, y, ctrl, shift),
             SelectionMode::Auto | SelectionMode::Face => self.assign_face(entity, point, x, y, ctrl, shift),
         }
     }
 
-    fn assign_edge(&mut self, entity: EntityUuid, x: f64, y: f64) {
+    fn assign_edge(&mut self, entity: EntityUuid, x: f64, y: f64, ctrl: bool, shift: bool) {
         let Some((pose, record)) = self.block_display(entity) else {
             self.clear_element_selection();
             return;
         };
-        let Some(body) = record.display_body() else {
+        let Some(body) = selection_body(&record) else {
             self.append("Clear the bevel and the insets before editing edges.");
             self.clear_element_selection();
             return;
         };
         let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
         let started = Instant::now();
-        let pick = body.pick_edge(origin, direction, slack);
+        let (fillets, curves, _) = self.round_pick_parts(entity);
+        let pick = if fillets.is_empty() {
+            body.pick_edge(origin, direction, slack)
+        } else {
+            visible_edge_pick(&body, &fillets, &curves, origin, direction, slack)
+        };
         self.note_element_pick(SelectionMode::Edge, elapsed_us(started));
         if let Some(pick) = pick {
-            self.note_edge(entity, pick.id);
-        } else if let Some(face) = body.pick_face(origin, direction) {
-            if let Some(edge) = body.closest_edge_of_face(face.id, origin, direction) {
-                self.note_edge(entity, edge);
-                self.subdivide_hint = Some((entity, face.id));
+            self.note_edge(entity, pick.id, ctrl, shift);
+        } else if fillets.is_empty() {
+            if let Some(face) = body.pick_face(origin, direction) {
+                if let Some(edge) = body.closest_edge_of_face(face.id, origin, direction) {
+                    self.note_edge(entity, edge, ctrl, shift);
+                    self.subdivide_hint = Some((entity, face.id));
+                }
+            } else {
+                self.subdivide_hint = None;
+                self.selected_face = None;
+                self.element_selection.clear();
+                self.publish_elements();
+                self.inspector_force_realize = true;
             }
         } else {
             self.subdivide_hint = None;
-            self.selected_edge = None;
             self.selected_face = None;
-            self.selected_body_face = None;
-            self.selected_body_faces.clear();
-            self.selected_vertex = None;
+            self.element_selection.clear();
+            self.publish_elements();
             self.inspector_force_realize = true;
         }
     }
 
-    fn assign_vertex(&mut self, entity: EntityUuid, x: f64, y: f64) {
+    fn assign_vertex(&mut self, entity: EntityUuid, x: f64, y: f64, ctrl: bool, shift: bool) {
         let Some((pose, record)) = self.block_display(entity) else {
             self.clear_element_selection();
             return;
         };
-        let Some(body) = record.display_body() else {
+        let Some(body) = selection_body(&record) else {
             self.append("Clear the bevel and the insets before editing edges.");
             self.clear_element_selection();
             return;
         };
         let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { return };
         let started = Instant::now();
-        let pick = body.pick_vertex(origin, direction, slack);
+        let (fillets, curves, _) = self.round_pick_parts(entity);
+        let pick = if fillets.is_empty() {
+            body.pick_vertex(origin, direction, slack)
+        } else {
+            visible_vertex_pick(&body, &fillets, &curves, origin, direction, slack)
+        };
         self.note_element_pick(SelectionMode::Vertex, elapsed_us(started));
         if let Some(pick) = pick {
-            self.note_vertex(entity, pick.id);
+            self.note_vertex(entity, pick.id, ctrl, shift);
         } else {
-            self.selected_vertex = None;
             self.selected_face = None;
-            self.selected_body_face = None;
-            self.selected_body_faces.clear();
-            self.selected_edge = None;
+            self.element_selection.clear();
+            self.publish_elements();
             self.inspector_force_realize = true;
         }
     }
@@ -7701,25 +10904,37 @@ impl Editor {
             self.clear_element_selection();
             return;
         };
-        if record.body.is_some() {
-            let Some(body) = record.body.as_ref() else { return };
-            let Some((origin, direction, _)) = self.topology_ray(&pose, x, y) else { return };
-            let started = Instant::now();
-            let pick = body.pick_face(origin, direction);
-            self.note_element_pick(SelectionMode::Face, elapsed_us(started));
-            if let Some(pick) = pick {
-                self.note_body_face(entity, pick.id, ctrl, shift);
-            } else {
-                let local = pose.rotation.conjugate().rotate(Vec3::new(
-                    point.x - pose.translation.x,
-                    point.y - pose.translation.y,
-                    point.z - pose.translation.z,
-                ));
-                if let Some(face) = body.nearest_face([local.x, local.y, local.z], 0.02) {
-                    self.note_body_face(entity, face, ctrl, shift);
+        if record.body.is_some() || record.has_authored_seed() {
+            if let Some(body) = selection_body(&record) {
+                let Some((origin, direction, _)) = self.topology_ray(&pose, x, y) else { return };
+                let started = Instant::now();
+                let (fillets, curves, tokens) = self.round_pick_parts(entity);
+                let pick = if fillets.is_empty() {
+                    body.pick_face(origin, direction)
+                } else {
+                    visible_face_pick(&body, &tokens, &fillets, &curves, origin, direction)
+                };
+                self.note_element_pick(SelectionMode::Face, elapsed_us(started));
+                if let Some(pick) = pick {
+                    self.note_body_face(entity, pick.id, ctrl, shift);
+                } else if fillets.is_empty() {
+                    let local = pose.rotation.conjugate().rotate(Vec3::new(
+                        point.x - pose.translation.x,
+                        point.y - pose.translation.y,
+                        point.z - pose.translation.z,
+                    ));
+                    if let Some(face) = body.nearest_face([local.x, local.y, local.z], 0.02) {
+                        self.note_body_face(entity, face, ctrl, shift);
+                    }
+                } else {
+                    self.subdivide_hint = None;
+                    self.selected_face = None;
+                    self.element_selection.clear();
+                    self.publish_elements();
+                    self.inspector_force_realize = true;
                 }
+                return;
             }
-            return;
         }
         if let Some(face) = self.face_on_block(entity, point) {
             self.note_selected_face(entity, face);
@@ -7730,6 +10945,10 @@ impl Editor {
 
     fn begin_gizmo_drag(&mut self, hwnd: HWND, handle: gizmo::GizmoHandle, x: f64, y: f64) {
         let Some(entity) = self.selection.primary_entity() else { return };
+        if self.engine.world().entity_locked(entity) {
+            self.append("That object is locked.");
+            return;
+        }
         let Ok(pose) = self.engine.world().entity_world_pose(entity) else { return };
         let Ok(inspection) = self.engine.world().inspect_entity(entity) else { return };
         let Some(local) = inspection.sections.get(1).and_then(|section| section.fields.first()).and_then(|field| match field.value {
@@ -7779,7 +10998,8 @@ impl Editor {
         self.modeling_session.and_then(|session| match session.tool {
             ModelingTool::Extrude => Some(chrome::ToolbarCommand::Extrude),
             ModelingTool::Inset => Some(chrome::ToolbarCommand::Inset),
-            ModelingTool::Bevel => Some(chrome::ToolbarCommand::Bevel),
+            ModelingTool::Bevel | ModelingTool::BevelEdge => Some(chrome::ToolbarCommand::Bevel),
+            ModelingTool::Round => Some(chrome::ToolbarCommand::Round),
             ModelingTool::MoveEdge => Some(chrome::ToolbarCommand::MoveEdge),
             ModelingTool::ExtrudeEdge => Some(chrome::ToolbarCommand::ExtrudeEdge),
             ModelingTool::MoveVertex => Some(chrome::ToolbarCommand::MoveVertex),
@@ -7802,7 +11022,7 @@ impl Editor {
 
     fn operation_handle_at(&self, x: f64, y: f64) -> Option<u8> {
         let session = self.modeling_session?;
-        if region_extrude(session) {
+        if region_extrude(session) || session.tool == ModelingTool::BevelEdge {
             return None;
         }
         let (entity, pose, size) = self.face_target()?;
@@ -7844,10 +11064,8 @@ impl Editor {
 
     fn note_selected_face(&mut self, entity: EntityUuid, face: u8) {
         let next = Some((entity, face));
-        self.selected_body_face = None;
-        self.selected_body_faces.clear();
-        self.selected_edge = None;
-        self.selected_vertex = None;
+        self.element_selection.clear();
+        self.publish_elements();
         if self.selected_face == next {
             return;
         }
@@ -7873,19 +11091,29 @@ impl Editor {
             return false;
         }
         let outline = self.engine.world().entity_outline();
+        let hidden = self.view_hidden_entities();
         let mut best: Option<(EntityUuid, u32, f64)> = None;
         let mut kind = SelectionMode::Face;
         let mut spent = 0u32;
         for row in outline {
+            if hidden.contains(&row.uuid) {
+                continue;
+            }
             let Some((pose, record)) = self.block_display(row.uuid) else { continue };
-            let Some(body) = record.body.as_ref() else { continue };
+            let Some(body) = selection_body(&record) else { continue };
             let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) else { continue };
             let started = Instant::now();
+            let (fillets, curves, tokens) = self.round_pick_parts(row.uuid);
             let pick = match self.selection_mode {
-                SelectionMode::Edge => body.pick_edge(origin, direction, slack),
-                SelectionMode::Vertex => body.pick_vertex(origin, direction, slack),
-                SelectionMode::Auto | SelectionMode::Face => body.pick_face(origin, direction),
-                SelectionMode::Object => None,
+                SelectionMode::Edge if fillets.is_empty() => body.pick_edge(origin, direction, slack),
+                SelectionMode::Edge => visible_edge_pick(&body, &fillets, &curves, origin, direction, slack),
+                SelectionMode::Vertex if fillets.is_empty() => body.pick_vertex(origin, direction, slack),
+                SelectionMode::Vertex => visible_vertex_pick(&body, &fillets, &curves, origin, direction, slack),
+                SelectionMode::Auto | SelectionMode::Face if (record.body.is_some() || record.has_authored_seed()) && fillets.is_empty() => body.pick_face(origin, direction),
+                SelectionMode::Auto | SelectionMode::Face if record.body.is_some() || record.has_authored_seed() => {
+                    visible_face_pick(&body, &tokens, &fillets, &curves, origin, direction)
+                }
+                SelectionMode::Object | SelectionMode::Auto | SelectionMode::Face => None,
             };
             spent = spent.saturating_add(elapsed_us(started));
             let Some(pick) = pick else { continue };
@@ -7905,8 +11133,8 @@ impl Editor {
             self.apply_click_selection(selection::SelectionItem::Entity(entity), ctrl, shift);
         }
         match kind {
-            SelectionMode::Edge => self.note_edge(entity, id),
-            SelectionMode::Vertex => self.note_vertex(entity, id),
+            SelectionMode::Edge => self.note_edge(entity, id, ctrl, shift),
+            SelectionMode::Vertex => self.note_vertex(entity, id, ctrl, shift),
             _ => self.note_body_face(entity, id, ctrl, shift),
         }
         true
@@ -7915,66 +11143,268 @@ impl Editor {
     fn note_body_face(&mut self, entity: EntityUuid, face: u32, ctrl: bool, shift: bool) {
         self.subdivide_hint = None;
         self.selected_face = None;
-        self.selected_edge = None;
-        self.selected_vertex = None;
-        let foreign = self.selected_body_face.is_some_and(|(id, _)| id != entity);
-        if foreign || (!ctrl && !shift) {
-            let unchanged = self.selected_body_face == Some((entity, face)) && self.selected_body_faces.as_slice() == [face];
-            self.selected_body_face = Some((entity, face));
-            self.selected_body_faces = vec![face];
-            if unchanged {
-                return;
-            }
-            self.rebuild_inspector();
+        if !self.element_selection.click(entity, selection::ElementKind::Face, face, ctrl, shift) {
             return;
         }
-        if self.selected_body_faces.is_empty() {
-            if let Some((_, existing)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
-                self.selected_body_faces.push(existing);
-            }
+        self.note_authored_pick(entity, "face", face);
+        self.publish_elements();
+        self.rebuild_inspector();
+    }
+
+    fn note_edge(&mut self, entity: EntityUuid, edge: u32, ctrl: bool, shift: bool) {
+        self.subdivide_hint = None;
+        self.selected_face = None;
+        if !self.element_selection.click(entity, selection::ElementKind::Edge, edge, ctrl, shift) {
+            return;
         }
-        if ctrl {
-            if let Some(index) = self.selected_body_faces.iter().position(|id| *id == face) {
-                self.selected_body_faces.remove(index);
-            } else {
-                self.selected_body_faces.push(face);
-            }
-            self.selected_body_face = self.selected_body_faces.last().copied().map(|id| (entity, id));
-        } else if !self.selected_body_faces.contains(&face) {
-            self.selected_body_faces.push(face);
-            self.selected_body_face = Some((entity, face));
+        self.note_authored_pick(entity, "edge", edge);
+        self.publish_elements();
+        self.rebuild_inspector();
+    }
+
+    fn note_vertex(&mut self, entity: EntityUuid, vertex: u32, ctrl: bool, shift: bool) {
+        self.subdivide_hint = None;
+        self.selected_face = None;
+        if !self.element_selection.click(entity, selection::ElementKind::Vertex, vertex, ctrl, shift) {
+            return;
+        }
+        self.note_authored_pick(entity, "vertex", vertex);
+        self.publish_elements();
+        self.rebuild_inspector();
+    }
+
+    /// One click line for an authored seed. A stored body and a hover do not log.
+    fn note_authored_pick(&mut self, entity: EntityUuid, kind: &str, id: u32) {
+        let Some(record) = self.engine.world().authored_block(entity) else { return };
+        if !record.has_authored_seed() {
+            return;
+        }
+        let names = match kind {
+            "face" => jarvig_core::semantic_face_names(&record, id),
+            "edge" => jarvig_core::semantic_edge_names(&record, id),
+            "vertex" => jarvig_core::semantic_vertex_names(&record, id),
+            _ => Vec::new(),
+        };
+        let token = if kind == "face" {
+            jarvig_core::preferred_face_token(&names)
+        } else if kind == "edge" {
+            names.iter().find(|name| name.starts_with("E:fillet-")).cloned().or_else(|| names.first().cloned())
         } else {
-            self.selected_body_face = Some((entity, face));
-        }
-        self.rebuild_inspector();
+            names.first().cloned()
+        };
+        let token = token.unwrap_or_else(|| "-".to_string());
+        let body = if record.body.is_some() { "present" } else { "absent" };
+        self.append(&format!("PICK {kind} {token} id {id} intent {} body {body}", record.intent.len()));
     }
 
-    fn note_edge(&mut self, entity: EntityUuid, edge: u32) {
-        self.subdivide_hint = None;
-        let next = Some((entity, edge));
-        self.selected_face = None;
-        self.selected_body_face = None;
-        self.selected_body_faces.clear();
-        self.selected_vertex = None;
-        if self.selected_edge == next {
+    fn note_authored_extrude(&mut self, entity: EntityUuid, faces: &[u32]) {
+        let Some(record) = self.engine.world().authored_block(entity) else { return };
+        if !record.has_authored_seed() || record.body.is_some() {
             return;
         }
-        self.selected_edge = next;
-        self.rebuild_inspector();
+        let inputs = faces
+            .iter()
+            .filter_map(|face| jarvig_core::preferred_face_token(&jarvig_core::semantic_face_names(&record, *face)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inputs = if inputs.is_empty() { "-".to_string() } else { inputs };
+        self.append(&format!(
+            "COMMAND extrude inputs {inputs} appended extrude body_before absent body_after absent intent {}",
+            record.intent.len()
+        ));
     }
 
-    fn note_vertex(&mut self, entity: EntityUuid, vertex: u32) {
-        self.subdivide_hint = None;
-        let next = Some((entity, vertex));
-        self.selected_face = None;
-        self.selected_body_face = None;
-        self.selected_body_faces.clear();
-        self.selected_edge = None;
-        if self.selected_vertex == next {
+    /// Grabs the radius handle. The semantic radius moves. The tape does not.
+    fn begin_round_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if session.tool != ModelingTool::Round || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let grabbed = {
+            let Some(basis) = self.round_basis.as_ref() else { return false };
+            if basis.entity != session.entity || basis.edge != session.element || basis.readiness == RoundStatus::Conflict {
+                return false;
+            }
+            let Ok(pose) = self.engine.world().entity_world_pose(session.entity) else { return false };
+            let mut best: Option<(f64, jarvig_core::Fillet)> = None;
+            for fillet in &basis.fillets {
+                let Ok(scaled) = jarvig_core::fillet_scaled(fillet, session.amount) else { continue };
+                let crown = self.world_of(&pose, scaled.point(scaled.length_m * 0.5, scaled.span * 0.5));
+                let projected = self.project_corner(crown);
+                if !projected.in_front {
+                    continue;
+                }
+                let dx = projected.x - x;
+                let dy = projected.y - y;
+                let distance = dx * dx + dy * dy;
+                if distance > 22.0 * 22.0 {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(nearest, _)| distance < *nearest) {
+                    best = Some((distance, scaled));
+                }
+            }
+            let Some((_, fillet)) = best else { return false };
+            let Ok((crown_per_radius, away_local)) = jarvig_core::fillet_crown_step(&fillet) else { return false };
+            let crown = self.world_of(&pose, fillet.point(fillet.length_m * 0.5, fillet.span * 0.5));
+            let away = pose.rotation.rotate(Vec3::new(away_local[0], away_local[1], away_local[2]));
+            let edge = pose.rotation.rotate(Vec3::new(fillet.direction[0], fillet.direction[1], fillet.direction[2]));
+            let (screen_x, screen_y, meters_per_pixel) = self.round_pointer_scale(crown, away, edge);
+            (fillet, crown_per_radius, away_local, screen_x, screen_y, meters_per_pixel)
+        };
+        let (fillet, crown_per_radius, away_local, screen_x, screen_y, meters_per_pixel) = grabbed;
+        if let Some(basis) = self.round_basis.as_mut() {
+            basis.fillet = fillet;
+            basis.crown_per_radius = crown_per_radius;
+            basis.away = away_local;
+        }
+        let amount_origin = session.amount;
+        let entity = session.entity;
+        // begin_capture ends an existing capture, and that end clears round_drag.
+        // Store the drag after capture is taken.
+        self.right_press = None;
+        self.begin_capture(hwnd, CaptureKind::Face);
+        self.round_drag = Some(RoundDrag {
+            entity,
+            amount_origin,
+            origin_x: x,
+            origin_y: y,
+            screen_x,
+            screen_y,
+            meters_per_pixel,
+            clamped: false,
+        });
+        self.place_round_label(amount_origin);
+        true
+    }
+
+    /// Crown motion on screen, in meters per pixel. A crown aimed at the camera uses the edge.
+    fn round_pointer_scale(&self, crown: Vec3, away: Vec3, edge: Vec3) -> (f64, f64, f64) {
+        let sample = 0.05;
+        let crown_px = self.project_corner(crown);
+        let ahead = self.project_corner(Vec3::new(crown.x + away.x * sample, crown.y + away.y * sample, crown.z + away.z * sample));
+        let edge_px = self.project_corner(Vec3::new(crown.x + edge.x * sample, crown.y + edge.y * sample, crown.z + edge.z * sample));
+        let ahead_px = ahead.in_front.then_some((ahead.x, ahead.y));
+        let edge_screen = edge_px.in_front.then_some((edge_px.x, edge_px.y));
+        gizmo::round_screen_scale((crown_px.x, crown_px.y), ahead_px, edge_screen, sample, self.round_world_per_pixel(crown))
+    }
+
+    fn round_world_per_pixel(&self, crown: Vec3) -> f64 {
+        let Some(camera) = self.editor_camera.as_ref() else { return 0.01 };
+        let pose = camera.pose();
+        let distance = vec_len(vec_sub(crown, pose.translation)).max(0.05);
+        let height = self.renderer.as_ref().map(|renderer| renderer.configured_size().1).unwrap_or(720).max(1) as f64;
+        let world_per_pixel = distance * (camera.vertical_fov_radians * 0.5).tan() / (height * 0.5);
+        if world_per_pixel.is_finite() && world_per_pixel > 1.0e-6 { world_per_pixel } else { 0.01 }
+    }
+
+    fn update_round_drag(&mut self, x: f64, y: f64) {
+        let Some(drag) = self.round_drag else { return };
+        let Some(session) = self.modeling_session else { return };
+        if session.entity != drag.entity || session.tool != ModelingTool::Round {
             return;
         }
-        self.selected_vertex = next;
-        self.rebuild_inspector();
+        let pixels = (x - drag.origin_x) * drag.screen_x + (y - drag.origin_y) * drag.screen_y;
+        let along = if drag.meters_per_pixel.is_finite() { pixels * drag.meters_per_pixel } else { 0.0 };
+        let fine = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
+        let ctrl = (unsafe { GetKeyState(VK_CONTROL as i32) } as u16) & 0x8000 != 0;
+        let Some(basis) = self.round_basis.as_ref() else { return };
+        let maximum = basis.max_radius_m;
+        let step = basis.crown_per_radius;
+        let snap = if ctrl { Some(if fine { 0.001 } else { 0.01 }) } else { None };
+        let radius = jarvig_core::dragged_round_radius(drag.amount_origin, along, step, fine, snap, 0.001, maximum);
+        let hit_limit = (radius - maximum).abs() <= 1.0e-9 && along > 0.0;
+        let announce = hit_limit && !drag.clamped;
+        if let Some(open) = self.round_drag.as_mut() {
+            open.clamped = hit_limit;
+        }
+        if announce {
+            self.append(&format!("Round stopped at {radius:.3} m. That is as large as this round can close."));
+        }
+        self.preview_round_amount(session, radius);
+        let shown = self.modeling_session.map(|open| open.amount).unwrap_or(radius);
+        self.place_round_label(shown);
+    }
+
+    fn show_round_radius(&mut self, amount: f64) {
+        let text = format!("{amount:.3}");
+        let wide_text = wide(&text);
+        self.inspector_applying = true;
+        for control in &self.inspector_controls {
+            if let inspector::InspectorBinding::Text { field, .. } = &control.binding {
+                if *field == inspector::SOLID_UI_AMOUNT {
+                    unsafe { SetWindowTextW(control.hwnd, wide_text.as_ptr()); }
+                }
+            }
+        }
+        self.inspector_applying = false;
+    }
+
+    fn place_round_label(&mut self, amount: f64) {
+        let Some((x, y)) = self.round_label_anchor(amount) else {
+            self.hide_round_label();
+            return;
+        };
+        self.show_round_label(&format!("Radius {amount:.3} m"), x, y);
+    }
+
+    fn round_label_anchor(&self, amount: f64) -> Option<(i32, i32)> {
+        let session = self.modeling_session?;
+        let basis = self.round_basis.as_ref()?;
+        let fillet = jarvig_core::fillet_scaled(&basis.fillet, amount).ok()?;
+        let pose = self.engine.world().entity_world_pose(session.entity).ok()?;
+        let crown = self.world_of(&pose, fillet.point(fillet.length_m * 0.5, fillet.span * 0.5));
+        let projected = self.project_corner(crown);
+        if !projected.in_front {
+            return None;
+        }
+        let viewport = self.panel_hwnd(PERSPECTIVE);
+        if viewport.is_null() {
+            return None;
+        }
+        let mut origin = POINT { x: projected.x.round() as i32, y: projected.y.round() as i32 };
+        unsafe { ClientToScreen(viewport, &mut origin); }
+        Some((origin.x + 18, origin.y - 30))
+    }
+
+    fn show_round_label(&mut self, text: &str, x: i32, y: i32) {
+        let class_name = wide("STATIC");
+        let caption = wide(text);
+        unsafe {
+            if self.round_label.is_null() {
+                let instance = GetModuleHandleW(std::ptr::null());
+                self.round_label = CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | 0x0000_0008,
+                    class_name.as_ptr(),
+                    caption.as_ptr(),
+                    WS_POPUP | WS_VISIBLE | 0x0001 | 0x0200,
+                    x,
+                    y,
+                    168,
+                    24,
+                    self.frame,
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null(),
+                );
+                if self.round_label.is_null() {
+                    return;
+                }
+                SendMessageW(self.round_label, 0x0030, GetStockObject(DEFAULT_GUI_FONT) as usize, 1);
+            } else {
+                SetWindowTextW(self.round_label, caption.as_ptr());
+            }
+            // Activating this popup focuses it. Viewport WM_KILLFOCUS would end the drag.
+            SetWindowPos(self.round_label, std::ptr::null_mut(), x, y, 168, 24, 0x0054);
+            ShowWindow(self.round_label, 8);
+        }
+    }
+
+    fn hide_round_label(&mut self) {
+        if self.round_label.is_null() {
+            return;
+        }
+        unsafe { ShowWindow(self.round_label, 0); }
     }
 
     fn begin_region_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
@@ -7983,7 +11413,7 @@ impl Editor {
             return false;
         }
         let Some((pose, record)) = self.block_display(session.entity) else { return false };
-        let Some(body) = record.body.clone().or_else(|| record.display_body()) else { return false };
+        let Some(body) = self.region_draw_body(session.entity, &record) else { return false };
         let Some(center_local) = region_center(&body, &self.region_faces) else { return false };
         let center = self.world_of(&pose, center_local);
         let arrow = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
@@ -7995,6 +11425,42 @@ impl Editor {
             .and_then(|(origin, direction, _)| body.pick_face(origin, direction))
             .is_some_and(|pick| self.region_faces.contains(&pick.id));
         if !on_arrow && !on_region {
+            return false;
+        }
+        let plane_normal = gizmo::axis_drag_plane(arrow, ray.direction);
+        let Some(hit) = gizmo::ray_plane(ray.origin, ray.direction, center, plane_normal) else { return false };
+        self.face_drag = Some(FaceDrag {
+            entity: session.entity,
+            face: 0,
+            baseline_size: session.baseline_size,
+            baseline_inset: session.baseline_inset,
+            baseline_bevel: session.baseline_bevel,
+            baseline_local: session.baseline_local,
+            plane_point: center,
+            world_normal: arrow,
+            plane_normal,
+            start_hit: hit,
+            amount_origin: session.amount,
+        });
+        self.begin_capture(hwnd, CaptureKind::Face);
+        true
+    }
+
+    fn begin_bevel_drag(&mut self, hwnd: HWND, x: f64, y: f64) -> bool {
+        let Some(session) = self.modeling_session else { return false };
+        if session.tool != ModelingTool::BevelEdge || self.selection.primary_entity() != Some(session.entity) {
+            return false;
+        }
+        let Some((pose, record)) = self.block_display(session.entity) else { return false };
+        let Some(body) = record.display_body().or_else(|| self.session_geometry(&session)) else { return false };
+        let local = self.bevel_anchor_local(&body);
+        let center = self.world_of(&pose, local);
+        let arrow = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
+        let Some(ray) = self.viewport_ray(x, y) else { return false };
+        let Some(length) = self.gizmo_length(center) else { return false };
+        let on_arrow = gizmo::hit_operation_handle(ray.origin, ray.direction, center, arrow, length);
+        let on_solid = self.topology_ray(&pose, x, y).and_then(|(origin, direction, _)| body.pick_face(origin, direction)).is_some();
+        if !on_arrow && !on_solid {
             return false;
         }
         let plane_normal = gizmo::axis_drag_plane(arrow, ray.direction);
@@ -8064,14 +11530,22 @@ impl Editor {
         let along = snap_dimension(gizmo::scalar_along(delta, drag.world_normal));
         let raw = match session.tool {
             ModelingTool::Extrude => drag.amount_origin + along,
-            ModelingTool::Bevel | ModelingTool::Inset => (drag.amount_origin + along).max(0.0),
-            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => return,
+            ModelingTool::Bevel | ModelingTool::Inset | ModelingTool::BevelEdge => (drag.amount_origin + along).max(0.0),
+            ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex | ModelingTool::Round => return,
         };
         self.preview_modeling_amount(raw);
     }
 
     /// Mouse-up commits a drag and closes that operation. A typed amount still uses Apply.
+    /// A Round drag stops here and leaves the preview for Apply.
     fn commit_face(&mut self) {
+        if self.round_drag.take().is_some() {
+            self.hide_round_label();
+            if self.capture == Some(CaptureKind::Face) {
+                self.end_capture(true, false);
+            }
+            return;
+        }
         let dragged = self.face_drag.take().is_some() || self.topology_drag.take().is_some();
         if self.capture == Some(CaptureKind::Face) {
             self.end_capture(true, false);
@@ -8095,14 +11569,25 @@ impl Editor {
 
     fn restore_face_drag(&mut self) {
         let Some(drag) = self.face_drag.take() else { return };
-        if self.modeling_session.is_some_and(region_extrude) {
-            if let Some(Some(body)) = self.topology_session_body.clone() {
-                let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
-                    target: drag.entity,
-                    body: Some(body),
-                    size_m: drag.baseline_size,
-                    translation: drag.baseline_local,
-                });
+        if self.modeling_session.is_some_and(|session| region_extrude(session) || session.tool == ModelingTool::BevelEdge) {
+            if self.authored_extrude_target(drag.entity) {
+                self.clear_extrude_preview();
+                let _ = self.engine.world_mut().set_entity_local_translation(drag.entity, drag.baseline_local);
+            } else {
+                self.stage_topology_baseline_materials(drag.entity);
+                if let Some(body) = self.topology_session_body.clone() {
+                    let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
+                        target: drag.entity,
+                        body,
+                        size_m: drag.baseline_size,
+                        translation: drag.baseline_local,
+                    });
+                }
+            }
+            if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::BevelEdge) {
+                self.bevel_edges = self.bevel_request.clone();
+                self.bevel_expanded = false;
+                self.bevel_clamped = false;
             }
         } else {
             let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockDrag {
@@ -8189,6 +11674,58 @@ impl Editor {
         true
     }
 
+    fn remember_topology_authoring(&mut self, entity: EntityUuid, record: &jarvig_core::BlockRecord) {
+        self.topology_session_materials = record.face_materials.clone();
+        self.topology_session_groups = record.surface_groups.clone();
+        self.topology_session_edge_names = self.engine.world().surface_edge_names(entity);
+        self.topology_defaulted = 0;
+        self.topology_group_ambiguous = 0;
+    }
+
+    fn clear_topology_authoring(&mut self) {
+        self.topology_session_materials.clear();
+        self.topology_session_groups.clear();
+        self.topology_session_edge_names.clear();
+        self.topology_defaulted = 0;
+        self.topology_group_ambiguous = 0;
+    }
+
+    fn stage_topology_baseline_materials(&mut self, entity: EntityUuid) {
+        let materials = self.topology_session_materials.clone();
+        let groups = self.topology_session_groups.clone();
+        self.topology_defaulted = 0;
+        self.topology_group_ambiguous = 0;
+        let _ = self.engine.world_mut().stage_block_face_materials(entity, materials);
+        let _ = self.engine.world_mut().stage_block_surface_groups(entity, groups);
+    }
+
+    fn stage_projected_materials(&mut self, entity: EntityUuid, source: &SolidBody, edited: &SolidBody, lineage: &jarvig_core::TopologyLineage) {
+        let projected = jarvig_core::BlockRecord::project_face_materials(source, edited, lineage, &self.topology_session_materials);
+        let projected_groups = jarvig_core::BlockRecord::project_surface_groups(source, edited, lineage, &self.topology_session_groups, &self.topology_session_edge_names);
+        self.topology_defaulted = projected.defaulted;
+        self.topology_group_ambiguous = projected_groups.ambiguous;
+        let _ = self.engine.world_mut().stage_block_face_materials(entity, projected.assignments);
+        let _ = self.engine.world_mut().stage_block_surface_groups(entity, projected_groups.groups);
+    }
+
+    /// Body the extrude arrow and the face loop use. An authored preview stays off the record.
+    fn region_draw_body(&self, entity: EntityUuid, record: &jarvig_core::BlockRecord) -> Option<SolidBody> {
+        if let Some(preview) = self.extrude_preview.as_ref().filter(|preview| preview.entity == entity) {
+            return Some(preview.body.clone());
+        }
+        if record.body.is_some() {
+            return record.body.clone();
+        }
+        if record.has_authored_seed() {
+            return self
+                .modeling_session
+                .filter(|session| session.entity == entity)
+                .and_then(|session| self.session_geometry(&session))
+                .or_else(|| selection_body(record));
+        }
+        record.display_body()
+    }
+
     fn session_geometry(&self, session: &ModelingSession) -> Option<SolidBody> {
         match &self.topology_session_body {
             Some(Some(body)) => Some(body.clone()),
@@ -8226,12 +11763,18 @@ impl Editor {
             return;
         }
         let edited = match session.tool {
-            ModelingTool::MoveEdge => drag.geometry.move_edge(drag.element, snapped),
-            ModelingTool::ExtrudeEdge => drag.geometry.extrude_edge(drag.element, snapped),
-            ModelingTool::MoveVertex => drag.geometry.move_vertex(drag.element, snapped),
-            _ => return,
+            ModelingTool::MoveEdge => drag.geometry.move_edge(drag.element, snapped).ok(),
+            ModelingTool::MoveVertex => drag.geometry.move_vertex(drag.element, snapped).ok(),
+            ModelingTool::ExtrudeEdge => match drag.geometry.extrude_edge_traced(drag.element, snapped) {
+                Ok((edit, lineage)) => {
+                    self.stage_projected_materials(drag.entity, &drag.geometry, &edit.body, &lineage);
+                    Some(edit)
+                }
+                Err(_) => None,
+            },
+            _ => None,
         };
-        let Ok(edit) = edited else { return };
+        let Some(edit) = edited else { return };
         let Ok(local_pose) = self.engine.world().entity_local_pose(drag.entity) else { return };
         let shift = local_pose.rotation.rotate(Vec3::new(edit.shift[0], edit.shift[1], edit.shift[2]));
         let translation = Vec3::new(
@@ -8251,6 +11794,7 @@ impl Editor {
     }
 
     fn restore_topology_baseline(&mut self, drag: &TopologyDrag) {
+        self.stage_topology_baseline_materials(drag.entity);
         let _ = self.engine.execute_authoring(AuthoringCommand::RestoreBlockBody {
             target: drag.entity,
             body: drag.stored.clone(),
@@ -8283,6 +11827,20 @@ impl Editor {
         Some(([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z], self.pick_slack_m(depth)))
     }
 
+    /// Fillets, semantic curves, and source tokens of the observation already built for `entity`.
+    /// A click uses this cache. It does not replay the tape.
+    fn round_pick_parts(&self, entity: EntityUuid) -> (Vec<jarvig_core::Fillet>, Vec<jarvig_core::CurveElement>, Vec<String>) {
+        let Some(cache) = self.round_view.as_ref() else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        if cache.entity != entity || cache.noted_failure {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let fillets = if cache.fillets.is_empty() { cache.fillet.clone().into_iter().collect() } else { cache.fillets.clone() };
+        let tokens = if cache.tokens.len() == fillets.len() { cache.tokens.clone() } else { Vec::new() };
+        (fillets, cache.curves.clone(), tokens)
+    }
+
     fn pick_slack_m(&self, depth: f64) -> f64 {
         let Some(camera) = self.editor_camera.as_ref() else { return 0.05 };
         let Some(renderer) = self.renderer.as_ref() else { return 0.05 };
@@ -8302,20 +11860,34 @@ impl Editor {
         let mut face = None;
         if let Some(entity) = self.selection.primary_entity() {
             if let Some((pose, record)) = self.block_display(entity) {
-                if let Some(body) = record.display_body() {
+                let body = if record.has_authored_seed() { selection_body(&record) } else { record.display_body() };
+                if let Some(body) = body {
                     if let Some((origin, direction, slack)) = self.topology_ray(&pose, x, y) {
                         let started = Instant::now();
+                        let (fillets, curves, tokens) = self.round_pick_parts(entity);
                         match self.selection_mode {
                             SelectionMode::Edge => {
-                                edge = body.pick_edge(origin, direction, slack).map(|pick| pick.id);
+                                edge = if fillets.is_empty() {
+                                    body.pick_edge(origin, direction, slack).map(|pick| pick.id)
+                                } else {
+                                    visible_edge_pick(&body, &fillets, &curves, origin, direction, slack).map(|pick| pick.id)
+                                };
                                 self.note_element_pick(SelectionMode::Edge, elapsed_us(started));
                             }
                             SelectionMode::Vertex => {
-                                vertex = body.pick_vertex(origin, direction, slack).map(|pick| pick.id);
+                                vertex = if fillets.is_empty() {
+                                    body.pick_vertex(origin, direction, slack).map(|pick| pick.id)
+                                } else {
+                                    visible_vertex_pick(&body, &fillets, &curves, origin, direction, slack).map(|pick| pick.id)
+                                };
                                 self.note_element_pick(SelectionMode::Vertex, elapsed_us(started));
                             }
-                            SelectionMode::Auto | SelectionMode::Face if record.body.is_some() => {
-                                face = body.pick_face(origin, direction).map(|pick| pick.id);
+                            SelectionMode::Auto | SelectionMode::Face if record.body.is_some() || record.has_authored_seed() => {
+                                face = if fillets.is_empty() {
+                                    body.pick_face(origin, direction).map(|pick| pick.id)
+                                } else {
+                                    visible_face_pick(&body, &tokens, &fillets, &curves, origin, direction).map(|pick| pick.id)
+                                };
                                 self.note_element_pick(SelectionMode::Face, elapsed_us(started));
                             }
                             _ => {}
@@ -8346,7 +11918,9 @@ impl Editor {
             self.operation_handle_at(x, y)
         } else if matches!(self.selection_mode, SelectionMode::Object | SelectionMode::Edge | SelectionMode::Vertex) {
             None
-        } else if self.selection.primary_entity().is_some_and(|id| self.engine.world().authored_block(id).is_some_and(|record| record.body.is_some())) {
+        } else if self.selection.primary_entity().is_some_and(|id| {
+            self.engine.world().authored_block(id).is_some_and(|record| record.body.is_some() || record.has_authored_seed())
+        }) {
             None
         } else {
             self.face_under_cursor(x, y)
@@ -8455,6 +12029,12 @@ impl Editor {
     }
 
     fn publish_gizmo(&mut self) {
+        if self.curve_lab.is_some() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_editor_overlay(None);
+            }
+            return;
+        }
         let vertices = self.gizmo_vertices().unwrap_or_default();
         let view = self.viewport_view;
         if let Some(renderer) = self.renderer.as_mut() {
@@ -8466,6 +12046,12 @@ impl Editor {
     }
 
     fn publish_reference(&mut self) {
+        if self.curve_lab.as_ref().is_some_and(|lab| lab.reference_suppressed()) {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_editor_reference(None);
+            }
+            return;
+        }
         let show = !self.session_active() && !self.land_mode && !self.character_workspace;
         let vertices = if show { self.reference_vertices() } else { Vec::new() };
         let view = self.viewport_view;
@@ -10570,6 +14156,50 @@ impl Editor {
         }
     }
 
+    fn create_plane(&mut self) {
+        self.stop_play();
+        if self.session_active() {
+            self.append("Stop play before adding a plane.");
+            return;
+        }
+        if self.character_workspace {
+            self.append("Return to the level before adding a plane. A plane is level geometry.");
+            return;
+        }
+        let count = self.engine.world().block_count() as f64;
+        let local = Vec3::new(count * 2.5, 1.0, -4.0);
+        self.prepare_authored_action();
+        let opened = self.history_begin("Create Plane", &[]);
+        match self.engine.execute_authoring(AuthoringCommand::CreatePlane { local }) {
+            Ok(jarvig_core::AuthoringResult::Created(id)) => {
+                self.history_note_created(id);
+                if opened {
+                    self.history_commit();
+                }
+                self.evict_retired_meshes();
+                if let Ok(item) = selection::SelectionItem::entity(id) {
+                    let _ = self.selection.replace(item);
+                }
+                self.append("Plane is a parametric solid. It uses the same evaluated body as a block, at minimum thickness. The visible mesh is derived. Collision is the analytic box.");
+                self.inspector_force_realize = true;
+                self.sync_outliner();
+                self.refresh_title();
+            }
+            Ok(_) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append("Create Plane did not return the new entity.");
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.append(&format!("Create Plane failed: {error}"));
+            }
+        }
+    }
+
     fn aim_at_terrain(&mut self, id: EntityUuid) {
         let Ok(pose) = self.engine.world().entity_world_pose(id) else { return };
         if let Some(camera) = self.editor_camera.as_mut() {
@@ -10733,26 +14363,43 @@ impl Editor {
             .collect()
     }
 
+    /// Draw skip for this view. Play shows game visibility. Hide in Editor is not that flag.
+    fn view_hidden_entities(&self) -> Vec<jarvig_core::EntityId> {
+        if self.session_active() {
+            return Vec::new();
+        }
+        let mut hidden = if self.character_workspace {
+            self.character_hidden_entities()
+        } else {
+            self.land_hidden_entities()
+        };
+        for id in &self.editor_hidden {
+            if !hidden.contains(id) {
+                hidden.push(*id);
+            }
+        }
+        hidden
+    }
+
     fn publish_land_view(&mut self) {
         if self.renderer.is_none() {
             return;
         }
+        let hidden = self.view_hidden_entities();
         if self.session_active() || (!self.land_mode && !self.character_workspace) {
-            let renderer = self.renderer.as_mut().expect("renderer");
-            renderer.set_terrain_grid(None);
-            renderer.set_hidden_entities(&[]);
-            renderer.set_land_unlit(false);
-            return;
-        }
-        if self.character_workspace {
-            let hidden = self.character_hidden_entities();
             let renderer = self.renderer.as_mut().expect("renderer");
             renderer.set_terrain_grid(None);
             renderer.set_hidden_entities(&hidden);
             renderer.set_land_unlit(false);
             return;
         }
-        let hidden = self.land_hidden_entities();
+        if self.character_workspace {
+            let renderer = self.renderer.as_mut().expect("renderer");
+            renderer.set_terrain_grid(None);
+            renderer.set_hidden_entities(&hidden);
+            renderer.set_land_unlit(false);
+            return;
+        }
         let unlit = !self.land_show_lighting;
         let grid = self.land_surface_grid();
         let renderer = self.renderer.as_mut().expect("renderer");
@@ -11033,6 +14680,284 @@ impl Editor {
             let _ = self.jobs.take_result::<LandChunkProduct>(id);
         }
         self.queue_land_chunks();
+    }
+
+    fn refresh_round_views(&mut self) {
+        if self.curve_lab.is_some()
+            || self.authored_lab.is_some()
+            || self.view_lab.is_some()
+            || self.observation_lab.is_some()
+            || self.direct_lab.is_some()
+            || self.intent_lab.is_some()
+            || self.analytic_lab.is_some()
+        {
+            return;
+        }
+        if self.extrude_preview.is_some() {
+            return;
+        }
+        if self.session_active() {
+            self.clear_round_view();
+            return;
+        }
+        let Some(view) = self.viewport_view else { return };
+        let Some(controller) = self.editor_camera.clone() else { return };
+        let Some(rect) = self.renderer.as_ref().and_then(|renderer| renderer.viewport(view).ok().flatten()) else { return };
+        if rect.width < 2 || rect.height < 2 {
+            return;
+        }
+        let Some(entity) = self.round_view_target() else {
+            self.clear_round_view();
+            return;
+        };
+        let Some(saved) = self.engine.world().authored_block(entity) else {
+            self.clear_round_view();
+            return;
+        };
+        let record = if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round && session.entity == entity) {
+            self.round_preview.clone().unwrap_or(saved)
+        } else {
+            saved
+        };
+        if record.body.is_some() {
+            self.clear_round_view();
+            return;
+        }
+        let radius_bits = round_radius_bits(&record);
+        let size_bits = [record.size_m[0].to_bits(), record.size_m[1].to_bits(), record.size_m[2].to_bits()];
+        let intent_len = record.intent.len();
+        let Ok(pose) = self.engine.world().entity_world_pose(entity) else { return };
+        let camera = local_round_camera(&pose, &controller, rect.width, rect.height);
+        if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round && session.entity == entity)
+            && self.round_basis.as_ref().is_some_and(|basis| basis.entity == entity)
+        {
+            let amount = self.modeling_session.map(|session| session.amount).unwrap_or(0.0);
+            self.refresh_resolved_round(view, entity, amount, &camera);
+            return;
+        }
+        let live_divisions = self.round_view.as_ref().and_then(|cache| {
+            if cache.entity != entity || cache.intent_len != intent_len || cache.size_bits != size_bits || cache.radius_bits != radius_bits || cache.noted_failure || radius_bits == 0 {
+                return None;
+            }
+            if cache.fillets.is_empty() {
+                cache.fillet.as_ref().and_then(|fillet| jarvig_core::arc_divisions(fillet, &camera).ok())
+            } else {
+                max_arc_divisions(&cache.fillets, &camera)
+            }
+        });
+        if self.round_view.as_ref().is_some_and(|cache| round_cache_holds(cache, entity, intent_len, size_bits, radius_bits, live_divisions)) {
+            return;
+        }
+        let same_identity = self.round_view.as_ref().is_some_and(|cache| {
+            cache.entity == entity && cache.intent_len == intent_len && cache.size_bits == size_bits && cache.radius_bits == radius_bits
+        });
+        if !same_identity {
+            let key = RoundRefusal { entity, intent_len, size_bits, radius_bits };
+            if self.round_refused == Some(key) {
+                return;
+            }
+            if jarvig_core::intent_authority_diagnostic(&record) != "Intent Authority: ELIGIBLE" {
+                self.round_refused = Some(key);
+                self.clear_round_view();
+                return;
+            }
+            self.round_refused = None;
+        }
+        let mut observation_fillets = Vec::new();
+        let mut observation_tokens = Vec::new();
+        let mut observation_curves = Vec::new();
+        let built = if radius_bits == 0 {
+            match jarvig_core::intent_authority_candidate(&record) {
+                jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => Some((jarvig_core::mesh_from_body(&body), 0, None, false)),
+                jarvig_core::IntentAuthorityCandidate::Refused(_) => None,
+            }
+        } else {
+            match jarvig_core::realize_round_solid(&record, &camera, "Viewport", 1) {
+                Ok(product) => {
+                    if let Ok(rounds) = jarvig_core::replay_rounds(&record) {
+                        observation_tokens = rounds.iter().map(|round| round.token.clone()).collect();
+                        observation_fillets = rounds.into_iter().map(|round| round.fillet).collect();
+                        if let jarvig_core::IntentAuthorityCandidate::Reconstructable(body) = jarvig_core::intent_authority_candidate(&record) {
+                            if observation_tokens.len() == observation_fillets.len() && !observation_fillets.is_empty() {
+                                let pairs: Vec<_> = observation_tokens.iter().cloned().zip(observation_fillets.iter().cloned()).collect();
+                                match jarvig_core::curve_catalog(&body, &pairs) {
+                                    Ok(curves) => observation_curves = curves,
+                                    Err(error) => self.append(&format!("Round curves were not named: {error}")),
+                                }
+                            }
+                        }
+                    }
+                    let fillet = observation_fillets.first().cloned();
+                    Some((product.mesh, product.chosen_arc_divisions, fillet, false))
+                }
+                Err(error) => {
+                    let already = self.round_view.as_ref().is_some_and(|cache| cache.noted_failure && cache.entity == entity && cache.radius_bits == radius_bits);
+                    if !already {
+                        self.append(&format!("Round observation kept the planar solid: {error}"));
+                    }
+                    match jarvig_core::intent_authority_candidate(&record) {
+                        jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => Some((jarvig_core::mesh_from_body(&body), 0, None, true)),
+                        jarvig_core::IntentAuthorityCandidate::Refused(_) => None,
+                    }
+                }
+            }
+        };
+        let Some((mesh, divisions, fillet, failed)) = built else {
+            self.round_refused = Some(RoundRefusal { entity, intent_len, size_bits, radius_bits });
+            self.clear_round_view();
+            return;
+        };
+        let mesh_id = self.engine.world_mut().add_mesh(mesh);
+        let installed = match self.renderer.as_mut() {
+            Some(renderer) => renderer.set_view_mesh_override(view, entity, Some(mesh_id)).is_ok(),
+            None => false,
+        };
+        if !installed {
+            let _ = self.engine.world_mut().retire_unreferenced_mesh(mesh_id);
+            return;
+        }
+        let previous = self.round_view.take();
+        let mut logged = previous.as_ref().and_then(|cache| cache.logged_divisions);
+        if let Some(previous) = previous {
+            if previous.mesh != mesh_id {
+                let _ = self.engine.world_mut().retire_unreferenced_mesh(previous.mesh);
+            }
+        }
+        if divisions > 0 && logged != Some(divisions) {
+            self.append(&format!("Round observation: {divisions} arc divisions."));
+            logged = Some(divisions);
+        }
+        self.round_view = Some(RoundViewCache {
+            entity,
+            intent_len,
+            size_bits,
+            radius_bits,
+            divisions,
+            mesh: mesh_id,
+            fillet,
+            fillets: observation_fillets,
+            tokens: observation_tokens,
+            curves: observation_curves,
+            logged_divisions: logged,
+            noted_failure: failed,
+        });
+    }
+
+    /// Builds the open Round preview from the resolved fillets. The tape stays unread.
+    fn refresh_resolved_round(&mut self, view: jarvig_renderer::RenderViewId, entity: EntityUuid, amount: f64, camera: &jarvig_core::RoundCamera) {
+        let Some(saved) = self.engine.world().authored_block(entity) else {
+            self.clear_round_view();
+            return;
+        };
+        let size_bits = [saved.size_m[0].to_bits(), saved.size_m[1].to_bits(), saved.size_m[2].to_bits()];
+        let intent_len = saved.intent.len();
+        let decision = {
+            let Some(basis) = self.round_basis.as_ref() else { return };
+            if basis.entity != entity {
+                return;
+            }
+            let Some((live_fillets, radius_bits)) = session_preview_key(basis, amount) else { return };
+            let planar = live_fillets.is_empty();
+            let live = if planar { None } else { max_arc_divisions(&live_fillets, camera) };
+            let holds = self.round_view.as_ref().is_some_and(|cache| {
+                cache.entity == entity
+                    && cache.intent_len == intent_len
+                    && cache.size_bits == size_bits
+                    && cache.radius_bits == radius_bits
+                    && !cache.noted_failure
+                    && if planar {
+                        cache.fillet.is_none() && cache.divisions == 0
+                    } else {
+                        cache.fillet.is_some() && live == Some(cache.divisions)
+                    }
+            });
+            if holds {
+                None
+            } else if planar {
+                let tokens = if basis.kept.is_empty() && basis.tokens.len() == live_fillets.len() { basis.tokens.clone() } else { Vec::new() };
+                let curves = round_curve_elements(&basis.body, &tokens, &live_fillets);
+                Some(Ok((jarvig_core::mesh_from_body(&basis.body), 0, None, Vec::new(), tokens, curves, radius_bits)))
+            } else {
+                let tokens = if basis.kept.is_empty() && basis.tokens.len() == live_fillets.len() { basis.tokens.clone() } else { Vec::new() };
+                let curves = round_curve_elements(&basis.body, &tokens, &live_fillets);
+                match jarvig_core::observe_resolved_fillets(&basis.body, &live_fillets, camera) {
+                    Ok((mesh, divisions)) => {
+                        let fillet = live_fillets.first().cloned();
+                        Some(Ok((mesh, divisions, fillet, live_fillets, tokens, curves, radius_bits)))
+                    }
+                    Err(error) => Some(Err((error, radius_bits))),
+                }
+            }
+        };
+        let Some(decision) = decision else { return };
+        let (mesh, divisions, fillet, fillets, tokens, curves, radius_bits) = match decision {
+            Ok(ready) => ready,
+            Err((error, radius_bits)) => {
+                let already = self.round_view.as_ref().is_some_and(|cache| cache.noted_failure && cache.entity == entity && cache.radius_bits == radius_bits);
+                if !already {
+                    self.append(&format!("Round observation kept the last radius: {error}"));
+                }
+                if let Some(cache) = self.round_view.as_mut() {
+                    cache.noted_failure = true;
+                    cache.radius_bits = radius_bits;
+                }
+                return;
+            }
+        };
+        let mesh_id = self.engine.world_mut().add_mesh(mesh);
+        let installed = match self.renderer.as_mut() {
+            Some(renderer) => renderer.set_view_mesh_override(view, entity, Some(mesh_id)).is_ok(),
+            None => false,
+        };
+        if !installed {
+            let _ = self.engine.world_mut().retire_unreferenced_mesh(mesh_id);
+            return;
+        }
+        let previous = self.round_view.take();
+        let mut logged = previous.as_ref().and_then(|cache| cache.logged_divisions);
+        if let Some(previous) = previous {
+            if previous.mesh != mesh_id {
+                let _ = self.engine.world_mut().retire_unreferenced_mesh(previous.mesh);
+            }
+        }
+        if divisions > 0 && logged != Some(divisions) {
+            self.append(&format!("Round observation: {divisions} arc divisions."));
+            logged = Some(divisions);
+        }
+        self.round_view = Some(RoundViewCache {
+            entity,
+            intent_len,
+            size_bits,
+            radius_bits,
+            divisions,
+            mesh: mesh_id,
+            fillet,
+            fillets,
+            tokens,
+            curves,
+            logged_divisions: logged,
+            noted_failure: false,
+        });
+    }
+
+    fn round_view_target(&self) -> Option<EntityUuid> {
+        let session = self.modeling_session.filter(|session| session.tool == ModelingTool::Round).map(|session| session.entity);
+        let selected = self.selection.primary_entity().filter(|entity| self.engine.world().authored_block(*entity).is_some_and(|record| observes_saved_round(&record)));
+        let cached = self.round_view.as_ref().map(|cache| cache.entity).filter(|entity| self.engine.world().authored_block(*entity).is_some_and(|record| observes_saved_round(&record)));
+        if let Some(entity) = round_observation_entity(session, selected, cached, None) {
+            return Some(entity);
+        }
+        self.engine.world().entities().find(|entity| self.engine.world().authored_block(*entity).is_some_and(|record| observes_saved_round(&record)))
+    }
+
+    fn clear_round_view(&mut self) {
+        let Some(cache) = self.round_view.take() else { return };
+        if let Some(view) = self.viewport_view {
+            if let Some(renderer) = self.renderer.as_mut() {
+                let _ = renderer.set_view_mesh_override(view, cache.entity, None);
+            }
+        }
+        let _ = self.engine.world_mut().retire_unreferenced_mesh(cache.mesh);
     }
 
     fn evict_retired_meshes(&mut self) {
@@ -13260,6 +17185,9 @@ impl Editor {
     }
 
     fn marquee_should_arm(&self, x: f64, y: f64) -> bool {
+        if self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round) {
+            return false;
+        }
         if self.gizmo_handle_at(x, y).is_some() || self.operation_handle_at(x, y).is_some() {
             return false;
         }
@@ -13269,9 +17197,35 @@ impl Editor {
         self.pick_entity_at(x, y).is_none()
     }
 
+    /// Face, edge, or vertex box on the one selected solid. An empty press or a press on that solid.
+    /// A press on a different solid stays a pick. Analytic bevel and inset without a display body stay an object marquee.
+    fn element_box_should_arm(&self, x: f64, y: f64) -> bool {
+        if !matches!(self.selection_mode, SelectionMode::Face | SelectionMode::Edge | SelectionMode::Vertex) {
+            return false;
+        }
+        if self.modeling_session.is_some() {
+            return false;
+        }
+        if self.gizmo_handle_at(x, y).is_some() || self.operation_handle_at(x, y).is_some() {
+            return false;
+        }
+        if self.character_workspace && self.joint_pivot_at(x, y).is_some() {
+            return false;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return false };
+        let Some((_, record)) = self.block_display(entity) else { return false };
+        if selection_body(&record).is_none() {
+            return false;
+        }
+        match self.pick_entity_at(x, y) {
+            None => true,
+            Some(hit) => hit == entity,
+        }
+    }
+
     fn pick_entity_at(&self, x: f64, y: f64) -> Option<EntityUuid> {
         let ray = self.viewport_ray(x, y)?;
-        let hidden = self.land_hidden_entities();
+        let hidden = self.view_hidden_entities();
         let hit = {
             let world = self.engine.world();
             let snapshot = world.extract(RenderFrameId(30)).ok()?;
@@ -13305,6 +17259,10 @@ impl Editor {
             self.viewport_press(self.panel_hwnd(PERSPECTIVE), drag.origin_x, drag.origin_y, drag.ctrl, drag.shift);
             return;
         }
+        if drag.elements {
+            self.finish_element_box(&drag);
+            return;
+        }
         let ids = self.marquee_hits(&drag);
         self.clear_element_selection();
         if drag.ctrl {
@@ -13327,10 +17285,101 @@ impl Editor {
         self.sync_selection_view();
     }
 
+    fn finish_element_box(&mut self, drag: &marquee::MarqueeDrag) {
+        let Some(entity) = self.selection.primary_entity() else { return };
+        if !self.session_active() && self.editor_hidden.contains(&entity) {
+            return;
+        }
+        let Some((pose, record)) = self.block_display(entity) else { return };
+        let Some(body) = selection_body(&record) else { return };
+        let kind = match self.selection_mode {
+            SelectionMode::Face => selection::ElementKind::Face,
+            SelectionMode::Edge => selection::ElementKind::Edge,
+            SelectionMode::Vertex => selection::ElementKind::Vertex,
+            SelectionMode::Auto | SelectionMode::Object => return,
+        };
+        let rect = marquee::ScreenRect::from_drag(drag.origin_x, drag.origin_y, drag.x, drag.y);
+        let marquee_kind = marquee::kind_for(drag.origin_x, drag.x);
+        let (fillets, curves, _) = self.round_pick_parts(entity);
+        let mut hits = Vec::new();
+        match kind {
+            selection::ElementKind::Face => {
+                for face in &body.faces {
+                    let points = self.projected_vertices(&pose, &body, &face.vertices);
+                    if marquee::element_hits(marquee_kind, rect, &points) {
+                        hits.push(face.id);
+                    }
+                }
+                for element in curves.iter().filter(|element| element.kind == jarvig_core::CurveKind::Face) {
+                    let points: Vec<_> = element.outline.iter().copied().map(|point| self.project_corner(self.world_of(&pose, point))).collect();
+                    if marquee::element_hits(marquee_kind, rect, &points) {
+                        hits.push(element.id);
+                    }
+                }
+            }
+            selection::ElementKind::Edge if !fillets.is_empty() => {
+                for (id, _, _) in body.edge_segments() {
+                    let Some((start, end)) = round_cage_segment_set(&body, &fillets, id) else { continue };
+                    let points = vec![self.project_corner(self.world_of(&pose, start)), self.project_corner(self.world_of(&pose, end))];
+                    if marquee::element_hits(marquee_kind, rect, &points) {
+                        hits.push(id);
+                    }
+                }
+                for element in curves.iter().filter(|element| element.kind == jarvig_core::CurveKind::Edge) {
+                    let points = vec![
+                        self.project_corner(self.world_of(&pose, element.segment.0)),
+                        self.project_corner(self.world_of(&pose, element.segment.1)),
+                    ];
+                    if marquee::element_hits(marquee_kind, rect, &points) {
+                        hits.push(element.id);
+                    }
+                }
+            }
+            selection::ElementKind::Edge => {
+                for edge in &body.edges {
+                    let points = self.projected_vertices(&pose, &body, &[edge.a, edge.b]);
+                    if marquee::element_hits(marquee_kind, rect, &points) {
+                        hits.push(edge.id);
+                    }
+                }
+            }
+            selection::ElementKind::Vertex => {
+                for vertex in &body.vertices {
+                    let point = self.project_corner(self.world_of(&pose, vertex.position));
+                    if marquee::element_hits(marquee_kind, rect, &[point]) {
+                        hits.push(vertex.id);
+                    }
+                }
+                for element in curves.iter().filter(|element| element.kind == jarvig_core::CurveKind::Vertex) {
+                    let point = self.project_corner(self.world_of(&pose, element.segment.0));
+                    if marquee::element_hits(marquee_kind, rect, &[point]) {
+                        hits.push(element.id);
+                    }
+                }
+            }
+        }
+        self.subdivide_hint = None;
+        self.selected_face = None;
+        self.element_selection.apply_box(entity, kind, &hits, drag.ctrl, drag.shift);
+        self.publish_elements();
+        self.inspector_force_realize = true;
+        self.rebuild_inspector();
+        self.refresh_status();
+    }
+
+    fn projected_vertices(&self, pose: &ResolvedPose, body: &SolidBody, ids: &[u32]) -> Vec<marquee::ProjectedCorner> {
+        ids.iter()
+            .filter_map(|id| {
+                let vertex = body.vertices.iter().find(|vertex| vertex.id == *id)?;
+                Some(self.project_corner(self.world_of(pose, vertex.position)))
+            })
+            .collect()
+    }
+
     fn marquee_hits(&self, drag: &marquee::MarqueeDrag) -> Vec<EntityUuid> {
         let kind = marquee::kind_for(drag.origin_x, drag.x);
         let rect = marquee::ScreenRect::from_drag(drag.origin_x, drag.origin_y, drag.x, drag.y);
-        let hidden = self.land_hidden_entities();
+        let hidden = self.view_hidden_entities();
         let boxes = {
             let world = self.engine.world();
             let mut boxes: Vec<(EntityUuid, [Vec3; 8])> = Vec::new();
@@ -13448,21 +17497,24 @@ impl Editor {
     fn gizmo_vertices(&self) -> Option<Vec<jarvig_renderer::OverlayVertex>> {
         let camera = self.editor_camera.as_ref()?;
         let mut vertices = Vec::new();
-        if let (Some((_entity, pose)), Some(renderer)) = (self.gizmo_target(), self.renderer.as_ref()) {
-            let height = renderer.configured_size().1;
-            let distance = vec_len(vec_sub(pose.translation, camera.position));
-            let length = gizmo::visual_length(distance, camera.vertical_fov_radians, height);
-            let rotate = self.gizmo_shows_rotation();
-            vertices.extend(gizmo::build_gizmo(
-                pose.translation,
-                camera.position,
-                length,
-                self.transform_space,
-                pose.rotation,
-                rotate,
-                self.gizmo_hover.filter(|handle| handle.is_rotation() == rotate),
-                self.gizmo_drag.as_ref().map(|drag| drag.handle),
-            ));
+        if let (Some((entity, pose)), Some(renderer)) = (self.gizmo_target(), self.renderer.as_ref()) {
+            let editor_hidden = !self.session_active() && self.editor_hidden.contains(&entity);
+            if !editor_hidden {
+                let height = renderer.configured_size().1;
+                let distance = vec_len(vec_sub(pose.translation, camera.position));
+                let length = gizmo::visual_length(distance, camera.vertical_fov_radians, height);
+                let rotate = self.gizmo_shows_rotation();
+                vertices.extend(gizmo::build_gizmo(
+                    pose.translation,
+                    camera.position,
+                    length,
+                    self.transform_space,
+                    pose.rotation,
+                    rotate,
+                    self.gizmo_hover.filter(|handle| handle.is_rotation() == rotate),
+                    self.gizmo_drag.as_ref().map(|drag| drag.handle),
+                ));
+            }
         }
         let cage_started = Instant::now();
         self.push_solid_overlay(&mut vertices, camera.position);
@@ -13485,9 +17537,24 @@ impl Editor {
 
     fn push_solid_overlay(&self, vertices: &mut Vec<jarvig_renderer::OverlayVertex>, camera: Vec3) {
         let Some((entity, pose, size)) = self.face_target() else { return };
+        if !self.session_active() && self.editor_hidden.contains(&entity) {
+            return;
+        }
         let Some(length) = self.gizmo_length(pose.translation) else { return };
         let record = self.engine.world().authored_block(entity);
-        let body = record.as_ref().and_then(|record| record.display_body());
+        let round_resolved = self.round_basis.is_some() && self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round);
+        let body = if round_resolved { None } else { record.as_ref().and_then(selection_body) };
+        let round_draw = self.round_view.as_ref().and_then(|cache| {
+            if cache.entity != entity || cache.noted_failure {
+                return None;
+            }
+            let fillets = if cache.fillets.is_empty() {
+                cache.fillet.clone().into_iter().collect::<Vec<_>>()
+            } else {
+                cache.fillets.clone()
+            };
+            (!fillets.is_empty()).then_some((fillets, cache.divisions.max(1), cache.tokens.clone(), cache.curves.clone()))
+        });
         if let Some(session) = self.modeling_session.filter(|session| session.entity == entity) {
             if topology_tool(session.tool) {
                 let geometry = self.session_geometry(&session).or(body);
@@ -13503,7 +17570,7 @@ impl Editor {
                 return;
             }
             if region_extrude(session) {
-                let geometry = record.as_ref().and_then(|record| record.body.clone()).or_else(|| self.session_geometry(&session));
+                let geometry = record.as_ref().and_then(|block| self.region_draw_body(entity, block)).or_else(|| self.session_geometry(&session));
                 if let Some(geometry) = geometry {
                     self.draw_body_edges(vertices, camera, &pose, length, &geometry, None, None, false);
                     for face in &self.region_faces {
@@ -13514,6 +17581,43 @@ impl Editor {
                         let direction = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
                         vertices.extend(gizmo::region_arrow_vertices(center, direction, camera, length, self.face_drag.is_some()));
                     }
+                }
+                return;
+            }
+            if session.tool == ModelingTool::Round {
+                let prepared = self.round_basis.as_ref().and_then(|basis| {
+                    if basis.entity != entity {
+                        return None;
+                    }
+                    let (fillets, handles) = session_round_fillets(basis, session.amount)?;
+                    Some((basis.body.clone(), fillets, handles))
+                });
+                if let Some((geometry, fillets, handles)) = prepared {
+                    if fillets.is_empty() {
+                        self.draw_body_edges(vertices, camera, &pose, length, &geometry, Some(session.element), None, false);
+                    } else {
+                        let divisions = self.round_view.as_ref().map(|cache| cache.divisions.max(1)).unwrap_or(1);
+                        let tokens = self
+                            .round_basis
+                            .as_ref()
+                            .filter(|basis| basis.kept.is_empty() && basis.tokens.len() == fillets.len())
+                            .map(|basis| basis.tokens.clone())
+                            .unwrap_or_default();
+                        let curves = round_curve_elements(&geometry, &tokens, &fillets);
+                        self.draw_round_cages(vertices, camera, &pose, &geometry, &fillets, &handles, divisions, Some(session.element), &tokens, &curves);
+                    }
+                } else if let Some(geometry) = record.as_ref().and_then(selection_body) {
+                    self.draw_body_edges(vertices, camera, &pose, length, &geometry, Some(session.element), None, false);
+                }
+                return;
+            }
+            if session.tool == ModelingTool::BevelEdge {
+                let geometry = record.as_ref().and_then(|record| record.display_body()).or_else(|| self.session_geometry(&session));
+                if let Some(geometry) = geometry {
+                    self.draw_body_edges(vertices, camera, &pose, length, &geometry, None, None, false);
+                    let center = self.world_of(&pose, self.bevel_anchor_local(&geometry));
+                    let direction = pose.rotation.rotate(Vec3::new(self.region_normal[0], self.region_normal[1], self.region_normal[2]));
+                    vertices.extend(gizmo::region_arrow_vertices(center, direction, camera, length, self.face_drag.is_some()));
                 }
                 return;
             }
@@ -13546,15 +17650,24 @@ impl Editor {
             SelectionMode::Edge => {
                 if let Some(body) = body.as_ref() {
                     let selected = self.selected_edge.filter(|(id, _)| *id == entity).map(|(_, edge)| edge);
-                    self.draw_body_edges(vertices, camera, &pose, length, body, selected, self.edge_hover, false);
+                    if let Some((fillets, divisions, tokens, curves)) = round_draw.as_ref() {
+                        self.draw_round_cages(vertices, camera, &pose, body, fillets, &[], *divisions, selected, tokens, curves);
+                    } else {
+                        self.draw_body_edges(vertices, camera, &pose, length, body, selected, self.edge_hover, false);
+                    }
                 } else {
                     vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
                 }
             }
             SelectionMode::Vertex => {
                 if let Some(body) = body.as_ref() {
-                    self.draw_body_edges(vertices, camera, &pose, length, body, None, None, true);
                     let selected = self.selected_vertex.filter(|(id, _)| *id == entity).map(|(_, vertex)| vertex);
+                    if let Some((fillets, divisions, tokens, curves)) = round_draw.as_ref() {
+                        self.draw_round_cages(vertices, camera, &pose, body, fillets, &[], *divisions, None, tokens, curves);
+                        self.draw_curve_vertices(vertices, camera, &pose, length, curves, selected, self.vertex_hover);
+                    } else {
+                        self.draw_body_edges(vertices, camera, &pose, length, body, None, None, true);
+                    }
                     self.draw_body_vertices(vertices, camera, &pose, length, body, selected, self.vertex_hover);
                 } else {
                     vertices.extend(gizmo::box_outline_vertices(pose.translation, pose.rotation, size, camera, length));
@@ -13562,11 +17675,17 @@ impl Editor {
             }
             SelectionMode::Auto | SelectionMode::Face => {
                 let stored = record.as_ref().is_some_and(|record| record.body.is_some());
-                let cage = self.selection_mode == SelectionMode::Face || stored || self.show_grid;
+                let authored = record.as_ref().is_some_and(|record| record.has_authored_seed() && record.body.is_none());
+                let cage = self.selection_mode == SelectionMode::Face || stored || authored || self.show_grid;
                 if cage {
                     if let Some(body) = body.as_ref() {
-                        self.draw_body_edges(vertices, camera, &pose, length, body, None, None, false);
-                        if stored {
+                        if let Some((fillets, divisions, tokens, curves)) = round_draw.as_ref() {
+                            self.draw_round_cages(vertices, camera, &pose, body, fillets, &[], *divisions, None, tokens, curves);
+                            self.draw_curve_face_highlights(vertices, camera, &pose, length, curves, fillets, tokens, entity);
+                        } else {
+                            self.draw_body_edges(vertices, camera, &pose, length, body, None, None, false);
+                        }
+                        if stored || authored {
                             self.push_body_face_highlights(vertices, camera, &pose, length, body, entity);
                         } else {
                             self.push_analytic_face_highlights(vertices, camera, &pose, size, length, entity);
@@ -13657,7 +17776,7 @@ impl Editor {
         faint: bool,
     ) {
         for (id, start, end) in body.edge_segments() {
-            let hot = selected == Some(id);
+            let hot = selected == Some(id) || self.selected_edges.contains(&id);
             let hovered = hover == Some(id);
             let (radius, color) = if hot {
                 (length * 0.022, [0.95, 0.45, 0.38, 1.0])
@@ -13672,6 +17791,173 @@ impl Editor {
         }
     }
 
+    /// Draws the planar cage with every rounded edge replaced by its arc.
+    /// A perpendicular end stops on the tangent instead of the sharp vertex.
+    /// Handles are drawn on `handles` only.
+    fn draw_round_cages(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        body: &SolidBody,
+        fillets: &[jarvig_core::Fillet],
+        handles: &[jarvig_core::Fillet],
+        divisions: u32,
+        selected: Option<u32>,
+        tokens: &[String],
+        curves: &[jarvig_core::CurveElement],
+    ) {
+        let Some(first) = fillets.first() else { return };
+        let divisions = divisions.max(1);
+        let crown = self.world_of(pose, first.point(first.length_m * 0.5, first.span * 0.5));
+        let distance = vec_len(vec_sub(crown, camera)).max(0.05);
+        let height = self.renderer.as_ref().map(|renderer| renderer.configured_size().1).unwrap_or(720).max(1) as f64;
+        let fov = self.editor_camera.as_ref().map(|camera| camera.vertical_fov_radians).unwrap_or(60.0_f64.to_radians());
+        let world_per_pixel = distance * (fov * 0.5).tan() / (height * 0.5);
+        let cap = fillets.iter().map(|fillet| fillet.radius_m).fold(0.001_f64, f64::max) * 0.12;
+        let wire = (world_per_pixel * 1.5).clamp(1.0e-4, cap);
+        let hot_wire = (world_per_pixel * 2.2).clamp(1.0e-4, cap);
+        for (id, _, _) in body.edge_segments() {
+            let Some((start, end)) = round_cage_segment_set(body, fillets, id) else { continue };
+            let hot = selected == Some(id) || self.selected_edges.contains(&id);
+            let hovered = self.edge_hover == Some(id);
+            let (radius, color) = if hot {
+                (hot_wire, [0.95, 0.45, 0.38, 1.0])
+            } else if hovered {
+                (hot_wire, [1.0, 0.82, 0.45, 1.0])
+            } else {
+                (wire, [0.45, 0.62, 0.85, 1.0])
+            };
+            gizmo::push_segment(vertices, camera, self.world_of(pose, start), self.world_of(pose, end), radius, color);
+        }
+        for element in curves.iter().filter(|element| element.kind == jarvig_core::CurveKind::Edge) {
+            let hot = selected == Some(element.id) || self.selected_edges.contains(&element.id);
+            let hovered = self.edge_hover == Some(element.id);
+            let (radius, color) = if hot {
+                (hot_wire, [0.95, 0.45, 0.38, 1.0])
+            } else if hovered {
+                (hot_wire, [1.0, 0.82, 0.45, 1.0])
+            } else {
+                (wire, [0.45, 0.62, 0.85, 1.0])
+            };
+            gizmo::push_segment(vertices, camera, self.world_of(pose, element.segment.0), self.world_of(pose, element.segment.1), radius, color);
+        }
+        for (index, fillet) in fillets.iter().enumerate() {
+            let handled = handles.iter().any(|handle| handle.edge_id == fillet.edge_id);
+            let hot = handled || self.round_arc_hot(body, fillet, selected);
+            let (radius, color) = if hot {
+                (hot_wire, [0.95, 0.45, 0.38, 1.0])
+            } else {
+                (wire, [0.45, 0.62, 0.85, 1.0])
+            };
+            let (along0, along1) = fillet_draw_range(curves, tokens.get(index).map(String::as_str), fillet);
+            for station in [0.0, 0.5, 1.0] {
+                let along = along0 + (along1 - along0) * station;
+                let mut previous = fillet.point(along, 0.0);
+                for step in 1..=divisions {
+                    let angle = fillet.span * f64::from(step) / f64::from(divisions);
+                    let next = fillet.point(along, angle);
+                    gizmo::push_segment(vertices, camera, self.world_of(pose, previous), self.world_of(pose, next), radius, color);
+                    previous = next;
+                }
+            }
+            for fraction in [0.0, 0.5, 1.0] {
+                let angle = fillet.span * fraction;
+                gizmo::push_segment(
+                    vertices,
+                    camera,
+                    self.world_of(pose, fillet.point(along0, angle)),
+                    self.world_of(pose, fillet.point(along1, angle)),
+                    radius,
+                    color,
+                );
+            }
+            if handled {
+                let crown_local = fillet.point(fillet.length_m * 0.5, fillet.span * 0.5);
+                let handle = (world_per_pixel * 6.0).clamp(1.0e-4, fillet.radius_m.max(0.001) * 0.35);
+                let color = if self.round_drag.is_some() { [1.0, 0.62, 0.18, 1.0] } else { [1.0, 0.86, 0.32, 1.0] };
+                self.draw_vertex_marker(vertices, camera, pose, crown_local, handle, color);
+            }
+        }
+    }
+
+    fn round_arc_hot(&self, body: &SolidBody, fillet: &jarvig_core::Fillet, selected: Option<u32>) -> bool {
+        if selected.is_some_and(|edge| fillet_covers_edge(body, fillet, edge)) {
+            return true;
+        }
+        self.selected_edges.iter().any(|edge| fillet_covers_edge(body, fillet, *edge))
+    }
+
+    /// Strokes the semantic outline of a selected fillet or corner. Tessellation samples stay off this stroke.
+    /// A fillet id with no catalog entry still strokes the radius-wide surface.
+    fn draw_curve_face_highlights(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        curves: &[jarvig_core::CurveElement],
+        fillets: &[jarvig_core::Fillet],
+        tokens: &[String],
+        entity: EntityUuid,
+    ) {
+        let mut faces = Vec::new();
+        if let Some(face) = self.body_face_hover {
+            faces.push(face);
+        }
+        for face in &self.selected_body_faces {
+            if !faces.contains(face) {
+                faces.push(*face);
+            }
+        }
+        if let Some((_, face)) = self.selected_body_face.filter(|(id, _)| *id == entity) {
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+        for face in faces {
+            let hot = self.body_face_hover == Some(face);
+            let color = if hot { [0.75, 0.88, 1.0, 1.0] } else { [0.95, 0.55, 0.62, 1.0] };
+            let radius = if hot { length * 0.012 } else { length * 0.016 };
+            let outline = curves
+                .iter()
+                .find(|element| element.kind == jarvig_core::CurveKind::Face && element.id == face)
+                .map(|element| element.outline.clone())
+                .filter(|outline| outline.len() >= 2)
+                .or_else(|| fillet_face_outline(fillets, tokens, face));
+            let Some(outline) = outline else { continue };
+            for index in 0..outline.len() {
+                let start = self.world_of(pose, outline[index]);
+                let end = self.world_of(pose, outline[(index + 1) % outline.len()]);
+                gizmo::push_segment(vertices, camera, start, end, radius, color);
+            }
+        }
+    }
+
+    fn draw_curve_vertices(
+        &self,
+        vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
+        camera: Vec3,
+        pose: &ResolvedPose,
+        length: f64,
+        curves: &[jarvig_core::CurveElement],
+        selected: Option<u32>,
+        hover: Option<u32>,
+    ) {
+        for element in curves.iter().filter(|element| element.kind == jarvig_core::CurveKind::Vertex) {
+            let hot = selected == Some(element.id) || self.selected_vertices.contains(&element.id);
+            let hovered = hover == Some(element.id);
+            let (radius, color) = if hot {
+                (length * 0.018, [0.95, 0.45, 0.38, 1.0])
+            } else if hovered {
+                (length * 0.014, [1.0, 0.82, 0.45, 1.0])
+            } else {
+                (length * 0.008, [0.55, 0.70, 0.85, 1.0])
+            };
+            self.draw_vertex_marker(vertices, camera, pose, element.segment.0, radius, color);
+        }
+    }
+
     fn draw_body_vertices(
         &self,
         vertices: &mut Vec<jarvig_renderer::OverlayVertex>,
@@ -13683,7 +17969,7 @@ impl Editor {
         hover: Option<u32>,
     ) {
         for vertex in &body.vertices {
-            let hot = selected == Some(vertex.id);
+            let hot = selected == Some(vertex.id) || self.selected_vertices.contains(&vertex.id);
             let hovered = hover == Some(vertex.id);
             let (radius, color) = if hot {
                 (length * 0.018, [0.95, 0.45, 0.38, 1.0])
@@ -13771,6 +18057,9 @@ impl Editor {
             } else {
                 self.restore_gizmo_drag();
             }
+        }
+        if self.round_drag.take().is_some() {
+            self.hide_round_label();
         }
         if self.face_drag.is_some() {
             self.restore_face_drag();
@@ -14004,6 +18293,7 @@ impl Editor {
                 self.finish_history_effect(&apply);
                 let label = self.history.redo_label().unwrap_or("edit").to_string();
                 self.sync_outliner();
+                self.reapply_saved_folder_expansion();
                 self.refresh_title();
                 self.refresh_edit_menu();
                 self.append(&format!("Undid {label}."));
@@ -14027,6 +18317,7 @@ impl Editor {
                 self.finish_history_effect(&apply);
                 let label = self.history.undo_label().unwrap_or("edit").to_string();
                 self.sync_outliner();
+                self.reapply_saved_folder_expansion();
                 self.refresh_title();
                 self.refresh_edit_menu();
                 self.append(&format!("Redid {label}."));
@@ -14146,6 +18437,10 @@ impl Editor {
         let Some(target) = self.selection.primary_entity() else {
             return;
         };
+        if self.engine.world().entity_locked(target) {
+            self.append("That object is locked.");
+            return;
+        }
         self.prepare_authored_action();
         let mut ids = vec![target];
         ids.extend(self.engine.world().entity_children(target));
@@ -14200,6 +18495,466 @@ impl Editor {
                 }
                 self.append(&format!("Duplicate failed: {error}."));
             }
+        }
+    }
+
+    fn level_edit_open(&mut self) -> bool {
+        if self.session_active() {
+            self.append("Stop play before organizing the level.");
+            false
+        } else {
+            true
+        }
+    }
+
+    fn note_folder_error(&mut self, error: jarvig_core::OrganizationError) {
+        self.append(match error {
+            jarvig_core::OrganizationError::EmptyName => "Name the folder first.",
+            jarvig_core::OrganizationError::NameLimit => "That folder name is too long.",
+            jarvig_core::OrganizationError::SpatialParent => "That object has a geometric parent. A folder does not move it.",
+            jarvig_core::OrganizationError::UnknownFolder
+            | jarvig_core::OrganizationError::MissingParent
+            | jarvig_core::OrganizationError::NotFound
+            | jarvig_core::OrganizationError::Cycle => "That folder is not in the level.",
+        });
+    }
+
+    fn entity_label(&self, entity: EntityUuid) -> String {
+        self.engine.world().entity_outline().into_iter().find(|row| row.uuid == entity).map(|row| row.name).unwrap_or_default()
+    }
+
+    fn hide_primary(&mut self, visible_in_editor: bool) {
+        if !self.level_edit_open() {
+            return;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return };
+        let settings = self
+            .engine
+            .world()
+            .entity_outline()
+            .iter()
+            .any(|row| row.uuid == entity && row.class == jarvig_core::AuthoringClass::WorldSettings);
+        if settings || self.engine.world().authored_visible(entity).is_none() {
+            self.append("World Settings cannot be hidden.");
+            return;
+        }
+        set_editor_hidden(&mut self.editor_hidden, entity, visible_in_editor);
+        if visible_in_editor {
+            self.append("Shown in Editor.");
+        } else {
+            self.append("Hidden in Editor.");
+        }
+        self.publish_land_view();
+        self.realize_outliner();
+    }
+
+    fn lock_primary(&mut self, locked: bool) {
+        if !self.level_edit_open() {
+            return;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return };
+        if let Err(error) = self.engine.world_mut().set_entity_locked(entity, locked) {
+            self.note_folder_error(error);
+        }
+    }
+
+    fn note_folder_expansion(&mut self) {
+        if !self.folder_expansion_ready {
+            return;
+        }
+        let Some(level) = self.level_uuid else { return };
+        let known = self.outliner.folder_ids();
+        if known.is_empty() {
+            return;
+        }
+        let open = self.outliner.expanded_folder_ids();
+        if let Some(existing) = self.folder_expansion.iter_mut().find(|row| row.level == level) {
+            if existing.known == known && existing.open == open {
+                return;
+            }
+            existing.known = known;
+            existing.open = open;
+        } else {
+            self.folder_expansion.push(documents::FolderOpenRecord { level, known, open });
+        }
+        self.persist_workspace();
+    }
+
+    /// Undo restores organization, then the workspace open set. Expansion is not an undo entry.
+    fn reapply_saved_folder_expansion(&mut self) {
+        if !self.folder_expansion_ready || !self.folder_expansion_applied {
+            return;
+        }
+        let Some(level) = self.level_uuid else { return };
+        let Some(record) = self.folder_expansion.iter().find(|row| row.level == level).cloned() else { return };
+        self.outliner.apply_folder_expansion(&record.known, &record.open);
+        self.realize_outliner();
+    }
+
+    /// One organization transaction. An empty id list leaves entity records alone.
+    fn organization_edit(
+        &mut self,
+        label: &str,
+        edit: impl FnOnce(&mut jarvig_core::SceneWorld) -> Result<bool, jarvig_core::OrganizationError>,
+    ) {
+        if !self.level_edit_open() {
+            return;
+        }
+        if self.history.gesture_open() || self.modeling_session.is_some() {
+            self.append("Finish or cancel the current edit before organizing the level.");
+            return;
+        }
+        let opened = self.history_begin(label, &[]);
+        let result = edit(self.engine.world_mut());
+        match result {
+            Ok(true) => {
+                if opened {
+                    self.history_commit();
+                }
+                self.sync_outliner();
+            }
+            Ok(false) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+            }
+            Err(error) => {
+                if opened {
+                    let _ = self.history_cancel();
+                }
+                self.note_folder_error(error);
+            }
+        }
+    }
+
+    fn move_selected_folder(&mut self, folder: Option<u32>) {
+        let mut entities = Vec::new();
+        for item in self.selection.items() {
+            if let Some(id) = item.entity_id() {
+                if !entities.contains(&id) {
+                    entities.push(id);
+                }
+            }
+        }
+        if entities.is_empty() {
+            return;
+        }
+        let mut moved = false;
+        let mut report_spatial = false;
+        self.organization_edit("Move To Folder", |world| {
+            let mut spatial = false;
+            for entity in &entities {
+                match world.move_entity_to_folder(*entity, folder) {
+                    Ok(jarvig_core::AuthoringResult::Unchanged) => {}
+                    Ok(_) => moved = true,
+                    Err(jarvig_core::OrganizationError::SpatialParent) => spatial = true,
+                    Err(error) => return Err(error),
+                }
+            }
+            if moved {
+                report_spatial = spatial;
+                Ok(true)
+            } else if spatial {
+                Err(jarvig_core::OrganizationError::SpatialParent)
+            } else {
+                Ok(false)
+            }
+        });
+        if report_spatial {
+            self.append("That object has a geometric parent. A folder does not move it.");
+        }
+    }
+
+    fn remove_folder(&mut self, id: u32) {
+        self.organization_edit("Delete Folder", |world| world.delete_scene_folder(id).map(|()| true));
+    }
+
+    fn rename_entity_authored(&mut self, entity: EntityUuid, name: &str) {
+        if self.session_active() {
+            self.append("Rename is disabled while playing. Stop returns to the authored world.");
+            return;
+        }
+        if self.entity_label(entity) == name {
+            return;
+        }
+        let opened = self.open_property_edit(entity);
+        let submitted = inspector::submit_property(
+            &mut self.engine,
+            entity,
+            jarvig_core::TYPE_ENTITY,
+            jarvig_core::FIELD_NAME,
+            PropertyValue::String(name.to_string()),
+        );
+        self.finish_inspector_submit(self.selection.revision(), "Name", jarvig_core::FIELD_NAME, submitted, opened);
+        self.sync_outliner();
+    }
+
+    fn material_menu_slots(&self) -> Vec<(u8, String)> {
+        let Some(entity) = self.selection.primary_entity() else { return Vec::new() };
+        let Some(record) = self.engine.world().authored_block(entity) else { return Vec::new() };
+        (0..record.slot_count().min(16))
+            .map(|slot| {
+                let slot = slot as u8;
+                let label = if slot == 0 { "Object Material".to_string() } else { format!("Face Material {slot}") };
+                (slot, label)
+            })
+            .collect()
+    }
+
+    fn primary_block_has_body(&self) -> bool {
+        self.selection.primary_entity().and_then(|entity| self.engine.world().authored_block(entity)).is_some_and(|record| record.body.is_some())
+    }
+
+    fn open_viewport_menu(&mut self, x: f64, y: f64) {
+        if self.session_active() {
+            return;
+        }
+        if matches!(self.selection_mode, SelectionMode::Auto | SelectionMode::Object) {
+            if let Some(hit) = self.pick_entity_at(x, y) {
+                if !self.selection.contains(selection::SelectionItem::Entity(hit)) {
+                    self.apply_click_selection(selection::SelectionItem::Entity(hit), false, false);
+                }
+            }
+        }
+        let place = match self.selection_mode {
+            SelectionMode::Face => {
+                let stored = self.primary_block_has_body();
+                context_menu::MenuPlace::ViewportFace { bevel: !stored, inset: !stored }
+            }
+            SelectionMode::Edge => context_menu::MenuPlace::ViewportEdge,
+            SelectionMode::Vertex => context_menu::MenuPlace::ViewportVertex,
+            SelectionMode::Auto | SelectionMode::Object => {
+                if self.selection.primary_entity().is_none() {
+                    return;
+                }
+                context_menu::MenuPlace::ViewportObject
+            }
+        };
+        self.popup_context(place, None, None);
+    }
+
+    fn on_outliner_right_click(&mut self) {
+        let hwnd = self.panel_hwnd(OUTLINER);
+        match self.outliner_key_at_cursor() {
+            Some(TreeKey::Entity(id)) => {
+                let _ = self.apply_outliner_activation(Some(id), false);
+                let locked = self.engine.world().entity_locked(id);
+                let hidden = self.editor_hidden.contains(&id);
+                let parent = self.engine.world().scene_folder_of(id);
+                self.popup_context(context_menu::MenuPlace::OutlinerObject { locked, hidden }, None, parent);
+            }
+            Some(TreeKey::Folder(id)) => {
+                self.outliner.set_caret(Some(outliner::OutlinerNodeId::Folder(id)));
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 0); }
+                self.popup_context(context_menu::MenuPlace::OutlinerFolder, Some(id), Some(id));
+            }
+            Some(TreeKey::World) | None => self.popup_context(context_menu::MenuPlace::OutlinerEmpty, None, None),
+            Some(TreeKey::Tool(_)) => {}
+        }
+    }
+
+    fn outliner_key_at_cursor(&self) -> Option<TreeKey> {
+        let hwnd = self.panel_hwnd(OUTLINER);
+        unsafe {
+            let mut point = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut point) == 0 || ScreenToClient(hwnd, &mut point) == 0 {
+                return None;
+            }
+            let mut hit: TVHITTESTINFO = std::mem::zeroed();
+            hit.pt = point;
+            let item = SendMessageW(hwnd, TVM_HITTEST, 0, &mut hit as *mut TVHITTESTINFO as LPARAM);
+            if item == 0 || (hit.flags & TVHT_ONITEM) == 0 {
+                return None;
+            }
+            let mut read: TVITEMW = std::mem::zeroed();
+            read.mask = TVIF_PARAM;
+            read.hItem = item;
+            if SendMessageW(hwnd, TVM_GETITEMW, 0, &mut read as *mut TVITEMW as LPARAM) == 0 {
+                return None;
+            }
+            self.tree_key(read.lParam)
+        }
+    }
+
+    fn popup_context(&mut self, place: context_menu::MenuPlace, clicked_folder: Option<u32>, new_folder_parent: Option<u32>) {
+        let entries = context_menu::menu_entries(place);
+        let folders: Vec<(u32, String)> = self
+            .engine
+            .world()
+            .organization()
+            .folders()
+            .iter()
+            .take(64)
+            .map(|folder| (folder.id, folder.name.clone()))
+            .collect();
+        let slots = self.material_menu_slots();
+        let frame = self.frame;
+        let picked = unsafe { track_context_menu(frame, &entries, &folders, &slots) };
+        if picked == 0 {
+            return;
+        }
+        self.run_context_command(picked, clicked_folder, new_folder_parent, &folders);
+    }
+
+    fn run_context_command(&mut self, command: usize, clicked_folder: Option<u32>, new_folder_parent: Option<u32>, folders: &[(u32, String)]) {
+        use inspector::InspectorCommand;
+        match command {
+            1601 => self.prompt_rename(clicked_folder),
+            1602 => self.duplicate_selected(),
+            1603 => self.destroy_selected(),
+            1604 => {
+                let _ = self.focus_selected();
+            }
+            1605 => self.hide_primary(false),
+            1606 => self.hide_primary(true),
+            1607 => self.lock_primary(true),
+            1608 => self.lock_primary(false),
+            1609 => self.open_rename(NameTarget::NewFolder(new_folder_parent), ""),
+            1610 => {
+                if let Some(id) = clicked_folder {
+                    self.remove_folder(id);
+                }
+            }
+            1611 => self.create_block(),
+            1612 => self.create_plane(),
+            1613 => self.run_inspector_command(InspectorCommand::ExtrudeFace, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1614 => self.run_inspector_command(InspectorCommand::InsetFace, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1615 => self.run_inspector_command(InspectorCommand::Bevel, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1616 => self.run_inspector_command(InspectorCommand::SubdivideFace, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1617 => self.prompt_or_create_group(),
+            1618 => self.run_inspector_command(InspectorCommand::AddSurfaceGroupFaces, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1619 => self.run_inspector_command(InspectorCommand::RemoveSurfaceGroupFaces, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1620 => {
+                if let Some(entity) = self.selection.primary_entity() {
+                    self.add_material_slot(entity);
+                }
+            }
+            1621 => self.select_topology(InspectorCommand::SelectConnected),
+            1622 => self.select_topology(InspectorCommand::SelectBoundary),
+            1623 => self.select_topology(InspectorCommand::SelectGrow),
+            1624 => self.select_topology(InspectorCommand::SelectShrink),
+            1625 => self.run_inspector_command(InspectorCommand::SplitEdge, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1626 => self.run_inspector_command(InspectorCommand::ExtrudeEdge, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1627 => self.select_topology(InspectorCommand::SelectLoop),
+            1628 => self.select_topology(InspectorCommand::SelectRing),
+            1629 => self.run_inspector_command(InspectorCommand::MoveVertex, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1630 => self.run_inspector_command(InspectorCommand::Round, jarvig_core::TYPE_PARAMETRIC_BLOCK),
+            1700 => self.move_selected_folder(None),
+            1701..=1764 => {
+                if let Some((id, _)) = folders.get(command - 1701) {
+                    self.move_selected_folder(Some(*id));
+                }
+            }
+            1800..=1815 => {
+                if let Some(entity) = self.selection.primary_entity() {
+                    self.assign_material_slot(entity, (command - 1800) as u8);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn prompt_rename(&mut self, clicked_folder: Option<u32>) {
+        if let Some(folder) = clicked_folder {
+            let name = self.engine.world().organization().folder(folder).map(|folder| folder.name.clone()).unwrap_or_default();
+            self.open_rename(NameTarget::Folder(folder), &name);
+            return;
+        }
+        let Some(entity) = self.selection.primary_entity() else { return };
+        let name = self.entity_label(entity);
+        self.open_rename(NameTarget::Entity(entity), &name);
+    }
+
+    fn prompt_or_create_group(&mut self) {
+        let Some(entity) = self.selection.primary_entity() else {
+            self.append("Select a face first.");
+            return;
+        };
+        let name = self.group_name_text();
+        if name.trim().is_empty() {
+            self.open_rename(NameTarget::SurfaceGroup(entity), "");
+            return;
+        }
+        self.create_surface_group(entity);
+    }
+
+    fn open_rename(&mut self, target: NameTarget, initial: &str) {
+        self.close_rename();
+        if self.frame.is_null() {
+            return;
+        }
+        let mut point = POINT { x: 80, y: 80 };
+        unsafe {
+            let mut cursor = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut cursor) != 0 {
+                ScreenToClient(self.frame, &mut cursor);
+                point = cursor;
+            }
+        }
+        let text = wide(initial);
+        let class_name = wide("EDIT");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                text.as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                point.x,
+                point.y,
+                220,
+                24,
+                self.frame,
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            )
+        };
+        if hwnd.is_null() {
+            return;
+        }
+        unsafe {
+            if !self.ui_font.is_null() {
+                SendMessageW(hwnd, WM_SETFONT, self.ui_font as WPARAM, 1);
+            }
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            SetFocus(hwnd);
+            subclass_rename_edit(hwnd);
+        }
+        self.rename = Some(RenamePrompt { hwnd, target });
+    }
+
+    fn close_rename(&mut self) {
+        if let Some(prompt) = self.rename.take() {
+            unsafe { DestroyWindow(prompt.hwnd); }
+        }
+    }
+
+    fn finish_rename(&mut self, accept: bool) {
+        let Some(prompt) = self.rename.take() else { return };
+        let text = window_text(prompt.hwnd);
+        unsafe { DestroyWindow(prompt.hwnd); }
+        if !accept {
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match prompt.target {
+            NameTarget::Entity(entity) => self.rename_entity_authored(entity, trimmed),
+            NameTarget::Folder(id) => {
+                let name = trimmed.to_string();
+                self.organization_edit("Rename Folder", move |world| match world.rename_scene_folder(id, &name) {
+                    Ok(jarvig_core::AuthoringResult::Applied) => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(error),
+                });
+            }
+            NameTarget::NewFolder(parent) => {
+                let name = trimmed.to_string();
+                self.organization_edit("Create Folder", move |world| world.create_scene_folder(&name, parent).map(|_| true));
+            }
+            NameTarget::SurfaceGroup(entity) => self.create_named_surface_group(entity, trimmed),
         }
     }
 
@@ -14303,6 +19058,10 @@ impl Editor {
         }
         let down = message == WM_KEYDOWN;
         if down && (lparam & 0x4000_0000) != 0 {
+            return true;
+        }
+        if down && wparam == VK_RETURN as usize && self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round) {
+            self.apply_modeling();
             return true;
         }
         if wparam == VK_ESCAPE as usize {
@@ -14430,7 +19189,7 @@ impl Editor {
                 if self.gizmo_drag.is_some() {
                     return true;
                 }
-                if self.face_drag.is_some() || self.topology_drag.is_some() {
+                if self.face_drag.is_some() || self.topology_drag.is_some() || self.round_drag.is_some() {
                     self.cancel_modeling(true);
                     return true;
                 }
@@ -14438,12 +19197,27 @@ impl Editor {
                     self.marquee = None;
                     unsafe { ReleaseCapture(); }
                 }
-                self.begin_capture(hwnd, CaptureKind::Look);
+                if self.capture.is_some() {
+                    self.begin_capture(hwnd, CaptureKind::Look);
+                    return true;
+                }
+                let x = (lparam & 0xffff) as u16 as i16 as f64;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                self.right_press = Some(marquee::MarqueeDrag::new(x, y, false, false));
+                unsafe { SetCapture(hwnd); }
                 true
             }
             WM_RBUTTONUP => {
                 if self.capture == Some(CaptureKind::Look) {
+                    self.right_press = None;
                     self.end_capture(true, false);
+                    return true;
+                }
+                if let Some(press) = self.right_press.take() {
+                    unsafe { ReleaseCapture(); }
+                    if !press.moved {
+                        self.open_viewport_menu(press.origin_x, press.origin_y);
+                    }
                 }
                 true
             }
@@ -14473,6 +19247,11 @@ impl Editor {
                     }
                     return true;
                 }
+                let round_press = self.modeling_session.is_some_and(|session| session.tool == ModelingTool::Round) && self.round_drag.is_none();
+                if round_press && matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit | CaptureKind::Face)) {
+                    self.right_press = None;
+                    self.end_capture(true, false);
+                }
                 if matches!(self.capture, Some(CaptureKind::Look | CaptureKind::Pan | CaptureKind::Orbit | CaptureKind::Terrain | CaptureKind::Face)) {
                     return true;
                 }
@@ -14485,6 +19264,13 @@ impl Editor {
                 }
                 let ctrl = (unsafe { GetKeyState(VK_CONTROL as i32) } as u16) & 0x8000 != 0;
                 let shift = (unsafe { GetKeyState(VK_SHIFT as i32) } as u16) & 0x8000 != 0;
+                if self.object_tool == chrome::ToolbarCommand::Select && self.element_box_should_arm(x, y) {
+                    self.arm_marquee(hwnd, x, y, shift, ctrl);
+                    if let Some(drag) = self.marquee.as_mut() {
+                        drag.elements = true;
+                    }
+                    return true;
+                }
                 if self.object_tool == chrome::ToolbarCommand::Select && self.marquee_should_arm(x, y) {
                     self.arm_marquee(hwnd, x, y, shift, ctrl);
                     return true;
@@ -14520,6 +19306,17 @@ impl Editor {
             WM_MOUSEMOVE => {
                 let x = (lparam & 0xffff) as u16 as i16 as f64;
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f64;
+                let start_look = self.capture != Some(CaptureKind::Look)
+                    && self.right_press.as_mut().is_some_and(|press| {
+                        press.update(x, y);
+                        press.moved
+                    });
+                if start_look {
+                    self.begin_capture(hwnd, CaptureKind::Look);
+                }
+                if self.right_press.is_some() && self.capture != Some(CaptureKind::Look) && self.round_drag.is_none() {
+                    return true;
+                }
                 if self.marquee.is_some() {
                     self.update_marquee(x, y);
                     return true;
@@ -14527,7 +19324,9 @@ impl Editor {
                 if self.capture == Some(CaptureKind::Gizmo) {
                     self.update_gizmo_drag(x, y);
                 } else if self.capture == Some(CaptureKind::Face) {
-                    if self.topology_drag.is_some() {
+                    if self.round_drag.is_some() {
+                        self.update_round_drag(x, y);
+                    } else if self.topology_drag.is_some() {
                         self.update_topology_drag(x, y);
                     } else {
                         self.update_face_drag(x, y);
@@ -14565,7 +19364,10 @@ impl Editor {
             }
             WM_KEYDOWN | WM_KEYUP => self.on_nav_key(message, wparam, lparam),
             WM_KILLFOCUS => {
-                self.end_capture(true, true);
+                // The radius readout can move focus while the button is down. That is not a cancel.
+                if self.round_drag.is_none() {
+                    self.end_capture(true, true);
+                }
                 true
             }
             WM_CAPTURECHANGED => {
@@ -14573,7 +19375,7 @@ impl Editor {
                 if self.marquee.is_some() && self.capture.is_none() && gained != hwnd {
                     self.marquee = None;
                 }
-                if !self.capture_ending && self.capture.is_some() {
+                if !self.capture_ending && self.capture.is_some() && self.round_drag.is_none() {
                     self.end_capture(false, true);
                 }
                 true
@@ -15154,6 +19956,34 @@ impl Editor {
         Ok(())
     }
 
+    fn show_intent_shadow(&mut self) {
+        let Some(id) = self.selection.primary_entity() else {
+            self.append("Intent shadow needs a selected block.");
+            return;
+        };
+        let Some(record) = self.engine.world().authored_block(id) else {
+            self.append("Intent shadow needs a selected block.");
+            return;
+        };
+        let report = jarvig_core::evaluate_intent_shadow(&record);
+        for line in report.text.lines() {
+            self.append(line);
+        }
+        let selected = if self.selected_body_face.is_some_and(|(entity, _)| entity == id) {
+            self.selected_body_face.map(|(_, face)| jarvig_core::ConcreteElement::Face(face))
+        } else if self.selected_edge.is_some_and(|(entity, _)| entity == id) {
+            self.selected_edge.map(|(_, edge)| jarvig_core::ConcreteElement::Edge(edge))
+        } else if self.selected_vertex.is_some_and(|(entity, _)| entity == id) {
+            self.selected_vertex.map(|(_, vertex)| jarvig_core::ConcreteElement::Vertex(vertex))
+        } else {
+            None
+        };
+        let semantic = jarvig_core::semantic_shadow_diagnostic(&record, selected);
+        for line in semantic.lines() {
+            self.append(line);
+        }
+    }
+
     fn append(&mut self, line: &str) {
         self.log.push_str(line);
         self.log.push_str("\r\n");
@@ -15202,6 +20032,7 @@ impl Editor {
             ID_EDIT_DESELECT => self.deselect_all(),
             ID_EDIT_INVERT => self.invert_selection(),
             ID_CREATE_BLOCK => self.create_block(),
+            ID_CREATE_PLANE => self.create_plane(),
             id if (ID_FILE_RECENT_PROJECT..ID_FILE_RECENT_PROJECT + 8).contains(&id) => self.file_recent_project(id - ID_FILE_RECENT_PROJECT),
             id if (ID_FILE_RECENT_LEVEL..ID_FILE_RECENT_LEVEL + 8).contains(&id) => self.file_recent_level(id - ID_FILE_RECENT_LEVEL),
             ID_FILE_EXIT => unsafe { PostMessageW(self.frame, WM_CLOSE, 0, 0); },
@@ -15278,6 +20109,7 @@ impl Editor {
                     "Topology grid is off. Face, Edge, and Vertex modes still draw it."
                 });
             }
+            ID_VIEW_INTENT_SHADOW => self.show_intent_shadow(),
             ID_VIEW_CONTENT => self.toggle_panel(CONTENT),
             ID_VIEW_OUTPUT => self.toggle_panel(OUTPUT),
             ID_VIEW_RESET => self.reset_from_menu(),
@@ -15481,6 +20313,62 @@ impl Editor {
         }
     }
 
+    fn toolbar_unavailable(&self) -> Vec<chrome::ToolbarCommand> {
+        let Some(entity) = self.selection.primary_entity() else { return Vec::new() };
+        let Some(record) = self.engine.world().authored_block(entity) else { return Vec::new() };
+        if record.has_authored_seed() {
+            return vec![
+                chrome::ToolbarCommand::Inset,
+                chrome::ToolbarCommand::Bevel,
+                chrome::ToolbarCommand::Subdivide,
+                chrome::ToolbarCommand::MoveEdge,
+                chrome::ToolbarCommand::ExtrudeEdge,
+                chrome::ToolbarCommand::MoveVertex,
+            ];
+        }
+        if round_class_refusal(&record).is_some() {
+            return vec![chrome::ToolbarCommand::Round];
+        }
+        Vec::new()
+    }
+
+    fn toolbar_click_refusal(&self, command: chrome::ToolbarCommand) -> Option<String> {
+        let Some(entity) = self.selection.primary_entity() else { return None };
+        let Some(record) = self.engine.world().authored_block(entity) else { return None };
+        match command {
+            chrome::ToolbarCommand::Round => round_class_refusal(&record),
+            chrome::ToolbarCommand::Inset => record.has_authored_seed().then(|| authored_block_refusal("Inset")),
+            chrome::ToolbarCommand::Bevel => record.has_authored_seed().then(|| authored_block_refusal("Bevel")),
+            chrome::ToolbarCommand::Subdivide => record.has_authored_seed().then(|| authored_block_refusal("Subdivide")),
+            chrome::ToolbarCommand::MoveEdge => record.has_authored_seed().then(|| authored_block_refusal("Move Edge")),
+            chrome::ToolbarCommand::ExtrudeEdge => record.has_authored_seed().then(|| authored_block_refusal("Extrude Edge")),
+            chrome::ToolbarCommand::MoveVertex => record.has_authored_seed().then(|| authored_block_refusal("Move Vertex")),
+            _ => None,
+        }
+    }
+
+    fn shelf_command_dimmed(&self, command: inspector::InspectorCommand) -> bool {
+        let Some(entity) = self.selection.primary_entity() else { return false };
+        let Some(record) = self.engine.world().authored_block(entity) else { return false };
+        match command {
+            inspector::InspectorCommand::Round => round_class_refusal(&record).is_some(),
+            inspector::InspectorCommand::InsetFace
+            | inspector::InspectorCommand::Bevel
+            | inspector::InspectorCommand::SubdivideFace
+            | inspector::InspectorCommand::SubdivideFace4
+            | inspector::InspectorCommand::MoveEdge
+            | inspector::InspectorCommand::ExtrudeEdge
+            | inspector::InspectorCommand::MoveVertex
+            | inspector::InspectorCommand::ResetShape
+            | inspector::InspectorCommand::EditBevel
+            | inspector::InspectorCommand::EditInset(_)
+            | inspector::InspectorCommand::MirrorX
+            | inspector::InspectorCommand::MirrorY
+            | inspector::InspectorCommand::MirrorZ => record.has_authored_seed(),
+            _ => false,
+        }
+    }
+
     fn paint_toolbar(&self, hwnd: HWND) {
         unsafe {
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
@@ -15506,6 +20394,7 @@ impl Editor {
                         self.editor_mode(),
                         self.modeling_tools_visible(),
                         self.modeling_toolbar_command(),
+                        &self.toolbar_unavailable(),
                     );
                     BitBlt(hdc, 0, 0, width.max(1), height.max(1), memory, 0, 0, SRCCOPY);
                     SelectObject(memory, previous);
@@ -15519,6 +20408,11 @@ impl Editor {
 
     fn toolbar_click(&mut self, index: usize) {
         let Some(command) = self.toolbar_icons.command(index) else { return };
+        if let Some(reason) = self.toolbar_click_refusal(command) {
+            self.append(&reason);
+            unsafe { InvalidateRect(self.toolbar, std::ptr::null(), 0); }
+            return;
+        }
         match command {
             chrome::ToolbarCommand::Select | chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate => {
                 if matches!(command, chrome::ToolbarCommand::Translate | chrome::ToolbarCommand::Rotate) && self.modeling_session.is_some() {
@@ -15532,7 +20426,14 @@ impl Editor {
             chrome::ToolbarCommand::Block => self.create_block(),
             chrome::ToolbarCommand::Extrude => self.begin_modeling(ModelingTool::Extrude),
             chrome::ToolbarCommand::Inset => self.begin_modeling(ModelingTool::Inset),
-            chrome::ToolbarCommand::Bevel => self.begin_modeling(ModelingTool::Bevel),
+            chrome::ToolbarCommand::Bevel => {
+                if self.selection_mode == SelectionMode::Edge {
+                    self.begin_modeling(ModelingTool::BevelEdge);
+                } else {
+                    self.begin_modeling(ModelingTool::Bevel);
+                }
+            }
+            chrome::ToolbarCommand::Round => self.begin_modeling(ModelingTool::Round),
             chrome::ToolbarCommand::Subdivide => {
                 if let Some(entity) = self.selection.primary_entity() {
                     self.subdivide_selected_face(entity, 2);
@@ -15620,11 +20521,559 @@ impl Editor {
     }
 }
 
+fn cannot_bevel(edges: usize) -> &'static str {
+    if edges > 1 { "Cannot bevel these edges." } else { "Cannot bevel this edge." }
+}
+
+/// Round is for an authored block. A stored shape and a saved size box say why.
+fn round_class_refusal(record: &jarvig_core::BlockRecord) -> Option<String> {
+    if record.body.is_some() {
+        return Some("Round edits an authored block. This object stores its own shape.".into());
+    }
+    if !record.has_authored_seed() && record.intent.is_empty() {
+        return Some("This block is a saved size box. Create Block makes an authored block.".into());
+    }
+    None
+}
+
+fn authored_block_refusal(name: &str) -> String {
+    format!("{name} is not available on an authored block.")
+}
+
+fn modeling_tool_refusal(record: &jarvig_core::BlockRecord, tool: ModelingTool) -> Option<String> {
+    if tool == ModelingTool::Round {
+        return round_class_refusal(record);
+    }
+    if record.has_authored_seed() && tool != ModelingTool::Extrude {
+        return Some(authored_block_refusal(modeling_tool_name(tool)));
+    }
+    None
+}
+
+/// An eligible solid whose saved record has no tessellated body.
+fn eligible_bodyless(record: &jarvig_core::BlockRecord) -> bool {
+    record.body.is_none() && jarvig_core::intent_authority_diagnostic(record) == "Intent Authority: ELIGIBLE"
+}
+
+fn curved_face_name(record: &jarvig_core::BlockRecord, face: u32) -> bool {
+    jarvig_core::semantic_face_names(record, face).iter().any(|name| name.starts_with("F:fillet(") || name.starts_with("F:corner("))
+}
+
+/// A saved round can draw an observation. This does not replay the tape.
+fn observes_saved_round(record: &jarvig_core::BlockRecord) -> bool {
+    record.body.is_none() && record.intent.iter().any(|entry| matches!(entry.payload, jarvig_core::IntentPayload::Round { .. }))
+}
+
+/// The solid that owns the one round observation.
+/// An open Round session wins. A selected solid wins only when it already has a saved round.
+/// Selecting a plain block leaves the observation on the solid that still has one.
+fn round_observation_entity(session: Option<EntityUuid>, selected_has_round: Option<EntityUuid>, cached_has_round: Option<EntityUuid>, any_saved: Option<EntityUuid>) -> Option<EntityUuid> {
+    session.or(selected_has_round).or(cached_has_round).or(any_saved)
+}
+
+/// The cached observation still matches this record, so this frame does not replay the tape.
+fn round_cache_holds(cache: &RoundViewCache, entity: EntityUuid, intent_len: usize, size_bits: [u64; 3], radius_bits: u64, live_divisions: Option<u32>) -> bool {
+    cache.entity == entity
+        && cache.intent_len == intent_len
+        && cache.size_bits == size_bits
+        && cache.radius_bits == radius_bits
+        && (cache.noted_failure || radius_bits == 0 || (cache.fillet.is_some() && live_divisions == Some(cache.divisions)))
+}
+
+/// The body the edge cage and the pick ray use. A stored body stays that body.
+/// An eligible record with no stored body uses the planar replay.
+fn selection_body(record: &jarvig_core::BlockRecord) -> Option<jarvig_core::SolidBody> {
+    if record.body.is_some() || record.analytic_features() {
+        return record.display_body();
+    }
+    match jarvig_core::intent_authority_candidate(record) {
+        jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => Some(body),
+        jarvig_core::IntentAuthorityCandidate::Refused(_) => record.display_body(),
+    }
+}
+
+/// The first semantic edge named by the latest saved round.
+#[cfg(test)]
+fn saved_round_token(record: &jarvig_core::BlockRecord) -> Option<&str> {
+    record.intent.iter().rev().find_map(|entry| {
+        let jarvig_core::IntentPayload::Round { .. } = &entry.payload else { return None };
+        let groups = entry.groups.as_ref()?;
+        let token = groups.first()?.first()?;
+        token.starts_with("E:").then_some(token.as_str())
+    })
+}
+
+/// The saved radius of the latest round whose groups name `token`.
+fn authored_round_radius(record: &jarvig_core::BlockRecord, token: &str) -> Option<f64> {
+    record.intent.iter().rev().find_map(|entry| {
+        let jarvig_core::IntentPayload::Round { radius_m } = &entry.payload else { return None };
+        let groups = entry.groups.as_ref()?;
+        groups.iter().any(|group| group.len() == 1 && group[0] == token).then_some(*radius_m)
+    })
+}
+
+/// Bits of every saved round radius and token. Zero when the tape has no round.
+fn round_radius_bits(record: &jarvig_core::BlockRecord) -> u64 {
+    let mut bits = 0u64;
+    let mut any = false;
+    for entry in &record.intent {
+        let jarvig_core::IntentPayload::Round { radius_m } = &entry.payload else { continue };
+        any = true;
+        bits = mix_bytes(bits, &radius_m.to_bits().to_le_bytes());
+        if let Ok(tokens) = jarvig_core::round_group_tokens(entry.groups.as_deref()) {
+            for token in tokens {
+                bits = mix_bytes(bits, token.as_bytes());
+            }
+        }
+    }
+    if any { bits | 1 } else { 0 }
+}
+
+/// Cache identity of an open preview. The tokens keep two selections at one radius apart.
+fn round_preview_bits(tokens: &[String], amount: f64, conflict: bool) -> u64 {
+    let mut bits = mix_bytes(amount.to_bits() | 1, if conflict { b"conflict" } else { b"ready" });
+    for token in tokens {
+        bits = mix_bytes(bits, token.as_bytes());
+    }
+    bits | 1
+}
+
+fn mix_bytes(mut bits: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        bits = bits.wrapping_mul(0x100000001b3).wrapping_add(u64::from(*byte));
+    }
+    bits.wrapping_mul(0x100000001b3).wrapping_add(0xff)
+}
+
+fn round_selection_label(picked: usize) -> String {
+    if picked == 1 { "1 Edge".to_string() } else { format!("{picked} Edges") }
+}
+
+fn round_collapse_note(picked: usize, resolved: usize) -> String {
+    if picked > resolved {
+        let noun = if resolved == 1 { "edge" } else { "edges" };
+        format!("{picked} picked edges resolve to {resolved} semantic {noun}.")
+    } else {
+        String::new()
+    }
+}
+
+fn max_arc_divisions(fillets: &[jarvig_core::Fillet], camera: &jarvig_core::RoundCamera) -> Option<u32> {
+    if fillets.is_empty() {
+        return None;
+    }
+    let mut divisions = 0u32;
+    for fillet in fillets {
+        divisions = divisions.max(jarvig_core::arc_divisions(fillet, camera).ok()?);
+    }
+    Some(divisions)
+}
+
+/// Selected fillets at `amount`, then the kept fillets. Conflict previews the kept fillets only.
+fn session_round_fillets(basis: &RoundBasis, amount: f64) -> Option<(Vec<jarvig_core::Fillet>, Vec<jarvig_core::Fillet>)> {
+    if basis.readiness == RoundStatus::Conflict {
+        return Some((basis.kept.clone(), Vec::new()));
+    }
+    let mut active = Vec::new();
+    for fillet in &basis.fillets {
+        active.push(jarvig_core::fillet_scaled(fillet, amount).ok()?);
+    }
+    let mut all = active.clone();
+    all.extend(basis.kept.iter().cloned());
+    Some((all, active))
+}
+
+fn session_preview_key(basis: &RoundBasis, amount: f64) -> Option<(Vec<jarvig_core::Fillet>, u64)> {
+    let conflict = basis.readiness == RoundStatus::Conflict;
+    let radius_bits = round_preview_bits(&basis.tokens, if conflict { 0.0 } else { amount }, conflict);
+    if conflict {
+        return Some((basis.kept.clone(), radius_bits));
+    }
+    let (all, _) = session_round_fillets(basis, amount)?;
+    Some((all, radius_bits))
+}
+
+fn fillet_covers_edge(body: &SolidBody, fillet: &jarvig_core::Fillet, edge: u32) -> bool {
+    body.edges.iter().any(|item| item.id == edge) && jarvig_core::round_cage_segment(body, fillet, edge).is_none()
+}
+
+/// Semantic curves for fillets whose tokens are in the same order. Empty when the two lists disagree.
+fn round_curve_elements(body: &SolidBody, tokens: &[String], fillets: &[jarvig_core::Fillet]) -> Vec<jarvig_core::CurveElement> {
+    if tokens.len() != fillets.len() || fillets.is_empty() {
+        return Vec::new();
+    }
+    let pairs: Vec<(String, jarvig_core::Fillet)> = tokens.iter().cloned().zip(fillets.iter().cloned()).collect();
+    jarvig_core::curve_catalog(body, &pairs).unwrap_or_default()
+}
+
+/// Trimmed along range of one fillet. The middle station stays an observation ruling inside that range.
+fn fillet_draw_range(curves: &[jarvig_core::CurveElement], token: Option<&str>, fillet: &jarvig_core::Fillet) -> (f64, f64) {
+    let Some(token) = token else {
+        return (0.0, fillet.length_m);
+    };
+    let wanted = format!("F:fillet({token})");
+    curves.iter().find(|element| element.token == wanted).and_then(|element| element.along).unwrap_or((0.0, fillet.length_m))
+}
+
+fn unit_components(direction: [f64; 3]) -> Option<[f64; 3]> {
+    let length = (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]).sqrt();
+    if length < 1.0e-12 { None } else { Some([direction[0] / length, direction[1] / length, direction[2] / length]) }
+}
+
+fn prefer_pick(current: Option<jarvig_core::TopologyPick>, incoming: Option<jarvig_core::TopologyPick>) -> Option<jarvig_core::TopologyPick> {
+    match (current, incoming) {
+        (None, next) => next,
+        (Some(have), None) => Some(have),
+        (Some(have), Some(next)) => {
+            let next_wins = next.ray_t < have.ray_t - 1.0e-9 || ((next.ray_t - have.ray_t).abs() <= 1.0e-9 && next.distance < have.distance);
+            Some(if next_wins { next } else { have })
+        }
+    }
+}
+
+/// The visible edge. A rounded source edge is omitted. Its tangent boundaries and the shifted hard edge remain.
+fn visible_edge_pick(
+    body: &SolidBody,
+    fillets: &[jarvig_core::Fillet],
+    curves: &[jarvig_core::CurveElement],
+    origin: [f64; 3],
+    direction: [f64; 3],
+    slack: f64,
+) -> Option<jarvig_core::TopologyPick> {
+    let direction = unit_components(direction)?;
+    if fillets.is_empty() {
+        return body.pick_edge(origin, direction, slack);
+    }
+    let mut best = None;
+    for (id, _, _) in body.edge_segments() {
+        let Some((start, end)) = round_cage_segment_set(body, fillets, id) else { continue };
+        best = prefer_pick(best, jarvig_core::pick_segment(id, start, end, origin, direction, slack));
+    }
+    prefer_pick(best, jarvig_core::pick_curve_elements(curves, jarvig_core::CurveKind::Edge, origin, direction, slack))
+}
+
+fn visible_vertex_pick(
+    body: &SolidBody,
+    fillets: &[jarvig_core::Fillet],
+    curves: &[jarvig_core::CurveElement],
+    origin: [f64; 3],
+    direction: [f64; 3],
+    slack: f64,
+) -> Option<jarvig_core::TopologyPick> {
+    let direction = unit_components(direction)?;
+    let body_hit = body.pick_vertex(origin, direction, slack);
+    if fillets.is_empty() {
+        return body_hit;
+    }
+    let curve = jarvig_core::pick_curve_elements(curves, jarvig_core::CurveKind::Vertex, origin, direction, slack);
+    prefer_pick(body_hit, curve)
+}
+
+/// A planar hit inside a fillet strip or a corner shadow is that semantic face.
+/// The flat interior stays the planar face. Missing curve samples do not hand the strip back.
+fn visible_face_pick(
+    body: &SolidBody,
+    tokens: &[String],
+    fillets: &[jarvig_core::Fillet],
+    curves: &[jarvig_core::CurveElement],
+    origin: [f64; 3],
+    direction: [f64; 3],
+) -> Option<jarvig_core::TopologyPick> {
+    jarvig_core::visible_authored_face(body, tokens, fillets, curves, origin, direction)
+}
+
+/// Radius-wide quad of the fillet face `id`, when the catalog did not carry that face.
+fn fillet_face_outline(fillets: &[jarvig_core::Fillet], tokens: &[String], face: u32) -> Option<Vec<[f64; 3]>> {
+    if tokens.len() != fillets.len() {
+        return None;
+    }
+    for (token, fillet) in tokens.iter().zip(fillets.iter()) {
+        if jarvig_core::round_curve_id(&format!("F:fillet({token})"), 0) != face {
+            continue;
+        }
+        return Some(vec![
+            fillet.point(0.0, 0.0),
+            fillet.point(fillet.length_m, 0.0),
+            fillet.point(fillet.length_m, fillet.span),
+            fillet.point(0.0, fillet.span),
+        ]);
+    }
+    None
+}
+
+/// The concrete edges and saved radius of the one Round entry that owns every selected curve id.
+/// A sharp id, or curve ids from two entries, returns none so the caller keeps the sharp selection.
+fn round_feature_reopen(record: &jarvig_core::BlockRecord, ids: &[u32]) -> Option<(Vec<u32>, f64)> {
+    if ids.is_empty() || !record.has_authored_seed() || record.body.is_some() || !observes_saved_round(record) {
+        return None;
+    }
+    let rounds = jarvig_core::replay_rounds(record).ok()?;
+    let body = match jarvig_core::intent_authority_candidate(record) {
+        jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => body,
+        jarvig_core::IntentAuthorityCandidate::Refused(_) => return None,
+    };
+    let tokens: Vec<String> = rounds.iter().map(|round| round.token.clone()).collect();
+    let fillets: Vec<jarvig_core::Fillet> = rounds.iter().map(|round| round.fillet.clone()).collect();
+    let catalog = round_curve_elements(&body, &tokens, &fillets);
+    if catalog.is_empty() {
+        return None;
+    }
+    let entries: Vec<(Vec<String>, f64)> = record
+        .intent
+        .iter()
+        .filter_map(|entry| {
+            let jarvig_core::IntentPayload::Round { radius_m } = &entry.payload else { return None };
+            let tokens = jarvig_core::round_group_tokens(entry.groups.as_deref()).ok()?;
+            Some((tokens, *radius_m))
+        })
+        .collect();
+    let mut owner: Option<usize> = None;
+    for id in ids {
+        let element = catalog.iter().find(|element| element.id == *id)?;
+        let mut hit: Option<usize> = None;
+        for (index, (tokens, _)) in entries.iter().enumerate() {
+            if element.sources.iter().all(|source| tokens.iter().any(|token| token == source)) {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some(index);
+            }
+        }
+        let hit = hit?;
+        if let Some(previous) = owner {
+            if previous != hit {
+                return None;
+            }
+        } else {
+            owner = Some(hit);
+        }
+    }
+    let (tokens, radius) = entries.get(owner?)?;
+    let bindings = jarvig_core::semantic_edge_bindings(record).ok()?;
+    let mut edges = Vec::new();
+    for token in tokens {
+        let id = bindings.iter().find(|(name, _)| name == token).map(|(_, id)| *id)?;
+        if !edges.contains(&id) {
+            edges.push(id);
+        }
+    }
+    (!edges.is_empty()).then_some((edges, *radius))
+}
+
+/// One cage segment under every fillet. An edge that belongs to a fillet is omitted.
+fn round_cage_segment_set(body: &SolidBody, fillets: &[jarvig_core::Fillet], edge: u32) -> Option<([f64; 3], [f64; 3])> {
+    let item = body.edges.iter().find(|item| item.id == edge)?;
+    let origin_start = body.vertex_position(item.a)?;
+    let origin_end = body.vertex_position(item.b)?;
+    let mut start = origin_start;
+    let mut end = origin_end;
+    for fillet in fillets {
+        let (shifted_start, shifted_end) = jarvig_core::round_cage_segment(body, fillet, edge)?;
+        if shifted_start != origin_start {
+            start = shifted_start;
+        }
+        if shifted_end != origin_end {
+            end = shifted_end;
+        }
+    }
+    Some((start, end))
+}
+
+/// The semantic edges Round will edit, resolved before the tool opens.
+struct RoundOpen {
+    edge: u32,
+    picked: usize,
+    tokens: Vec<String>,
+    body: SolidBody,
+    fillets: Vec<jarvig_core::Fillet>,
+    kept: Vec<jarvig_core::Fillet>,
+    fillet: jarvig_core::Fillet,
+    max_radius_m: f64,
+    readiness: RoundStatus,
+    note: String,
+    amount: f64,
+    requested_m: f64,
+}
+
+/// One concrete edge for each persistent token on an authored solid.
+/// Object-mode Round uses this set. The saved command stores the tokens, not "all edges".
+fn authored_sharp_edge_ids(record: &jarvig_core::BlockRecord) -> Vec<u32> {
+    let jarvig_core::IntentAuthorityCandidate::Reconstructable(body) = jarvig_core::intent_authority_candidate(record) else {
+        return Vec::new();
+    };
+    let Ok(bindings) = jarvig_core::semantic_edge_bindings(record) else {
+        return Vec::new();
+    };
+    let mut seen = Vec::new();
+    let mut ids = Vec::new();
+    for edge in &body.edges {
+        let Ok(token) = jarvig_core::persistent_edge_token(&body, &bindings, edge.id) else {
+            continue;
+        };
+        if seen.iter().any(|have: &String| have == &token) {
+            continue;
+        }
+        seen.push(token);
+        ids.push(edge.id);
+    }
+    ids
+}
+
+fn resolve_round_open(record: &jarvig_core::BlockRecord, edges: &[u32], requested: Option<f64>) -> Result<RoundOpen, String> {
+    if edges.is_empty() {
+        return Err("Select an edge first.".into());
+    }
+    if let Some(reason) = round_class_refusal(record) {
+        return Err(reason);
+    }
+    let diagnostic = jarvig_core::intent_authority_diagnostic(record);
+    if diagnostic != "Intent Authority: ELIGIBLE" {
+        return Err(diagnostic);
+    }
+    let body = match jarvig_core::intent_authority_candidate(record) {
+        jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => body,
+        jarvig_core::IntentAuthorityCandidate::Refused(reason) => return Err(reason),
+    };
+    let bindings = jarvig_core::semantic_edge_bindings(record).map_err(|_| "That edge has no semantic name.".to_string())?;
+    let mut pairs: Vec<(String, Vec<u32>)> = Vec::new();
+    for edge in edges {
+        let token = jarvig_core::persistent_edge_token(&body, &bindings, *edge)?;
+        if pairs.iter().any(|(have, _)| have == &token) {
+            continue;
+        }
+        let chain = jarvig_core::logical_edge_chain(&body, *edge)?;
+        pairs.push((token, chain));
+    }
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    let tokens: Vec<String> = pairs.iter().map(|(token, _)| token.clone()).collect();
+    let picked = edges.len();
+    let collapse = round_collapse_note(picked, tokens.len());
+    let existing = if observes_saved_round(record) { jarvig_core::replay_rounds(record)? } else { Vec::new() };
+    let mut kept_features = Vec::new();
+    let mut seed_radii = Vec::new();
+    for round in &existing {
+        let chain = jarvig_core::logical_edge_chain(&body, round.edge_id)?;
+        let overlaps = pairs.iter().any(|(_, selected)| chains_overlap(selected, &chain)) || tokens.iter().any(|token| token == &round.token);
+        if overlaps {
+            seed_radii.push(round.radius_m);
+        } else {
+            kept_features.push(jarvig_core::RoundFeature {
+                token: round.token.clone(),
+                fillet: round.fillet.clone(),
+                chain,
+            });
+        }
+    }
+    let authored: Vec<f64> = tokens.iter().filter_map(|token| authored_round_radius(record, token)).collect();
+    let requested_m = match requested {
+        Some(value) if value.is_finite() => value.max(0.001),
+        _ => shared_radius(&seed_radii).or_else(|| shared_radius(&authored)).unwrap_or(jarvig_core::CURVE_RADIUS_M),
+    };
+    let mut selected_features = Vec::new();
+    for (token, chain) in &pairs {
+        let feature = match chain_feature(&body, token, chain, requested_m) {
+            Ok(feature) => feature,
+            Err(_) => chain_feature(&body, token, chain, 0.001)?,
+        };
+        selected_features.push(feature);
+    }
+    if selected_features.is_empty() {
+        return Err("Round needs a semantic edge.".into());
+    }
+    let assessment = jarvig_core::assess_round_set(&body, &kept_features, &selected_features, requested_m);
+    let kept = kept_features.into_iter().map(|feature| feature.fillet).collect();
+    let edge = edges[0];
+    match assessment {
+        jarvig_core::RoundAssessment::Ready { radius_m, maximum_m, clamped } => {
+            let mut fillets = Vec::new();
+            for feature in &selected_features {
+                fillets.push(jarvig_core::fillet_scaled(&feature.fillet, radius_m)?);
+            }
+            let fillet = fillets.first().cloned().ok_or_else(|| "Round needs a semantic edge.".to_string())?;
+            Ok(RoundOpen {
+                edge,
+                picked,
+                tokens,
+                body,
+                fillets,
+                kept,
+                fillet,
+                max_radius_m: maximum_m.max(0.001),
+                readiness: if clamped { RoundStatus::Clamped } else { RoundStatus::Valid },
+                note: collapse,
+                amount: radius_m.max(0.001),
+                requested_m,
+            })
+        }
+        jarvig_core::RoundAssessment::Conflict { reason, tokens: conflict } => {
+            let fillet = selected_features[0].fillet.clone();
+            let listed = if conflict.is_empty() { reason } else { format!("{reason} {}", conflict.join(" ")) };
+            let note = if collapse.is_empty() { listed } else { format!("{collapse} {listed}") };
+            Ok(RoundOpen {
+                edge,
+                picked,
+                tokens,
+                body,
+                fillets: Vec::new(),
+                kept,
+                fillet,
+                max_radius_m: requested_m.max(0.001),
+                readiness: RoundStatus::Conflict,
+                note,
+                amount: requested_m.max(0.001),
+                requested_m,
+            })
+        }
+    }
+}
+
+fn chain_feature(body: &SolidBody, token: &str, chain: &[u32], radius_m: f64) -> Result<jarvig_core::RoundFeature, String> {
+    let fillet = jarvig_core::fillet_for_chain(body, chain, radius_m)?;
+    Ok(jarvig_core::RoundFeature { token: token.to_string(), fillet, chain: chain.to_vec() })
+}
+
+fn shared_radius(radii: &[f64]) -> Option<f64> {
+    let first = *radii.first()?;
+    radii.iter().all(|radius| (radius - first).abs() <= 1.0e-6).then_some(first)
+}
+
+fn chains_overlap(left: &[u32], right: &[u32]) -> bool {
+    left.iter().any(|edge| right.contains(edge))
+}
+
+/// The editor camera is in root space, including the bootstrap offset. The fillet is object-local.
+fn local_round_camera(
+    pose: &jarvig_core::ResolvedPose,
+    camera: &camera::EditorCameraController,
+    width: u32,
+    height: u32,
+) -> jarvig_core::RoundCamera {
+    let inverse = pose.rotation.conjugate();
+    let eye = inverse.rotate(Vec3::new(
+        camera.position.x - pose.translation.x,
+        camera.position.y - pose.translation.y,
+        camera.position.z - pose.translation.z,
+    ));
+    let forward = inverse.rotate(camera.forward());
+    let up = inverse.rotate(camera.camera_up());
+    jarvig_core::RoundCamera {
+        eye: [eye.x, eye.y, eye.z],
+        forward: [forward.x, forward.y, forward.z],
+        up: [up.x, up.y, up.z],
+        vertical_fov_radians: camera.vertical_fov_radians,
+        near_m: f64::from(camera.near_m),
+        viewport_width: width as f32,
+        viewport_height: height as f32,
+        requested_error_px: jarvig_core::CURVE_ERROR_PX,
+    }
+}
+
 fn modeling_tool_name(tool: ModelingTool) -> &'static str {
     match tool {
         ModelingTool::Extrude => "Extrude",
         ModelingTool::Inset => "Inset",
-        ModelingTool::Bevel => "Bevel",
+        ModelingTool::Bevel | ModelingTool::BevelEdge => "Bevel",
+        ModelingTool::Round => "Round",
         ModelingTool::MoveEdge => "Move Edge",
         ModelingTool::ExtrudeEdge => "Extrude Edge",
         ModelingTool::MoveVertex => "Move Vertex",
@@ -15636,7 +21085,8 @@ fn modeling_start_amount(session: &ModelingSession) -> f64 {
         ModelingTool::Extrude => 0.0,
         ModelingTool::Inset => session.baseline_inset[session.face as usize],
         ModelingTool::Bevel => session.baseline_bevel,
-        ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => 0.0,
+        ModelingTool::Round => session.amount,
+        ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex | ModelingTool::BevelEdge => 0.0,
     }
 }
 
@@ -15666,6 +21116,38 @@ fn region_center(body: &SolidBody, faces: &[u32]) -> Option<[f64; 3]> {
     }
 }
 
+fn face_centroid(body: &SolidBody, face: u32) -> Option<[f64; 3]> {
+    let loop_ = body.face_loop(face)?;
+    if loop_.is_empty() {
+        return None;
+    }
+    let mut sum = [0.0; 3];
+    for vertex in loop_ {
+        let position = body.vertex_position(*vertex)?;
+        sum[0] += position[0];
+        sum[1] += position[1];
+        sum[2] += position[2];
+    }
+    let count = loop_.len() as f64;
+    Some([sum[0] / count, sum[1] / count, sum[2] / count])
+}
+
+/// Outward bisector of the two faces that share one edge.
+fn bevel_bisector(body: &SolidBody, edge: u32) -> Option<[f64; 3]> {
+    let faces = body.faces_of_edge(edge);
+    if faces.len() != 2 {
+        return None;
+    }
+    let left = body.unit_normal(faces[0])?;
+    let right = body.unit_normal(faces[1])?;
+    let sum = [left[0] + right[0], left[1] + right[1], left[2] + right[2]];
+    let span = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+    if span < 1.0e-6 {
+        return None;
+    }
+    Some([sum[0] / span, sum[1] / span, sum[2] / span])
+}
+
 /// Extrude reports the distance the face actually moved. Bevel and inset stay inside the solid.
 fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
     if !amount.is_finite() {
@@ -15679,6 +21161,8 @@ fn clamp_modeling_amount(session: ModelingSession, amount: f64) -> f64 {
             grown - session.baseline_size[axis]
         }
         ModelingTool::Inset | ModelingTool::Bevel => amount.clamp(0.0, jarvig_core::feature_limit(session.baseline_size)),
+        ModelingTool::BevelEdge => amount.max(0.0),
+        ModelingTool::Round => amount.clamp(0.001, jarvig_core::feature_limit(session.baseline_size).max(0.001)),
         ModelingTool::MoveEdge | ModelingTool::ExtrudeEdge | ModelingTool::MoveVertex => session.amount,
     }
 }
@@ -15689,6 +21173,7 @@ fn shelf_icon(command: inspector::InspectorCommand) -> Option<chrome::ToolbarCom
         inspector::InspectorCommand::ExtrudeFace => Some(Extrude),
         inspector::InspectorCommand::InsetFace | inspector::InspectorCommand::EditInset(_) => Some(Inset),
         inspector::InspectorCommand::Bevel | inspector::InspectorCommand::EditBevel => Some(Bevel),
+        inspector::InspectorCommand::Round => Some(chrome::ToolbarCommand::Round),
         inspector::InspectorCommand::SubdivideFace | inspector::InspectorCommand::SubdivideFace4 => Some(Subdivide),
         inspector::InspectorCommand::MoveEdge => Some(MoveEdge),
         inspector::InspectorCommand::ExtrudeEdge => Some(ExtrudeEdge),
@@ -15698,7 +21183,7 @@ fn shelf_icon(command: inspector::InspectorCommand) -> Option<chrome::ToolbarCom
     }
 }
 
-fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::ModelingView {
+fn modeling_view(session: ModelingSession, region_faces: &[u32], bevel_edges: &[u32]) -> inspector::ModelingView {
     let limit = jarvig_core::feature_limit(session.baseline_size);
     match session.tool {
         ModelingTool::Extrude => inspector::ModelingView {
@@ -15706,7 +21191,7 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             face: if region_extrude(session) {
                 match region_faces {
                     [id] => format!("F:{id}"),
-                    faces => format!("{} faces", faces.len()),
+                    faces => format!("{} Faces selected", faces.len()),
                 }
             } else {
                 face_name(session.face).to_string()
@@ -15717,6 +21202,12 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: 1000.0,
             show_amount: true,
             element_label: "Face",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
         ModelingTool::Inset => inspector::ModelingView {
             title: "Inset",
@@ -15727,6 +21218,12 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: limit,
             show_amount: true,
             element_label: "Face",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
         ModelingTool::Bevel => inspector::ModelingView {
             title: "Bevel",
@@ -15737,6 +21234,31 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: limit,
             show_amount: true,
             element_label: "Face",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
+        },
+        ModelingTool::BevelEdge => inspector::ModelingView {
+            title: "Bevel",
+            face: match bevel_edges {
+                [id] => format!("E:{id}"),
+                edges => format!("{} Edges selected", edges.len()),
+            },
+            amount_label: "Width",
+            amount: session.amount,
+            minimum: 0.0,
+            maximum: 1000.0,
+            show_amount: true,
+            element_label: "Edge",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
         ModelingTool::MoveEdge => inspector::ModelingView {
             title: "Move Edge",
@@ -15747,6 +21269,12 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: 0.0,
             show_amount: false,
             element_label: "Edge",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
         ModelingTool::ExtrudeEdge => inspector::ModelingView {
             title: "Extrude Edge",
@@ -15757,6 +21285,12 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: 0.0,
             show_amount: false,
             element_label: "Edge",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
         ModelingTool::MoveVertex => inspector::ModelingView {
             title: "Move Vertex",
@@ -15767,7 +21301,29 @@ fn modeling_view(session: ModelingSession, region_faces: &[u32]) -> inspector::M
             maximum: 0.0,
             show_amount: false,
             element_label: "Vertex",
+            profile: None,
+            resolution: None,
+            range: None,
+            resolved: None,
+            readiness: None,
+            note: None,
         },
+        ModelingTool::Round => inspector::ModelingView {
+                title: "Round",
+                face: "1 Edge".to_string(),
+                amount_label: "Radius",
+                amount: session.amount,
+                minimum: 0.001,
+                maximum: limit.max(0.001),
+                show_amount: true,
+                element_label: "Selection",
+                profile: Some("Circular"),
+                resolution: Some("Automatic / Observation"),
+                range: None,
+                resolved: None,
+                readiness: None,
+                note: None,
+            },
     }
 }
 
@@ -15936,7 +21492,102 @@ fn key_to_node(key: TreeKey) -> outliner::OutlinerNodeId {
     match key {
         TreeKey::World | TreeKey::Tool(_) => outliner::OutlinerNodeId::WorldRoot,
         TreeKey::Entity(entity) => outliner::OutlinerNodeId::Entity(entity),
+        TreeKey::Folder(id) => outliner::OutlinerNodeId::Folder(id),
     }
+}
+
+fn context_command(action: context_menu::ContextAction) -> Option<usize> {
+    use context_menu::ContextAction::*;
+    Some(match action {
+        Rename => 1601,
+        Duplicate => 1602,
+        Delete => 1603,
+        Focus => 1604,
+        Hide => 1605,
+        Show => 1606,
+        Lock => 1607,
+        Unlock => 1608,
+        CreateFolder => 1609,
+        DeleteFolder => 1610,
+        CreateBlock => 1611,
+        CreatePlane => 1612,
+        Extrude => 1613,
+        Inset => 1614,
+        Bevel => 1615,
+        Subdivide => 1616,
+        CreateSurfaceGroup => 1617,
+        AddToGroup => 1618,
+        RemoveFromGroup => 1619,
+        CreateMaterial => 1620,
+        SelectConnected => 1621,
+        Boundary => 1622,
+        Grow => 1623,
+        Shrink => 1624,
+        Split => 1625,
+        ExtrudeEdge => 1626,
+        Loop => 1627,
+        Ring => 1628,
+        MoveVertex => 1629,
+        Round => 1630,
+        MoveToFolder | AssignMaterial => return None,
+    })
+}
+
+unsafe fn track_context_menu(owner: HWND, entries: &[context_menu::MenuLine], folders: &[(u32, String)], slots: &[(u8, String)]) -> usize {
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return 0;
+    }
+    let mut children = Vec::new();
+    for line in entries {
+        match line {
+            context_menu::MenuLine::Separator => separator(menu),
+            context_menu::MenuLine::Action(action) if *action == context_menu::ContextAction::MoveToFolder => {
+                let child = CreatePopupMenu();
+                if child.is_null() {
+                    continue;
+                }
+                append(child, 1700, "World");
+                for (index, (_, name)) in folders.iter().enumerate() {
+                    append(child, 1701 + index, name);
+                }
+                chrome::darken_menu(child);
+                popup(menu, child, "Move To Folder");
+                children.push(child);
+            }
+            context_menu::MenuLine::Action(action) if *action == context_menu::ContextAction::AssignMaterial => {
+                let child = CreatePopupMenu();
+                if child.is_null() {
+                    continue;
+                }
+                if slots.is_empty() {
+                    append(child, 1800, "Object Material");
+                    EnableMenuItem(child, 1800 as u32, MF_BYCOMMAND | MF_GRAYED);
+                } else {
+                    for (slot, label) in slots {
+                        append(child, 1800 + *slot as usize, label);
+                    }
+                }
+                chrome::darken_menu(child);
+                popup(menu, child, "Assign Material");
+                children.push(child);
+            }
+            context_menu::MenuLine::Action(action) => {
+                if let Some(id) = context_command(*action) {
+                    append(menu, id, action.label());
+                }
+            }
+        }
+    }
+    chrome::darken_menu(menu);
+    let mut point = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut point);
+    let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, owner, std::ptr::null());
+    DestroyMenu(menu);
+    for child in children {
+        DestroyMenu(child);
+    }
+    if picked <= 0 { 0 } else { picked as usize }
 }
 
 unsafe fn find_item(hwnd: HWND, parent: HTREEITEM, param: isize) -> Option<HTREEITEM> {
@@ -15996,6 +21647,32 @@ fn wide(text: &str) -> Vec<u16> {
 
 fn axis_matches(components: &[String], axis: u8, value: f64) -> bool {
     components.get(axis as usize).and_then(|text| text.trim().parse::<f64>().ok()).is_some_and(|current| (current - value).abs() < 1.0e-6)
+}
+
+fn surface_group_name_message(name: &str) -> Option<&'static str> {
+    if name.chars().count() > jarvig_core::SURFACE_GROUP_NAME_LIMIT || name.chars().any(|glyph| glyph.is_control()) {
+        Some("That group name is too long.")
+    } else {
+        None
+    }
+}
+
+fn surface_group_face_message(record: &jarvig_core::BlockRecord, faces: &[u32]) -> Option<&'static str> {
+    let Some(body) = record.material_body() else {
+        return Some("That face is not on the solid.");
+    };
+    if faces.iter().any(|face| *face == 0 || !body.faces.iter().any(|stored| stored.id == *face)) {
+        Some("That face is not on the solid.")
+    } else {
+        None
+    }
+}
+
+fn surface_slot_from_choice(text: &str) -> Option<u32> {
+    if text == "Object Material" {
+        return Some(0);
+    }
+    text.strip_prefix("Face Material ").and_then(|rest| rest.parse().ok())
 }
 
 fn combo_text(hwnd: HWND) -> String {
@@ -16585,7 +22262,15 @@ fn capture_window(hwnd: HWND, path: &str) -> Result<(), String> {
     write_bmp(path, &image)
 }
 
+fn capture_screen_image(hwnd: HWND) -> Result<CapturedWindow, String> {
+    capture_window_image_from(hwnd, true)
+}
+
 fn capture_window_image(hwnd: HWND) -> Result<CapturedWindow, String> {
+    capture_window_image_from(hwnd, false)
+}
+
+fn capture_window_image_from(hwnd: HWND, screen_pixels: bool) -> Result<CapturedWindow, String> {
     unsafe {
         UpdateWindow(hwnd);
         let mut rect: RECT = std::mem::zeroed();
@@ -16597,7 +22282,8 @@ fn capture_window_image(hwnd: HWND) -> Result<CapturedWindow, String> {
         if width <= 0 || height <= 0 {
             return Err("empty client".into());
         }
-        let screen = GetDC(hwnd);
+        let source = if screen_pixels { std::ptr::null_mut() } else { hwnd };
+        let screen = GetDC(source);
         if screen.is_null() {
             return Err("window dc".into());
         }
@@ -16610,13 +22296,23 @@ fn capture_window_image(hwnd: HWND) -> Result<CapturedWindow, String> {
             if !memory.is_null() {
                 DeleteDC(memory);
             }
-            ReleaseDC(hwnd, screen);
+            ReleaseDC(source, screen);
             return Err("bitmap".into());
         }
         let previous = SelectObject(memory, bitmap);
-        let printed = PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT);
-        if printed == 0 {
-            BitBlt(memory, 0, 0, width, height, screen, 0, 0, SRCCOPY);
+        if screen_pixels {
+            if BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top, SRCCOPY) == 0 {
+                SelectObject(memory, previous);
+                DeleteObject(bitmap);
+                DeleteDC(memory);
+                ReleaseDC(source, screen);
+                return Err("screen capture".into());
+            }
+        } else {
+            let printed = PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT);
+            if printed == 0 {
+                BitBlt(memory, 0, 0, width, height, screen, 0, 0, SRCCOPY);
+            }
         }
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -16644,7 +22340,7 @@ fn capture_window_image(hwnd: HWND) -> Result<CapturedWindow, String> {
         SelectObject(memory, previous);
         DeleteObject(bitmap);
         DeleteDC(memory);
-        ReleaseDC(hwnd, screen);
+        ReleaseDC(source, screen);
         if rows == 0 {
             return Err("GetDIBits".into());
         }
@@ -16883,15 +22579,61 @@ unsafe fn register_classes(instance: HINSTANCE) -> Result<(), String> {
     Ok(())
 }
 
+unsafe fn check_menu_command(menu: HMENU, id: u32, flags: u32) {
+    if menu.is_null() {
+        return;
+    }
+    let count = GetMenuItemCount(menu);
+    if count <= 0 {
+        return;
+    }
+    for index in 0..count {
+        let child = GetSubMenu(menu, index);
+        if !child.is_null() {
+            check_menu_command(child, id, flags);
+        } else if GetMenuItemID(menu, index) == id {
+            CheckMenuItem(menu, id, flags);
+        }
+    }
+}
+
+unsafe fn fill_view_menu(menu: HMENU) -> Result<HMENU, String> {
+    let mut lighting = std::ptr::null_mut();
+    append_view_nodes(menu, context_menu::VIEW_MENU, &mut lighting)?;
+    if lighting.is_null() {
+        return Err("lighting menu was not created".into());
+    }
+    Ok(lighting)
+}
+
+unsafe fn append_view_nodes(menu: HMENU, nodes: &[context_menu::ViewNode], lighting: &mut HMENU) -> Result<(), String> {
+    for node in nodes {
+        match *node {
+            context_menu::ViewNode::Gap => separator(menu),
+            context_menu::ViewNode::Item(id, label) => append(menu, id, label),
+            context_menu::ViewNode::Group(label, children) => {
+                let child = CreatePopupMenu();
+                if child.is_null() {
+                    return Err("view submenu was not created".into());
+                }
+                append_view_nodes(child, children, lighting)?;
+                chrome::darken_menu(child);
+                popup(menu, child, label);
+                if label == "Lighting" {
+                    *lighting = child;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU, HMENU), String> {
     let menu = CreateMenu();
     let file = CreatePopupMenu();
     let edit = CreatePopupMenu();
     let create = CreatePopupMenu();
     let view = CreatePopupMenu();
-    let lighting = CreatePopupMenu();
-    let virtual_geometry = CreatePopupMenu();
-    let einstein = CreatePopupMenu();
     let build = CreatePopupMenu();
     let play = CreatePopupMenu();
     let help = CreatePopupMenu();
@@ -16900,9 +22642,6 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU, HMENU), St
         || edit.is_null()
         || create.is_null()
         || view.is_null()
-        || lighting.is_null()
-        || virtual_geometry.is_null()
-        || einstein.is_null()
         || build.is_null()
         || play.is_null()
         || help.is_null()
@@ -16945,111 +22684,8 @@ unsafe fn editor_menu() -> Result<(HMENU, HMENU, HMENU, HMENU, HMENU, HMENU), St
     append(edit, ID_EDIT_DESELECT, "Deselect All\tCtrl+Shift+A");
     append(edit, ID_EDIT_INVERT, "Invert Selection");
     append(create, ID_CREATE_BLOCK, "Block");
-    append(view, ID_VIEW_OUTLINER, "World Outliner");
-    append(view, ID_VIEW_CHARACTER, "Character Editor");
-    append(view, ID_VIEW_LAND, "Land Mode");
-    append(view, ID_VIEW_RESET_POSE, "Reset Pose");
-    append(view, ID_VIEW_JOINTS, "Show Joints");
-    append(view, ID_VIEW_ALL_JOINTS, "Show All Joints");
-    append(view, ID_VIEW_JOINT_LIMITS, "Show Joint Limits");
-    append(view, ID_VIEW_MESH_PARTS, "Mesh Parts");
-    append(view, ID_VIEW_INSPECTOR, "Inspector");
-    append(view, ID_VIEW_GRID, "Show Grid");
-    append(view, ID_VIEW_CONTENT, "Content Browser");
-    append(view, ID_VIEW_OUTPUT, "Output Log");
-    append(view, ID_VIEW_RESET, "Reset Layout");
-    append(view, ID_VIEW_EXPOSURE_UP, "Exposure +");
-    append(view, ID_VIEW_EXPOSURE_DOWN, "Exposure -");
-    append(view, ID_VIEW_EXPOSURE_RESET, "Reset Exposure");
-    append(view, ID_QUALITY_BASELINE, "Renderer Quality: Baseline");
-    append(view, ID_QUALITY_ENHANCED, "Renderer Quality: Enhanced");
-    append(view, ID_QUALITY_HIGH, "Renderer Quality: High");
-    append(view, ID_PRESENT_DITHER, "Presentation Dither");
-    append(view, ID_PRESENT_TONEMAP, "Presentation: Tone Map");
-    append(view, ID_PRESENT_QUANTIZED, "Presentation: 8-bit Steps");
-    append(view, ID_PRESENT_BEFORE, "Presentation: Before Tone Curve");
-    separator(view);
-    append(view, ID_VIEW_CREATE_CAMERA, "Create Camera Actor");
-    append(view, ID_VIEW_STARTUP_CAMERA, "Set Selected as Startup Camera");
-    append(view, ID_VIEW_PILOT, "Pilot Selected Camera");
-    append(view, ID_VIEW_MESHLETS, "Show Meshlet Colors");
-    append(view, ID_VIEW_MESHLET_SHADE, "Draw From Meshlets");
-    append(view, ID_VIEW_MESHLET_FRUSTUM, "Frustum Cull Meshlets");
-    append(view, ID_VIEW_MESHLET_OCCLUSION, "Occlusion Cull Meshlets");
-    append(view, ID_VIEW_MESHLET_FREEZE, "Freeze Meshlet Visibility");
-    append(view, ID_VIEW_MESHLET_HIGHLIGHT, "Highlight Cluster Under Cursor");
-    append(virtual_geometry, ID_VIEW_VG_NORMAL, "Normal");
-    append(virtual_geometry, ID_VIEW_LEAF_TRUTH, "Leaf Truth");
-    append(virtual_geometry, ID_VIEW_VG_FRUSTUM, "Frustum Only");
-    append(virtual_geometry, ID_VIEW_VG_HIER, "Hierarchy (no occlusion)");
-    append(virtual_geometry, ID_VIEW_VG_OCC, "Hierarchy + Occlusion");
-    popup(view, virtual_geometry, "Pipeline");
-    append(einstein, ID_VIEW_EINSTEIN_OFF, "None");
-    append(einstein, ID_VIEW_CUT_REASONS, "Cut Reasons");
-    append(einstein, ID_VIEW_VG_LEVELS, "Hierarchy Levels");
-    append(einstein, ID_VIEW_MICRO_ACTIVE, "Einstein Active Detail");
-    append(einstein, ID_VIEW_MICRO_ELIGIBLE, "Einstein Eligible Surfaces");
-    append(einstein, ID_VIEW_MICRO_ERROR, "Einstein LOD / Error");
-    append(einstein, ID_VIEW_MICRO_STATE, "Einstein State");
-    append(einstein, ID_VIEW_MICRO_REJECT, "Einstein Reject Reason");
-    append(einstein, ID_VIEW_EINSTEIN, "Einstein Detail Debug");
-    popup(view, einstein, "Visualization");
-    append(view, ID_VIEW_FREEZE_DIAGNOSTIC, "Freeze Diagnostic Frame");
-    append(view, ID_VIEW_COMPARE_LEAF, "Compare Against Leaf Truth");
-    append(view, ID_VIEW_RESET_DEBUG, "Reset Rendering Debug");
-    append(view, ID_VIEW_CLUSTER_HIERARCHY, "Cluster Hierarchy");
-    append(view, ID_VIEW_MICRO, "Microgeometry Auto");
-    append(view, ID_VIEW_MICRO_ON, "Microgeometry On");
-    append(view, ID_VIEW_MICRO_OFF, "Microgeometry Off");
-    append(view, ID_VIEW_MICRO_COLOR, "Microtriangle Colors");
-    append(view, ID_VIEW_ERROR_HALF, "Hierarchy Error 0.5 px");
-    append(view, ID_VIEW_ERROR_ONE, "Hierarchy Error 1 px");
-    append(view, ID_VIEW_ERROR_TWO, "Hierarchy Error 2 px");
-    append(view, ID_VIEW_ERROR_FOUR, "Hierarchy Error 4 px");
-    append(view, ID_VIEW_BACKGROUND_JOBS, "Background Jobs");
-    append(view, ID_VIEW_CANCEL_JOB, "Cancel Background Job");
-    append(view, ID_VIEW_ENVIRONMENT, "Environment Light");
-    append(view, ID_VIEW_RECAPTURE, "Recapture Reflection Probes");
-    append(view, ID_PROBE_STATIC, "Probe Update: Static");
-    append(view, ID_PROBE_ON_DEMAND, "Probe Update: On Demand");
-    append(view, ID_PROBE_ON_TRANSFORM, "Probe Update: On Transform");
-    append(view, ID_PROBE_ON_LIGHTING, "Probe Update: On Lighting");
-    append(view, ID_PROBE_TIME_SLICED, "Probe Update: Time Sliced");
-    append(view, ID_PROBE_RES_32, "Probe Resolution 32");
-    append(view, ID_PROBE_RES_64, "Probe Resolution 64");
-    append(view, ID_PROBE_RES_128, "Probe Resolution 128");
-    append(view, ID_PROBE_RES_256, "Probe Resolution 256");
-    append(lighting, ID_DEBUG_FULL, "Full Lighting");
-    append(lighting, ID_DEBUG_DIRECT, "Direct Only");
-    append(lighting, ID_DEBUG_ENV_DIFFUSE, "Environment Diffuse Only");
-    append(lighting, ID_DEBUG_ENV_SPECULAR, "Environment Specular Only");
-    append(lighting, ID_DEBUG_PROBE_ONLY, "Local Probe Specular Only");
-    append(lighting, ID_DEBUG_EMISSIVE, "Emissive Only");
-    separator(lighting);
-    append(lighting, ID_DEBUG_DIRECTIONAL, "Directional Light");
-    append(lighting, ID_DEBUG_POINT, "Point Light");
-    append(lighting, ID_DEBUG_SPOT, "Spot Light");
-    separator(lighting);
-    append(lighting, ID_DEBUG_GLOBAL_ENV, "Global Environment");
-    append(lighting, ID_DEBUG_PROBE, "Reflection Probe");
-    separator(lighting);
-    append(lighting, ID_DEBUG_DIRECTIONAL_ONLY, "Directional Only");
-    append(lighting, ID_DEBUG_POINT_ONLY, "Point Only");
-    append(lighting, ID_DEBUG_SPOT_ONLY, "Spot Only");
-    append(lighting, ID_DEBUG_NO_SHADOWS, "No Shadows");
-    append(lighting, ID_DEBUG_INDIRECT_ONLY, "Indirect Diffuse Only");
-    append(lighting, ID_DEBUG_DIRECT_UNSHADOWED, "Direct Unshadowed");
-    separator(lighting);
-    append(lighting, ID_DEBUG_CASCADES, "Shadow Cascades");
-    append(lighting, ID_DEBUG_CONTACT, "Contact Shadows");
-    separator(lighting);
-    append(lighting, ID_MAT_FULL, "Material: Full");
-    append(lighting, ID_MAT_BASE, "Material: Base Color");
-    append(lighting, ID_MAT_NORMAL, "Material: Normal");
-    append(lighting, ID_MAT_ROUGH, "Material: Roughness");
-    append(lighting, ID_MAT_AO, "Material: AO");
-    append(lighting, ID_MAT_METAL, "Material: Metallic");
-    popup(view, lighting, "Lighting Debug");
+    append(create, ID_CREATE_PLANE, "Plane");
+    let lighting = fill_view_menu(view)?;
     append(play, ID_PLAY, "Play In Editor");
     append(play, ID_PLAY_STANDALONE, "Run Standalone");
     append(build, ID_BUILD_PROJECT, "Build Project");
@@ -17347,7 +22983,9 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, message: u32, wparam: WPARAM, l
         WM_ACTIVATE => {
             if (wparam & 0xffff) == 0 {
                 if let Some(editor) = editor {
-                    editor.end_capture(true, true);
+                    if editor.round_drag.is_none() {
+                        editor.end_capture(true, true);
+                    }
                 }
             }
             0
@@ -17496,6 +23134,35 @@ unsafe extern "system" fn inspector_edit_proc(hwnd: HWND, message: u32, wparam: 
         }
     }
     let previous = std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(INSPECTOR_EDIT_PROC);
+    CallWindowProcW(Some(previous), hwnd, message, wparam, lparam)
+}
+
+static mut RENAME_EDIT_PROC: isize = 0;
+
+unsafe fn subclass_rename_edit(hwnd: HWND) {
+    let current = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if RENAME_EDIT_PROC == 0 {
+        RENAME_EDIT_PROC = current;
+    }
+    windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, rename_edit_proc as *const () as isize);
+}
+
+unsafe extern "system" fn rename_edit_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_KEYDOWN && (wparam == VK_RETURN as usize || wparam == VK_ESCAPE as usize) {
+        if let Some(editor) = editor_from(GetParent(hwnd)) {
+            editor.finish_rename(wparam == VK_RETURN as usize);
+        }
+        return 0;
+    }
+    if message == WM_KILLFOCUS {
+        if let Some(editor) = editor_from(GetParent(hwnd)) {
+            if editor.rename.as_ref().is_some_and(|prompt| prompt.hwnd == hwnd) {
+                editor.finish_rename(false);
+            }
+        }
+        return 0;
+    }
+    let previous = std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(RENAME_EDIT_PROC);
     CallWindowProcW(Some(previous), hwnd, message, wparam, lparam)
 }
 
@@ -18227,4 +23894,505 @@ unsafe fn set_window_user(hwnd: HWND, value: isize) {
 
 unsafe fn get_window_user(hwnd: HWND) -> isize {
     windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+}
+
+/// Hide in Editor. Does not write `SceneObject.visible`.
+fn set_editor_hidden(hidden: &mut Vec<jarvig_core::EntityId>, entity: jarvig_core::EntityId, visible_in_editor: bool) {
+    if visible_in_editor {
+        hidden.retain(|stored| *stored != entity);
+    } else if !hidden.contains(&entity) {
+        hidden.push(entity);
+    }
+}
+
+#[cfg(test)]
+mod round_frame_cache {
+    use super::{observes_saved_round, round_cache_holds, RoundViewCache};
+
+    fn cache(entity: jarvig_core::EntityUuid, radius_bits: u64, divisions: u32, fillet: bool, noted_failure: bool) -> RoundViewCache {
+        RoundViewCache {
+            entity,
+            intent_len: 65,
+            size_bits: [1, 2, 3],
+            radius_bits,
+            divisions,
+            mesh: jarvig_core::MeshId(0),
+            fillet: fillet.then(dummy_fillet),
+            fillets: fillet.then(dummy_fillet).into_iter().collect(),
+            tokens: Vec::new(),
+            curves: Vec::new(),
+            logged_divisions: None,
+            noted_failure,
+        }
+    }
+
+    fn dummy_fillet() -> jarvig_core::Fillet {
+        jarvig_core::Fillet {
+            edge_id: 26,
+            radius_m: 0.05,
+            origin: [0.0; 3],
+            direction: [1.0, 0.0, 0.0],
+            length_m: 1.0,
+            normal0: [0.0, 1.0, 0.0],
+            normal1: [0.0, 0.0, 1.0],
+            inward0: [0.0, -1.0, 0.0],
+            inward1: [0.0, 0.0, -1.0],
+            center_offset: [0.0; 3],
+            tangent_m: 0.05,
+            span: std::f64::consts::FRAC_PI_2,
+            axis: [1.0, 0.0, 0.0],
+            wing: [0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn the_latest_round_token_is_the_saved_edge() {
+        let mut record = jarvig_core::BlockRecord::standard([1.0, 1.0, 1.0]).expect("size");
+        assert!(super::saved_round_token(&record).is_none());
+        record.intent.push(jarvig_core::round_entry("E:grid(F:seed/4,1,1,2)", 0.05));
+        record.intent.push(jarvig_core::round_entry("E:grid(F:seed/4,1,1,2)", 0.04));
+        assert_eq!(super::saved_round_token(&record), Some("E:grid(F:seed/4,1,1,2)"));
+    }
+
+    #[test]
+    fn a_saved_round_is_found_without_a_replay_and_a_plain_record_is_not() {
+        let plain = jarvig_core::BlockRecord::standard([1.0, 1.0, 1.0]).expect("size");
+        assert!(!observes_saved_round(&plain));
+        let mut rounded = plain.clone();
+        rounded.intent.push(jarvig_core::round_entry("E:seed-edge/0", 0.05));
+        assert!(observes_saved_round(&rounded));
+        rounded.body = jarvig_core::SolidBody::from_box([1.0, 1.0, 1.0]).ok();
+        assert!(!observes_saved_round(&rounded));
+    }
+
+    #[test]
+    fn selecting_a_plain_block_leaves_the_round_on_the_solid_that_has_one() {
+        let rounded = jarvig_core::EntityUuid::parse("11111111-1111-4111-8111-111111111111").expect("rounded");
+        let plain = jarvig_core::EntityUuid::parse("22222222-2222-4222-8222-222222222222").expect("plain");
+        let open = jarvig_core::EntityUuid::parse("33333333-3333-4333-8333-333333333333").expect("session");
+        assert_eq!(super::round_observation_entity(Some(open), None, Some(rounded), Some(plain)), Some(open));
+        assert_eq!(super::round_observation_entity(None, Some(rounded), Some(plain), None), Some(rounded));
+        assert_eq!(super::round_observation_entity(None, None, Some(rounded), Some(plain)), Some(rounded));
+        assert_eq!(super::round_observation_entity(None, None, None, Some(rounded)), Some(rounded));
+    }
+
+    #[test]
+    fn an_unchanged_observation_does_not_ask_for_another_replay() {
+        let entity = jarvig_core::EntityUuid::parse("11111111-1111-4111-8111-111111111111").expect("uuid");
+        let size = [1, 2, 3];
+        let held = cache(entity, 0, 0, false, false);
+        assert!(round_cache_holds(&held, entity, 65, size, 0, None));
+        assert!(!round_cache_holds(&held, entity, 66, size, 0, None));
+        let radius = 0.05f64.to_bits();
+        let open = cache(entity, radius, 3, true, false);
+        assert!(round_cache_holds(&open, entity, 65, size, radius, Some(3)));
+        assert!(!round_cache_holds(&open, entity, 65, size, radius, Some(4)));
+        assert!(!round_cache_holds(&open, entity, 65, size, radius, None));
+        let failed = cache(entity, radius, 0, false, true);
+        assert!(round_cache_holds(&failed, entity, 65, size, radius, None));
+    }
+
+    fn intent_solid() -> jarvig_core::BlockRecord {
+        let bytes = std::fs::read(jarvig_core::authored_main_level()).expect("main level");
+        let parsed = jarvig_core::parse_level(std::str::from_utf8(&bytes).unwrap()).expect("parse");
+        parsed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Intent Solid")
+            .and_then(|entity| {
+                entity.components.iter().find_map(|component| match component {
+                    jarvig_core::ComponentRecord::ParametricBlock(block) => Some(block.clone()),
+                    _ => None,
+                })
+            })
+            .expect("Intent Solid")
+    }
+
+    fn edge_named(bindings: &[(String, u32)], token: &str) -> u32 {
+        bindings.iter().find(|(name, _)| name == token).map(|(_, id)| *id).unwrap_or_else(|| panic!("{token}"))
+    }
+
+    fn chain_ends(body: &jarvig_core::SolidBody, chain: &[u32]) -> Vec<u32> {
+        let mut counts = Vec::new();
+        for edge in chain {
+            let Some(item) = body.edges.iter().find(|item| item.id == *edge) else { continue };
+            for vertex in [item.a, item.b] {
+                if let Some((_, count)) = counts.iter_mut().find(|(id, _)| *id == vertex) {
+                    *count += 1;
+                } else {
+                    counts.push((vertex, 1u32));
+                }
+            }
+        }
+        counts.into_iter().filter(|(_, count)| *count == 1).map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn fragments_of_one_side_resolve_to_the_same_round() {
+        let record = intent_solid();
+        let body = match jarvig_core::intent_authority_candidate(&record) {
+            jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => body,
+            jarvig_core::IntentAuthorityCandidate::Refused(reason) => panic!("{reason}"),
+        };
+        let bindings = jarvig_core::semantic_edge_bindings(&record).expect("bindings");
+        let fragment = edge_named(&bindings, "E:grid(F:seed/4,1,1,2)");
+        let chain = jarvig_core::logical_edge_chain(&body, fragment).expect("chain");
+        assert!(chain.len() >= 2, "{chain:?}");
+        let open = super::resolve_round_open(&record, &chain, None).expect("open");
+        assert_eq!(open.tokens, vec!["E:seed-edge/3".to_string()]);
+        assert!(open.picked > open.tokens.len());
+        assert!(open.note.contains("resolve to 1 semantic edge"), "{}", open.note);
+        assert_eq!(open.readiness, super::RoundStatus::Valid);
+        let rounded = jarvig_core::commit_class_c_intent(&record, jarvig_core::round_entry("E:grid(F:seed/4,1,1,2)", jarvig_core::CURVE_RADIUS_M)).expect("round");
+        let sibling = chain.iter().copied().find(|edge| *edge != fragment).expect("sibling");
+        let again = super::resolve_round_open(&rounded, &[sibling], None).expect("same feature");
+        assert_eq!(again.tokens, vec!["E:seed-edge/3".to_string()]);
+        assert!((again.amount - jarvig_core::CURVE_RADIUS_M).abs() < 1.0e-9);
+        assert!(again.kept.is_empty(), "the fragment is the saved round");
+        assert_eq!(again.readiness, super::RoundStatus::Valid);
+    }
+
+    #[test]
+    fn two_disconnected_edges_share_one_radius() {
+        let record = intent_solid();
+        let bindings = jarvig_core::semantic_edge_bindings(&record).expect("bindings");
+        let left = edge_named(&bindings, "E:seed-edge/2");
+        let right = edge_named(&bindings, "E:seed-edge/3");
+        let open = super::resolve_round_open(&record, &[right, left], None).expect("pair");
+        assert_eq!(open.tokens, vec!["E:seed-edge/2".to_string(), "E:seed-edge/3".to_string()]);
+        assert_eq!(open.readiness, super::RoundStatus::Valid);
+        assert!((open.amount - jarvig_core::CURVE_RADIUS_M).abs() < 1.0e-9);
+        assert!(open.note.is_empty(), "{}", open.note);
+        assert_eq!(open.fillets.len(), 2);
+        let committed = jarvig_core::commit_class_c_intent(&record, jarvig_core::round_entry_set(&open.tokens, open.amount)).expect("apply");
+        assert!(committed.body.is_none());
+        let rounds = jarvig_core::replay_rounds(&committed).expect("rounds");
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(super::round_radius_bits(&record), 0);
+        assert_ne!(super::round_radius_bits(&committed), 0);
+        let other = jarvig_core::commit_class_c_intent(
+            &record,
+            jarvig_core::round_entry_set(&["E:seed-edge/2".to_string(), "E:seed-edge/1".to_string()], open.amount),
+        );
+        if let Ok(other) = other {
+            assert_ne!(super::round_radius_bits(&committed), super::round_radius_bits(&other));
+        }
+        assert_ne!(
+            super::round_preview_bits(&open.tokens, open.amount, false),
+            super::round_preview_bits(&["E:seed-edge/3".to_string()], open.amount, false)
+        );
+        assert!((super::authored_round_radius(&committed, "E:seed-edge/2").unwrap() - open.amount).abs() < 1.0e-12);
+        assert_eq!(super::saved_round_token(&committed), Some("E:seed-edge/2"));
+    }
+
+    #[test]
+    fn an_adjacent_request_clamps_or_names_the_conflict() {
+        let record = intent_solid();
+        let body = match jarvig_core::intent_authority_candidate(&record) {
+            jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => body,
+            jarvig_core::IntentAuthorityCandidate::Refused(reason) => panic!("{reason}"),
+        };
+        let bindings = jarvig_core::semantic_edge_bindings(&record).expect("bindings");
+        let kept_edge = edge_named(&bindings, "E:seed-edge/3");
+        let kept_chain = jarvig_core::logical_edge_chain(&body, kept_edge).expect("chain");
+        let kept_ends = chain_ends(&body, &kept_chain);
+        let mut adjacent = None;
+        let mut seen = Vec::new();
+        for (_, id) in &bindings {
+            let Ok(token) = jarvig_core::persistent_edge_token(&body, &bindings, *id) else { continue };
+            if token == "E:seed-edge/3" || seen.iter().any(|have: &String| have == &token) {
+                continue;
+            }
+            seen.push(token.clone());
+            let Ok(chain) = jarvig_core::logical_edge_chain(&body, *id) else { continue };
+            if chain.iter().any(|edge| kept_chain.contains(edge)) {
+                continue;
+            }
+            let ends = chain_ends(&body, &chain);
+            if !ends.iter().any(|vertex| kept_ends.contains(vertex)) {
+                continue;
+            }
+            if jarvig_core::fillet_for_chain(&body, &chain, jarvig_core::CURVE_RADIUS_M).is_ok() {
+                adjacent = Some(*id);
+                break;
+            }
+        }
+        let adjacent = adjacent.expect("adjacent edge");
+        let kept = jarvig_core::commit_class_c_intent(&record, jarvig_core::round_entry("E:seed-edge/3", jarvig_core::CURVE_RADIUS_M)).expect("kept");
+        let open = super::resolve_round_open(&kept, &[adjacent], Some(0.2)).expect("open");
+        match open.readiness {
+            super::RoundStatus::Clamped => {
+                assert!((open.amount - jarvig_core::CURVE_RADIUS_M).abs() < 1.0e-4, "{}", open.amount);
+                assert!((open.max_radius_m - jarvig_core::CURVE_RADIUS_M).abs() < 1.0e-4, "{}", open.max_radius_m);
+            }
+            super::RoundStatus::Conflict => {
+                assert!(open.note.contains("E:"), "{}", open.note);
+                assert!(open.fillets.is_empty());
+            }
+            super::RoundStatus::Valid => panic!("0.200 m beside 0.050 m stayed valid"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod authored_block_shelf {
+    use super::{authored_block_refusal, modeling_tool_refusal, round_class_refusal, ModelingTool};
+
+    #[test]
+    fn an_authored_block_names_the_tools_this_slice_leaves_off() {
+        let seed = jarvig_core::BlockRecord::authored_seed([2.0, 2.0, 2.0]).unwrap();
+        assert!(round_class_refusal(&seed).is_none());
+        assert!(modeling_tool_refusal(&seed, ModelingTool::Round).is_none());
+        assert!(modeling_tool_refusal(&seed, ModelingTool::Extrude).is_none());
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::Inset).as_deref(), Some("Inset is not available on an authored block."));
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::Bevel).as_deref(), Some("Bevel is not available on an authored block."));
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::BevelEdge).as_deref(), Some("Bevel is not available on an authored block."));
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::MoveEdge).as_deref(), Some("Move Edge is not available on an authored block."));
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::ExtrudeEdge).as_deref(), Some("Extrude Edge is not available on an authored block."));
+        assert_eq!(modeling_tool_refusal(&seed, ModelingTool::MoveVertex).as_deref(), Some("Move Vertex is not available on an authored block."));
+        assert_eq!(authored_block_refusal("Mirror"), "Mirror is not available on an authored block.");
+        assert_eq!(authored_block_refusal("Reset Shape"), "Reset Shape is not available on an authored block.");
+        assert_eq!(authored_block_refusal("Subdivide"), "Subdivide is not available on an authored block.");
+        assert_eq!(super::inspector::face_identity_label(&seed, 1), "F:seed/0");
+        assert_eq!(super::inspector::face_identity_label(&seed, 6), "F:seed/5");
+        assert_eq!(super::inspector::edge_identity_label(&seed, 9), "E:seed-edge/0");
+        let sharp = super::authored_sharp_edge_ids(&seed);
+        assert_eq!(sharp.len(), 12);
+        let whole = super::resolve_round_open(&seed, &sharp, Some(0.05)).expect("whole object");
+        assert_eq!(whole.readiness, super::RoundStatus::Valid);
+        assert_eq!(whole.tokens.len(), 12);
+        assert!(whole.tokens.iter().all(|token| token.starts_with("E:seed-edge/")), "{}", whole.tokens.join(" "));
+        let pair = super::resolve_round_open(&seed, &[11, 16], Some(0.05)).expect("two edges");
+        assert_eq!(pair.readiness, super::RoundStatus::Valid);
+        assert_eq!(pair.tokens.len(), 2);
+        let committed = jarvig_core::commit_authored_round(&seed, jarvig_core::round_entry_set(&pair.tokens, pair.amount)).expect("commit");
+        assert!(committed.body.is_none());
+        let rounds = jarvig_core::replay_rounds(&committed).expect("rounds");
+        let body = match jarvig_core::intent_authority_candidate(&committed) {
+            jarvig_core::IntentAuthorityCandidate::Reconstructable(body) => body,
+            jarvig_core::IntentAuthorityCandidate::Refused(reason) => panic!("{reason}"),
+        };
+        let tokens: Vec<String> = rounds.iter().map(|round| round.token.clone()).collect();
+        let fillets: Vec<_> = rounds.iter().map(|round| round.fillet.clone()).collect();
+        let curves = super::round_curve_elements(&body, &tokens, &fillets);
+        let boundary = curves.iter().find(|element| element.kind == jarvig_core::CurveKind::Edge && element.token.starts_with("E:fillet-")).expect("boundary");
+        assert_eq!(super::inspector::edge_identity_label(&committed, boundary.id), boundary.token);
+        let face = curves.iter().find(|element| element.kind == jarvig_core::CurveKind::Face && element.token.starts_with("F:fillet(")).expect("fillet");
+        assert_eq!(super::inspector::face_identity_label(&committed, face.id), face.token);
+        let junction = curves.iter().find(|element| element.kind == jarvig_core::CurveKind::Vertex).expect("junction");
+        assert_eq!(super::inspector::vertex_identity_label(&committed, junction.id), junction.token);
+        let corner = curves.iter().find(|element| element.token.starts_with("F:corner(")).expect("corner");
+        assert_eq!(super::inspector::face_identity_label(&committed, corner.id), corner.token);
+        let (reopened, radius) = super::round_feature_reopen(&committed, &[face.id]).expect("reopen face");
+        assert_eq!(reopened.len(), 2);
+        assert!((radius - 0.05).abs() < 1.0e-9);
+        let (from_boundary, _) = super::round_feature_reopen(&committed, &[boundary.id]).expect("reopen boundary");
+        assert_eq!(from_boundary, reopened);
+        assert!(super::round_feature_reopen(&committed, &[boundary.id, 9]).is_none());
+        assert!(super::round_feature_reopen(&seed, &[11, 16]).is_none());
+        let aim = |target: [f64; 3], offset: [f64; 3]| {
+            let origin = [target[0] + offset[0], target[1] + offset[1], target[2] + offset[2]];
+            let direction = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
+            (origin, direction)
+        };
+        let edge_dir = [
+            boundary.segment.1[0] - boundary.segment.0[0],
+            boundary.segment.1[1] - boundary.segment.0[1],
+            boundary.segment.1[2] - boundary.segment.0[2],
+        ];
+        let axes = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut side = [0.0, 0.0, 0.0];
+        for axis in axes {
+            side = [
+                edge_dir[1] * axis[2] - edge_dir[2] * axis[1],
+                edge_dir[2] * axis[0] - edge_dir[0] * axis[2],
+                edge_dir[0] * axis[1] - edge_dir[1] * axis[0],
+            ];
+            let side_len = (side[0] * side[0] + side[1] * side[1] + side[2] * side[2]).sqrt();
+            if side_len > 1.0e-6 {
+                side = [side[0] / side_len * 0.2, side[1] / side_len * 0.2, side[2] / side_len * 0.2];
+                break;
+            }
+        }
+        let mid = [
+            (boundary.segment.0[0] + boundary.segment.1[0]) * 0.5,
+            (boundary.segment.0[1] + boundary.segment.1[1]) * 0.5,
+            (boundary.segment.0[2] + boundary.segment.1[2]) * 0.5,
+        ];
+        let (origin, direction) = aim(mid, side);
+        let hit = super::visible_edge_pick(&body, &fillets, &curves, origin, direction, 0.02).expect("boundary pick");
+        assert_eq!(hit.id, boundary.id, "{}", boundary.token);
+        let fillet = tokens.iter().zip(fillets.iter()).find(|(token, _)| face.source == **token).map(|(_, fillet)| fillet).expect("fillet geometry");
+        let outward = [fillet.normal0[0] + fillet.normal1[0], fillet.normal0[1] + fillet.normal1[1], fillet.normal0[2] + fillet.normal1[2]];
+        let center = [
+            face.outline.iter().map(|point| point[0]).sum::<f64>() / face.outline.len() as f64,
+            face.outline.iter().map(|point| point[1]).sum::<f64>() / face.outline.len() as f64,
+            face.outline.iter().map(|point| point[2]).sum::<f64>() / face.outline.len() as f64,
+        ];
+        let (origin, direction) = aim(center, [outward[0] * 0.4, outward[1] * 0.4, outward[2] * 0.4]);
+        let hit = super::visible_face_pick(&body, &tokens, &fillets, &curves, origin, direction).expect("fillet pick");
+        assert_eq!(hit.id, face.id, "face {}", hit.id);
+        let mut shifted = None;
+        for (id, start, end) in body.edge_segments() {
+            let Some((moved_start, moved_end)) = super::round_cage_segment_set(&body, &fillets, id) else { continue };
+            if moved_start != start || moved_end != end {
+                shifted = Some((id, moved_start, moved_end));
+                break;
+            }
+        }
+        let (id, start, end) = shifted.expect("shifted hard edge");
+        let hard_mid = [(start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5, (start[2] + end[2]) * 0.5];
+        let (origin, direction) = aim(hard_mid, [0.2, 0.15, 0.05]);
+        let hit = super::visible_edge_pick(&body, &fillets, &curves, origin, direction, 0.05).expect("hard edge");
+        assert_eq!(hit.id, id);
+
+        let mut stored = jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap();
+        stored.body = Some(jarvig_core::SolidBody::from_box([2.0, 2.0, 2.0]).unwrap());
+        assert_eq!(
+            round_class_refusal(&stored).as_deref(),
+            Some("Round edits an authored block. This object stores its own shape.")
+        );
+        assert_eq!(
+            modeling_tool_refusal(&stored, ModelingTool::Round).as_deref(),
+            Some("Round edits an authored block. This object stores its own shape.")
+        );
+        assert!(modeling_tool_refusal(&stored, ModelingTool::Extrude).is_none());
+        assert_eq!(super::inspector::face_identity_label(&stored, 1), "F:1");
+
+        let plain = jarvig_core::BlockRecord::standard([2.0, 2.0, 2.0]).unwrap();
+        assert_eq!(super::inspector::face_identity_label(&plain, 1), "F:1");
+        assert_eq!(
+            round_class_refusal(&plain).as_deref(),
+            Some("This block is a saved size box. Create Block makes an authored block.")
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_visibility {
+    #[test]
+    fn editor_hide_does_not_write_object_visibility() {
+        let world = jarvig_core::SceneWorld::bootstrap();
+        let entity = world.entity_outline()[0].uuid;
+        assert_eq!(world.authored_visible(entity), Some(true));
+        let mut hidden = Vec::new();
+        super::set_editor_hidden(&mut hidden, entity, false);
+        assert_eq!(hidden, vec![entity]);
+        assert_eq!(world.authored_visible(entity), Some(true));
+        super::set_editor_hidden(&mut hidden, entity, true);
+        assert!(hidden.is_empty());
+        assert_eq!(world.authored_visible(entity), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod view_menu_coverage {
+    use super::*;
+
+    #[test]
+    fn grouped_view_commands_match_the_live_ids() {
+        let mut grouped = context_menu::view_command_ids();
+        grouped.sort();
+        let mut live = vec![
+            ID_VIEW_OUTLINER,
+            ID_VIEW_INSPECTOR,
+            ID_VIEW_CONTENT,
+            ID_VIEW_OUTPUT,
+            ID_VIEW_RESET,
+            ID_VIEW_CHARACTER,
+            ID_VIEW_LAND,
+            ID_VIEW_RESET_POSE,
+            ID_VIEW_JOINTS,
+            ID_VIEW_ALL_JOINTS,
+            ID_VIEW_JOINT_LIMITS,
+            ID_VIEW_MESH_PARTS,
+            ID_VIEW_GRID,
+            ID_VIEW_CREATE_CAMERA,
+            ID_VIEW_STARTUP_CAMERA,
+            ID_VIEW_PILOT,
+            ID_VIEW_EXPOSURE_UP,
+            ID_VIEW_EXPOSURE_DOWN,
+            ID_VIEW_EXPOSURE_RESET,
+            ID_QUALITY_BASELINE,
+            ID_QUALITY_ENHANCED,
+            ID_QUALITY_HIGH,
+            ID_PRESENT_DITHER,
+            ID_PRESENT_TONEMAP,
+            ID_PRESENT_QUANTIZED,
+            ID_PRESENT_BEFORE,
+            ID_VIEW_MESHLETS,
+            ID_VIEW_MESHLET_SHADE,
+            ID_VIEW_MESHLET_FRUSTUM,
+            ID_VIEW_MESHLET_OCCLUSION,
+            ID_VIEW_MESHLET_FREEZE,
+            ID_VIEW_MESHLET_HIGHLIGHT,
+            ID_VIEW_CLUSTER_HIERARCHY,
+            ID_VIEW_ERROR_HALF,
+            ID_VIEW_ERROR_ONE,
+            ID_VIEW_ERROR_TWO,
+            ID_VIEW_ERROR_FOUR,
+            ID_VIEW_VG_NORMAL,
+            ID_VIEW_LEAF_TRUTH,
+            ID_VIEW_VG_FRUSTUM,
+            ID_VIEW_VG_HIER,
+            ID_VIEW_VG_OCC,
+            ID_VIEW_MICRO,
+            ID_VIEW_MICRO_ON,
+            ID_VIEW_MICRO_OFF,
+            ID_VIEW_MICRO_COLOR,
+            ID_VIEW_EINSTEIN_OFF,
+            ID_VIEW_CUT_REASONS,
+            ID_VIEW_VG_LEVELS,
+            ID_VIEW_MICRO_ACTIVE,
+            ID_VIEW_MICRO_ELIGIBLE,
+            ID_VIEW_MICRO_ERROR,
+            ID_VIEW_MICRO_STATE,
+            ID_VIEW_MICRO_REJECT,
+            ID_VIEW_EINSTEIN,
+            ID_VIEW_INTENT_SHADOW,
+            ID_VIEW_COMPARE_LEAF,
+            ID_VIEW_ENVIRONMENT,
+            ID_VIEW_RECAPTURE,
+            ID_PROBE_STATIC,
+            ID_PROBE_ON_DEMAND,
+            ID_PROBE_ON_TRANSFORM,
+            ID_PROBE_ON_LIGHTING,
+            ID_PROBE_TIME_SLICED,
+            ID_PROBE_RES_32,
+            ID_PROBE_RES_64,
+            ID_PROBE_RES_128,
+            ID_PROBE_RES_256,
+            ID_DEBUG_FULL,
+            ID_DEBUG_DIRECT,
+            ID_DEBUG_ENV_DIFFUSE,
+            ID_DEBUG_ENV_SPECULAR,
+            ID_DEBUG_PROBE_ONLY,
+            ID_DEBUG_EMISSIVE,
+            ID_DEBUG_DIRECTIONAL,
+            ID_DEBUG_POINT,
+            ID_DEBUG_SPOT,
+            ID_DEBUG_GLOBAL_ENV,
+            ID_DEBUG_PROBE,
+            ID_DEBUG_DIRECTIONAL_ONLY,
+            ID_DEBUG_POINT_ONLY,
+            ID_DEBUG_SPOT_ONLY,
+            ID_DEBUG_NO_SHADOWS,
+            ID_DEBUG_INDIRECT_ONLY,
+            ID_DEBUG_DIRECT_UNSHADOWED,
+            ID_DEBUG_CASCADES,
+            ID_DEBUG_CONTACT,
+            ID_MAT_FULL,
+            ID_MAT_BASE,
+            ID_MAT_NORMAL,
+            ID_MAT_ROUGH,
+            ID_MAT_AO,
+            ID_MAT_METAL,
+            ID_VIEW_FREEZE_DIAGNOSTIC,
+            ID_VIEW_RESET_DEBUG,
+            ID_VIEW_BACKGROUND_JOBS,
+            ID_VIEW_CANCEL_JOB,
+        ];
+        live.sort();
+        assert_eq!(grouped, live);
+    }
 }

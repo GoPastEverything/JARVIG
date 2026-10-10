@@ -60,10 +60,11 @@ One owner at a time.
 | Ctrl+LMB | Toggle. Ctrl wins over Shift. |
 | LMB on empty view | Clear. |
 | Shift or Ctrl on empty view | No change. |
-| Select-mode drag on empty view | Marquee. Left to right selects objects fully enclosed. Right to left selects objects the rectangle touches. Shift adds. Ctrl toggles. The result is whole objects. |
+| Select-mode drag on empty view | Marquee. Left to right selects objects fully enclosed. Right to left selects objects the rectangle touches. Shift adds. Ctrl toggles. In Auto and Object the result is whole objects. In Face, Edge, and Vertex the same drag selects authored elements of the primary solid. |
+| RMB click under four pixels | Opens the command menu for the mode. It does not select. A right-drag past four pixels is still look. |
 | RMB look, MMB pan, Alt+LMB orbit | No selection change. Escape does one action and still consumes the key. |
 
-Auto, Object, Face, Edge, and Vertex are a Selection section on a parametric solid. They are not toolbar buttons. Edge selects one edge. Vertex selects one vertex. ADR-0069. A movement of four pixels or less is still the click in the first rows. The marquee does not hide or recenter the cursor. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. The hit is the projected box of the object. ADR-0068.
+Auto, Object, Face, Edge, and Vertex are a Selection section on a parametric solid. They are not toolbar buttons. Edge selects one edge. Vertex selects one vertex. ADR-0069. On an authored block the hit is semantic. A point in a fillet strip selects `F:fillet(...)`. A point in a corner shadow selects `F:corner(...)`. The flat interior stays the planar face. The short segments used to draw an arc are not selectable edges. A movement of four pixels or less is still the click in the first rows. The marquee does not hide or recenter the cursor. World Settings and hidden Land actors are skipped. A terrain chunk selects the terrain actor once. The hit is the projected box of the object. Face, Edge, and Vertex use the projected vertices of that solid's display body instead. ADR-0068.
 
 While a transform handle is under the cursor, the gizmo takes the press and the scene behind it is not picked. An active camera capture does not pick. A plain click does not bump the world revision. It bumps the selection revision only when the ordered selection changes.
 

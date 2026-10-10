@@ -62,11 +62,11 @@ With the viewport focused and the mouse not captured, `1` selects, `2` moves, an
 
 ## Build a room
 
-This is a graybox. It uses blocks, which are parametric solids. The level stores the size of each solid. The triangles are rebuilt from that record.
+This is a graybox. **Create > Block** places an authored block: a 2 m cube, one seed, and no stored body. The mesh is rebuilt from that tape.
 
 1. Stay on a Blank project, in Level.
-2. Choose **Create > Block**, or the Block button on the toolbar. The first solid is a 2 m cube at scene-local (0, 1, −4). Another block steps 2.5 m along +X.
-3. Click a face. **Extrude** appears on the toolbar. Click it, pull the arrow, then **Apply**. A typed amount in the inspector is exact. A drag steps by 0.05 m.
+2. Choose **Create > Block**, or the Block button on the toolbar. The first solid is a 2 m cube at scene-local (0, 1, −4). **Create > Plane** is a stored sheet, 2 m by 2 m and 0.05 m thick. Another solid steps 2.5 m along +X.
+3. Click a face. **Extrude** appears on the toolbar. Click it, pull the arrow, and release. The face you pulled keeps its name. To curve an edge, switch Select to Edge, click the edge, click **Round**, drag the radius handle, and **Apply**. Extrude a flat face afterward and the curve stays. Extrude on the curved face itself is refused, and the shape stays.
 4. Double-click the solid to select the whole object. **Edit > Duplicate** (Ctrl+D) makes another. Press `2` and drag the move gizmo.
 5. Repeat until you have a floor and four walls. **File > Save**.
 

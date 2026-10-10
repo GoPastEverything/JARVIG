@@ -16,8 +16,8 @@ Each button is an icon with a short caption. The active mesh tool is a darker ti
 | Move | Translate gizmo. Red X, green Y, blue Z. |
 | Rotate | Rotation rings. The stored value is a quaternion. |
 | Scale | Drawn and disabled. A spatial frame has no scale. |
-| Block | Places one parametric solid. It does not stay selected as a mode. |
-| Extrude, Inset, Bevel | Shown while a solid is selected, outside Play, Land, and Character. One modeling session. |
+| Block | Places one authored block. It does not stay selected as a mode. |
+| Extrude, Inset, Bevel, Round, Subdiv, Edge, Extend, Split, Vertex | Shown while a solid is selected, outside Play, Land, and Character. |
 | Level, Land, Character | Three views of the work you have open. |
 | Play, Pause, Stop | The in-editor session. |
 | Focus | Frames the current selection. Same as F. |
@@ -39,7 +39,7 @@ The editor has one selection. The outliner, the viewport, and the inspector read
 | Ctrl+click | Toggles. If both modifiers are held, Ctrl wins. |
 | Drag on empty space in Select | Marquee. Left to right selects objects fully inside the rectangle. Right to left selects objects the rectangle touches. Four pixels or less stays a click. |
 
-A whole solid draws a light-blue outline of its analytic box. A face draws that face. The box outline stays off while a modeling session is open. An imported mesh can be selected. It does not get that solid outline in this build. A marquee tests the projected box, so a thin mesh can be selected when the rectangle misses the triangles and still touches the box.
+On an authored block, a click in the fillet strip selects that fillet, and a click in the corner shadow selects that corner. The flat middle of a face stays that face. A whole solid draws a light-blue outline of its analytic box. A planar face draws that face. A selected fillet draws the radius-wide surface. The box outline stays off while a modeling session is open. An imported mesh can be selected. It does not get that solid outline in this build. A marquee tests the projected box, so a thin mesh can be selected when the rectangle misses the triangles and still touches the box.
 
 Right mouse, middle mouse, and orbit do not change the selection. Viewport picking hits meshes. Lights and probes are selected from the outliner.
 

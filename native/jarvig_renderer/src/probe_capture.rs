@@ -786,6 +786,7 @@ impl Renderer {
         let layout = self.camera_layout.ok_or(RenderError::Rhi(jarvig_rhi::RhiError::InvalidResource("camera layout")))?;
         let mut objects = Vec::new();
         for instance in snapshot.instances().iter().filter(|instance| instance.visible) {
+            self.frame_draws.push(super::FrameMeshDraw { pass: "probe", view: None, mesh: instance.mesh });
             let mesh = meshes.get(instance.mesh).ok_or(RenderError::Mesh(jarvig_core::MeshError::Empty))?;
             for (submesh_index, submesh) in mesh.submeshes().iter().enumerate() {
                 let Some(material_id) = instance.material_for_slot(submesh.material_slot) else { continue };

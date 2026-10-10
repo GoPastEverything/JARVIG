@@ -399,6 +399,11 @@ struct RenderView {
     camera: Camera,
     /// When set, this pose is the view origin. The snapshot camera is not written.
     pose_override: Option<ResolvedPose>,
+    /// Color-pass mesh for one entity. Empty on every product view.
+    /// Shadows and the contact prepass keep the snapshot instance mesh.
+    mesh_override: Option<(EntityId, MeshId)>,
+    /// Exact pixel viewport. `None` uses [`NormalizedRect`] and is the product path.
+    pixel_override: Option<PixelRect>,
     layout: NormalizedRect,
     settings: RenderViewSettings,
     depth: Option<TextureId>,
@@ -502,6 +507,8 @@ pub struct Renderer {
     gpu_textures: Vec<ResidentTexture>,
     gpu_samplers: Vec<(SamplerState, jarvig_rhi::SamplerId)>,
     gpu_meshes: Vec<(MeshId, GpuResidency)>,
+    /// Cleared at the start of each encoded frame. Color, shadow, contact, and probe draws.
+    frame_draws: Vec<FrameMeshDraw>,
     mesh_uploads: u32,
     material_pipelines: u32,
     material_parameter_uploads: u32,
@@ -953,6 +960,28 @@ struct GpuMesh {
     indices: BufferId,
     index_format: IndexFormat,
     submeshes: Vec<GpuSubmesh>,
+    /// Vertex buffer bytes plus index buffer bytes. This is the size passed to the device.
+    bytes: u64,
+    /// `BufferDesc.size` of the vertex `create_buffer` call.
+    vertex_create_bytes: u64,
+    /// `BufferDesc.size` of the index `create_buffer` call.
+    index_create_bytes: u64,
+}
+
+/// One mesh a pass drew on the last encoded frame. Instrumentation. Not a second renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMeshDraw {
+    pub pass: &'static str,
+    pub view: Option<RenderViewId>,
+    pub mesh: MeshId,
+}
+
+/// Device sizes recorded beside [`resident_mesh_bytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshUploadRecord {
+    pub vertex_create_bytes: u64,
+    pub index_create_bytes: u64,
+    pub gpu_bytes: u64,
 }
 
 struct GpuSubmesh {
@@ -1601,6 +1630,7 @@ impl Renderer {
             gpu_textures: Vec::new(),
             gpu_samplers: Vec::new(),
             gpu_meshes: Vec::new(),
+            frame_draws: Vec::new(),
             mesh_uploads: 0,
             material_pipelines: 0,
             material_parameter_uploads: 0,
@@ -2877,6 +2907,29 @@ impl Renderer {
         self.device.flush().map_err(RenderError::Rhi)
     }
 
+    /// Bytes of the resident vertex and index buffers for one logical mesh.
+    /// `None` when that mesh has not been uploaded or has been evicted.
+    pub fn resident_mesh_bytes(&self, mesh: MeshId) -> Option<u64> {
+        self.mesh_upload_record(mesh).map(|record| record.gpu_bytes)
+    }
+
+    /// Vertex and index sizes passed to `create_buffer`, plus their sum stored on the resident mesh.
+    pub fn mesh_upload_record(&self, mesh: MeshId) -> Option<MeshUploadRecord> {
+        self.gpu_meshes.iter().find_map(|(id, slot)| match slot {
+            GpuResidency::Resident(gpu) if *id == mesh => Some(MeshUploadRecord {
+                vertex_create_bytes: gpu.vertex_create_bytes,
+                index_create_bytes: gpu.index_create_bytes,
+                gpu_bytes: gpu.bytes,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Meshes drawn by the last encoded frame, in pass order. Empty before the first present.
+    pub fn frame_mesh_draws(&self) -> &[FrameMeshDraw] {
+        &self.frame_draws
+    }
+
     pub fn evict_gpu_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
         let taken = {
             let Some(slot) = self.gpu_meshes.iter_mut().find(|(id, _)| *id == mesh) else {
@@ -3058,11 +3111,11 @@ impl Renderer {
     }
 
     pub fn viewport(&self, view: RenderViewId) -> Result<Option<PixelRect>, RenderError> {
-        let layout = self.slot(view)?.layout;
         if self.width == 0 || self.height == 0 {
             return Ok(None);
         }
-        Ok(Some(pixel_rect(layout, self.width, self.height)?))
+        let view = self.slot(view)?;
+        Ok(Some(resolved_rect(view, self.width, self.height)?))
     }
 
     pub fn view_count(&self) -> usize {
@@ -3183,6 +3236,8 @@ impl Renderer {
             target: desc.target,
             camera: desc.camera,
             pose_override: None,
+            mesh_override: None,
+            pixel_override: None,
             layout: desc.layout,
             settings: desc.settings,
             depth: None,
@@ -3243,6 +3298,23 @@ impl Renderer {
     /// The pose last supplied for this view. `None` means prepare still reads the snapshot camera.
     pub fn view_pose(&self, id: RenderViewId) -> Result<Option<ResolvedPose>, RenderError> {
         Ok(self.slot(id)?.pose_override)
+    }
+
+    /// Draw `mesh` for `entity` in this view's color pass. `None` clears the override.
+    /// The snapshot instance mesh stays the product path, including shadows and contact.
+    pub fn set_view_mesh_override(&mut self, id: RenderViewId, entity: EntityId, mesh: Option<MeshId>) -> Result<(), RenderError> {
+        self.slot_mut(id)?.mesh_override = mesh.map(|mesh| (entity, mesh));
+        Ok(())
+    }
+
+    /// Pin this view to an exact pixel rectangle. `None` restores normalized layout.
+    /// A rectangle outside the framebuffer is refused and the previous override stays.
+    pub fn set_view_pixel_rect(&mut self, id: RenderViewId, rect: Option<PixelRect>) -> Result<(), RenderError> {
+        if let Some(rect) = rect {
+            checked_pixel_override(rect, self.width, self.height)?;
+        }
+        self.slot_mut(id)?.pixel_override = rect;
+        Ok(())
     }
 
     pub fn destroy_view(&mut self, id: RenderViewId) -> Result<(), RenderError> {
@@ -3622,6 +3694,7 @@ impl Renderer {
         materials: &MaterialLibrary,
         textures: &TextureLibrary,
     ) -> Result<(), RenderError> {
+        self.frame_draws.clear();
         self.ensure_draw_resources(snapshot, meshes)?;
         self.ensure_camera_layout()?;
         self.ensure_light_layout()?;
@@ -3632,7 +3705,7 @@ impl Renderer {
         for id in &ids_for_shadows {
             let (frame, fov, near, aspect) = {
                 let view = self.slot(*id)?;
-                let rect = pixel_rect(view.layout, self.width, self.height)?;
+                let rect = resolved_rect(view, self.width, self.height)?;
                 (view.camera.frame, view.camera.vertical_fov_radians, view.camera.near_m, rect.width as f32 / rect.height.max(1) as f32)
             };
             let pose = if let Some(pose) = self.slot(*id)?.pose_override {
@@ -4201,8 +4274,8 @@ impl Renderer {
         textures: &TextureLibrary,
     ) -> Result<Prepared, RenderError> {
         let rect = {
-            let layout = self.slot(id)?.layout;
-            pixel_rect(layout, self.width, self.height)?
+            let view = self.slot(id)?;
+            resolved_rect(view, self.width, self.height)?
         };
         let aspect = rect.width as f32 / rect.height as f32;
         let (frame, fov, near) = {
@@ -4219,6 +4292,10 @@ impl Renderer {
         let mut light_group = None;
         let hidden = self.entity_hidden.clone();
         let grid_meshes = self.terrain_grid_meshes.clone();
+        let mesh_override = self.slot(id)?.mesh_override;
+        if let Some((_, mesh)) = mesh_override {
+            self.ensure_gpu_mesh(mesh, meshes)?;
+        }
         for instance in snapshot.instances().iter().filter(|instance| instance.visible && !hidden.contains(&instance.entity)) {
             let packet = instance_gpu_transforms(instance, &pose, fov, near, aspect).map_err(RenderError::Space)?;
             self.write_binding(id, instance.id, &packet.to_bytes())?;
@@ -4231,7 +4308,11 @@ impl Renderer {
             if grid_meshes.contains(&instance.mesh) {
                 terrain_grid.push(TerrainGridDraw { mesh: instance.mesh, transform });
             }
-            let mesh = meshes.get(instance.mesh).ok_or(RenderError::Mesh(MeshError::Empty))?;
+            let draw_mesh = match mesh_override {
+                Some((entity, mesh)) if entity == instance.entity => mesh,
+                _ => instance.mesh,
+            };
+            let mesh = meshes.get(draw_mesh).ok_or(RenderError::Mesh(MeshError::Empty))?;
             for (submesh_index, submesh) in mesh.submeshes().iter().enumerate() {
                 let Some(material_id) = instance.material_for_slot(submesh.material_slot) else {
                     self.unbound_material_skips = self.unbound_material_skips.saturating_add(1);
@@ -4256,8 +4337,9 @@ impl Renderer {
                 } else {
                     None
                 };
+                self.frame_draws.push(FrameMeshDraw { pass: "color", view: Some(id), mesh: draw_mesh });
                 draws.push(PreparedDraw {
-                    mesh: instance.mesh,
+                    mesh: draw_mesh,
                     submesh: submesh_index,
                     transform,
                     material,
@@ -4645,10 +4727,12 @@ impl Renderer {
 
     fn upload_mesh(&mut self, mesh: &Mesh, label: &str) -> Result<GpuMesh, RenderError> {
         let stream = mesh.streams().first().ok_or(RenderError::Mesh(MeshError::Empty))?;
+        let vertex_create_bytes = stream.bytes.len() as u64;
+        let index_create_bytes = mesh.index_bytes().len() as u64;
         let vertices = self
             .device
             .create_buffer(&BufferDesc {
-                size: stream.bytes.len() as u64,
+                size: vertex_create_bytes,
                 usage: BufferUsage::Vertex,
                 label: Some(format!("{label}.Vertices")),
                 contents: Some(stream.bytes.clone()),
@@ -4657,12 +4741,13 @@ impl Renderer {
         let indices = self
             .device
             .create_buffer(&BufferDesc {
-                size: mesh.index_bytes().len() as u64,
+                size: index_create_bytes,
                 usage: BufferUsage::Index,
                 label: Some(format!("{label}.Indices")),
                 contents: Some(mesh.index_bytes().to_vec()),
             })
             .map_err(RenderError::Rhi)?;
+        let bytes = vertex_create_bytes + index_create_bytes;
         Ok(GpuMesh {
             vertices,
             indices,
@@ -4679,6 +4764,9 @@ impl Renderer {
                     base_vertex: submesh.base_vertex,
                 })
                 .collect(),
+            bytes,
+            vertex_create_bytes,
+            index_create_bytes,
         })
     }
 
@@ -4702,6 +4790,7 @@ impl Renderer {
             let mesh = meshes.get(instance.mesh).ok_or(RenderError::Mesh(MeshError::Empty))?;
             let stream = mesh.streams().first().ok_or(RenderError::Mesh(MeshError::Empty))?;
             let pipeline = self.ensure_contact_pipeline(u64::from(stream.stride))?;
+            self.frame_draws.push(FrameMeshDraw { pass: "contact", view: Some(pass.id), mesh: instance.mesh });
             prepared.push((instance.mesh, pipeline, group));
         }
         let clear = !*cleared;
@@ -6138,6 +6227,20 @@ fn u32_bytes(values: &[u32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn resolved_rect(view: &RenderView, width: u32, height: u32) -> Result<PixelRect, RenderError> {
+    if let Some(rect) = view.pixel_override {
+        return checked_pixel_override(rect, width, height);
+    }
+    pixel_rect(view.layout, width, height)
+}
+
+fn checked_pixel_override(rect: PixelRect, width: u32, height: u32) -> Result<PixelRect, RenderError> {
+    if width == 0 || height == 0 || rect.width == 0 || rect.height == 0 || rect.x.saturating_add(rect.width) > width || rect.y.saturating_add(rect.height) > height {
+        return Err(RenderError::Rhi(RhiError::Validation("pixel viewport is outside the target".into())));
+    }
+    Ok(rect)
 }
 
 fn pixel_rect(layout: NormalizedRect, width: u32, height: u32) -> Result<PixelRect, RenderError> {

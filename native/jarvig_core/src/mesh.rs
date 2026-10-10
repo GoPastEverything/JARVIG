@@ -736,6 +736,30 @@ pub fn block_surface_mesh(size_m: [f32; 3], inset_m: [f32; 6], bevel_m: f32) -> 
     mesh_from_faces(&flat)
 }
 
+/// Triangles of an authored body, grouped into one submesh per material slot.
+///
+/// Slot 0 is first. An empty slot is omitted. `first_index` counts indices. The triangle count
+/// matches [`mesh_from_body`]. Callers that have no painted face keep using that function.
+pub(crate) fn mesh_from_body_slots(body: &crate::topology::SolidBody, slot_of: impl Fn(u32) -> u32) -> Mesh {
+    let mut faces = Vec::new();
+    let mut slots = Vec::new();
+    for face in &body.faces {
+        let Some(positions) = body.face_positions(face.id) else { continue };
+        if positions.len() < 3 {
+            continue;
+        }
+        let hint = body.unit_normal(face.id).unwrap_or([0.0, 1.0, 0.0]);
+        faces.push(SolidFace {
+            verts: positions.iter().map(|position| [position[0] as f32, position[1] as f32, position[2] as f32]).collect(),
+            hint: [hint[0] as f32, hint[1] as f32, hint[2] as f32],
+        });
+        slots.push(slot_of(face.id));
+    }
+    let size = body.aabb_size();
+    let tagged = faces.iter().zip(slots.iter().copied()).collect::<Vec<_>>();
+    mesh_from_tagged(&tagged, [size[0] as f32, size[1] as f32, size[2] as f32])
+}
+
 /// Triangles of an authored topological body. An empty loop uses the body's own box, not a 1 m cube.
 pub fn mesh_from_body(body: &crate::topology::SolidBody) -> Mesh {
     let faces = body
@@ -949,44 +973,69 @@ fn mesh_from_faces(faces: &[SolidFace]) -> Mesh {
 }
 
 fn mesh_from_loops(faces: &[SolidFace], fallback_size: [f32; 3]) -> Mesh {
+    let tagged = faces.iter().map(|face| (face, 0u32)).collect::<Vec<_>>();
+    mesh_from_tagged(&tagged, fallback_size)
+}
+
+fn mesh_from_tagged(faces: &[(&SolidFace, u32)], fallback_size: [f32; 3]) -> Mesh {
+    let mut order = Vec::new();
+    for (_, slot) in faces {
+        if !order.contains(slot) {
+            order.push(*slot);
+        }
+    }
+    order.sort_unstable();
     let mut bytes = Vec::new();
     let mut indices = Vec::new();
+    let mut submeshes = Vec::new();
     let color = [1.0_f32, 1.0, 1.0];
-    for face in faces {
-        let hint = normalize3(face.hint).unwrap_or([0.0, 1.0, 0.0]);
-        if face.verts.len() < 3 {
-            continue;
-        }
-        for index in 1..face.verts.len() - 1 {
-            let next_base = bytes.len() / 60;
-            if next_base > usize::from(u16::MAX) - 3 {
-                break;
-            }
-            let mut tri = [face.verts[0], face.verts[index], face.verts[index + 1]];
-            let mut normal = face_normal(tri[0], tri[1], tri[2]);
-            if dot3(normal, hint) < 0.0 {
-                tri.swap(1, 2);
-                normal = [-normal[0], -normal[1], -normal[2]];
-            }
-            if dot3(normal, normal) < 1.0e-10 {
+    for slot in order {
+        let first_index = (indices.len() / 2) as u32;
+        for (face, face_slot) in faces {
+            if *face_slot != slot || face.verts.len() < 3 {
                 continue;
             }
-            let edge = sub3(tri[1], tri[0]);
-            let tangent = normalize_tangent(edge, normal);
-            let base = next_base as u16;
-            for (corner, position) in tri.iter().enumerate() {
-                let uv = [[0.0_f32, 0.0], [1.0, 0.0], [0.0, 1.0]][corner];
-                push_vertex(&mut bytes, *position, color, uv, normal, tangent);
+            let hint = normalize3(face.hint).unwrap_or([0.0, 1.0, 0.0]);
+            for index in 1..face.verts.len() - 1 {
+                let next_base = bytes.len() / 60;
+                if next_base > usize::from(u16::MAX) - 3 {
+                    break;
+                }
+                let mut tri = [face.verts[0], face.verts[index], face.verts[index + 1]];
+                let mut normal = face_normal(tri[0], tri[1], tri[2]);
+                if dot3(normal, hint) < 0.0 {
+                    tri.swap(1, 2);
+                    normal = [-normal[0], -normal[1], -normal[2]];
+                }
+                if dot3(normal, normal) < 1.0e-10 {
+                    continue;
+                }
+                let edge = sub3(tri[1], tri[0]);
+                let tangent = normalize_tangent(edge, normal);
+                let base = next_base as u16;
+                for (corner, position) in tri.iter().enumerate() {
+                    let uv = [[0.0_f32, 0.0], [1.0, 0.0], [0.0, 1.0]][corner];
+                    push_vertex(&mut bytes, *position, color, uv, normal, tangent);
+                }
+                for index_slot in [base, base + 1, base + 2] {
+                    indices.extend_from_slice(&index_slot.to_le_bytes());
+                }
             }
-            for slot in [base, base + 1, base + 2] {
-                indices.extend_from_slice(&slot.to_le_bytes());
-            }
+        }
+        let index_count = (indices.len() / 2) as u32 - first_index;
+        if index_count > 0 {
+            submeshes.push(SubmeshDesc {
+                first_index,
+                index_count,
+                base_vertex: 0,
+                topology: MeshTopology::TriangleList,
+                material_slot: slot,
+            });
         }
     }
     if indices.is_empty() {
         return box_mesh(fallback_size);
     }
-    let index_count = (indices.len() / 2) as u32;
     create_mesh(MeshDesc {
         streams: vec![VertexStreamDesc {
             stride: 60,
@@ -1001,13 +1050,7 @@ fn mesh_from_loops(faces: &[SolidFace], fallback_size: [f32; 3]) -> Mesh {
         }],
         index_format: MeshIndexFormat::Uint16,
         index_bytes: indices,
-        submeshes: vec![SubmeshDesc {
-            first_index: 0,
-            index_count,
-            base_vertex: 0,
-            topology: MeshTopology::TriangleList,
-            material_slot: 0,
-        }],
+        submeshes,
     })
     .expect("block surface")
 }

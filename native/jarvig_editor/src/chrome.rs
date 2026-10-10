@@ -205,6 +205,7 @@ pub enum ToolbarCommand {
     Extrude,
     Inset,
     Bevel,
+    Round,
     Subdivide,
     MoveEdge,
     ExtrudeEdge,
@@ -247,7 +248,7 @@ impl ToolbarCommand {
     pub fn is_modeling(self) -> bool {
         matches!(
             self,
-            Self::Extrude | Self::Inset | Self::Bevel | Self::Subdivide | Self::MoveEdge | Self::ExtrudeEdge | Self::SplitEdge | Self::MoveVertex
+            Self::Extrude | Self::Inset | Self::Bevel | Self::Round | Self::Subdivide | Self::MoveEdge | Self::ExtrudeEdge | Self::SplitEdge | Self::MoveVertex
         )
     }
 
@@ -262,6 +263,7 @@ impl ToolbarCommand {
             Self::Extrude => "Extrude",
             Self::Inset => "Inset",
             Self::Bevel => "Bevel",
+            Self::Round => "Round",
             Self::Subdivide => "Subdivide",
             Self::MoveEdge => "Move Edge",
             Self::ExtrudeEdge => "Extrude Edge",
@@ -295,6 +297,7 @@ impl ToolbarCommand {
             Self::Extrude => "Extrude",
             Self::Inset => "Inset",
             Self::Bevel => "Bevel",
+            Self::Round => "Round",
             Self::Subdivide => "Subdiv",
             Self::MoveEdge => "Edge",
             Self::ExtrudeEdge => "Extend",
@@ -397,6 +400,7 @@ impl Toolbar {
         mode: WorkspaceMode,
         show_modeling: bool,
         modeling: Option<ToolbarCommand>,
+        unavailable: &[ToolbarCommand],
     ) {
         unsafe {
             let rect = RECT { left: 0, top: 0, right: width, bottom: height };
@@ -410,7 +414,7 @@ impl Toolbar {
         }
         for slot in self.slots(dpi, show_modeling) {
             let button = &self.buttons[slot.index];
-            let disabled = button.command == ToolbarCommand::Scale;
+            let disabled = button.command == ToolbarCommand::Scale || unavailable.contains(&button.command);
             let on = !disabled
                 && ((button.command.is_object_tool() && button.command == active)
                     || (button.command == ToolbarCommand::Local && local_space)
@@ -490,7 +494,9 @@ impl Toolbar {
     }
 
     /// One inspector shelf button. Tiles put the toolbar icon over the caption.
-    pub fn paint_shelf(&self, hdc: HDC, rect: RECT, caption: &str, font: HFONT, icon: Option<ToolbarCommand>, on: bool, pressed: bool, kind: ShelfPaint) {
+    pub fn paint_shelf(&self, hdc: HDC, rect: RECT, caption: &str, font: HFONT, icon: Option<ToolbarCommand>, on: bool, pressed: bool, kind: ShelfPaint, dimmed: bool) {
+        let on = on && !dimmed;
+        let pressed = pressed && !dimmed;
         let background = if on { BUTTON_ON } else if pressed { BUTTON_HOT } else { BUTTON };
         let fill = if on {
             brush(brushes().button_on)
@@ -513,7 +519,7 @@ impl Toolbar {
                 SelectObject(hdc, font);
             }
             SetBkMode(hdc, 1);
-            SetTextColor(hdc, if on { TEXT } else { TEXT_DIM });
+            SetTextColor(hdc, if dimmed { rgb(96, 96, 96) } else if on { TEXT } else { TEXT_DIM });
         }
         if kind == ShelfPaint::Tile {
             if let Some(command) = icon {
@@ -521,7 +527,7 @@ impl Toolbar {
                     let size = ((rect.bottom - rect.top) - 22).clamp(16, 26);
                     let x = rect.left + ((rect.right - rect.left) - size).max(0) / 2;
                     let y = rect.top + 4;
-                    let tone = if on { IconTone::Active } else { IconTone::Muted };
+                    let tone = if dimmed { IconTone::Dim } else if on { IconTone::Active } else { IconTone::Muted };
                     blit_icon(hdc, icon, x, y, size, background, tone);
                 }
             }
@@ -628,6 +634,7 @@ const BUTTONS: &[(ToolbarCommand, &str, bool)] = &[
     (ToolbarCommand::Extrude, "extrude.png", true),
     (ToolbarCommand::Inset, "inset.png", false),
     (ToolbarCommand::Bevel, "bevel.png", false),
+    (ToolbarCommand::Round, "round.png", false),
     (ToolbarCommand::Subdivide, "subdivide.png", false),
     (ToolbarCommand::MoveEdge, "move_edge.png", false),
     (ToolbarCommand::ExtrudeEdge, "extrude_edge.png", false),
@@ -1027,7 +1034,9 @@ mod tests {
         }
         let slots = toolbar.slots(96, true);
         assert_eq!(slots.len(), BUTTONS.len());
-        assert_eq!(toolbar.slots(96, false).len(), BUTTONS.len() - 8);
+        assert!(ToolbarCommand::Round.is_modeling());
+        assert_eq!(ToolbarCommand::Round.caption(), "Round");
+        assert_eq!(toolbar.slots(96, false).len(), BUTTONS.len() - 9);
         for slot in &slots {
             assert!(slot.height > slot.icon, "caption band");
             assert!(slot.width >= slot.icon);

@@ -323,6 +323,7 @@ impl Editor {
             self.append(&format!("New level was written but did not become the world: {error}"));
         } else {
             self.restore_workspace();
+            self.seal_folder_expansion();
             self.append("Empty level. World Settings only. The ground grid and axis triad are editor reference: +X right, +Y up, −Z forward, 1 m. They are not saved and they do not draw in Play.");
         }
     }
@@ -515,6 +516,7 @@ impl Editor {
             Ok(document) => match self.adopt_level(document, Some(path.to_path_buf())) {
                 Ok(()) => {
                     self.restore_workspace();
+                    self.seal_folder_expansion();
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -547,9 +549,14 @@ impl Editor {
             self.report("Restoring editor workspace", "The saved mode, or the template when no workspace file exists.", None);
             self.pump_loading();
             let templated_land = self.apply_saved_template();
-            if !self.restore_workspace() && templated_land {
-                self.append(Self::workspace_line(super::chrome::WorkspaceMode::Land));
+            let restored = self.restore_workspace();
+            if !restored {
+                self.folder_expansion.clear();
+                if templated_land {
+                    self.append(Self::workspace_line(super::chrome::WorkspaceMode::Land));
+                }
             }
+            self.seal_folder_expansion();
             self.remember_project(path);
             self.report("Scanning asset registry", "Queued. The content browser fills when the scan finishes.", None);
             self.pump_loading();
@@ -602,6 +609,10 @@ impl Editor {
         self.marquee = None;
         self.selected_face = None;
         self.history.clear();
+        self.editor_hidden.clear();
+        self.folder_expansion_ready = false;
+        self.folder_expansion_applied = false;
+        self.outliner.reset_folder_expansion();
         self.refresh_edit_menu();
         self.last_autosave = Instant::now();
         if let Some(controller) = self.editor_camera.as_mut() {
@@ -619,9 +630,29 @@ impl Editor {
             self.remember_level(&path);
         }
         self.append(&format!("Level {} is the authored world. The editor camera was not loaded from the level.", self.level_name));
+        self.append_intent_experiment_report(&document);
         self.sync_spawn_preview();
         self.refresh_title();
         Ok(())
+    }
+
+    /// One report per parametric solid when the experiment switch is on. The file's body key
+    /// is the parsed document. The live world is the realization.
+    fn append_intent_experiment_report(&mut self, document: &LevelDocument) {
+        if !self.engine.intent_authority_experiment() {
+            return;
+        }
+        for entity in &document.entities {
+            let file_body = entity.components.iter().find_map(|component| match component {
+                jarvig_core::ComponentRecord::ParametricBlock(block) => Some(block.body.is_some()),
+                _ => None,
+            });
+            let Some(file_body) = file_body else { continue };
+            let Some(report) = self.engine.world().intent_load_report(entity.uuid, &entity.name, file_body) else { continue };
+            for line in report.lines() {
+                self.append(line);
+            }
+        }
     }
 
     /// The world document changed. GPU meshes, meshlets, hierarchy, and Einstein
@@ -689,6 +720,7 @@ impl Editor {
     pub(super) fn restore_authored_level(&mut self) -> Result<(), String> {
         let Some(stash) = self.authored_stash.take() else { return Ok(()) };
         self.adopt_level(stash.document, stash.path)?;
+        self.seal_folder_expansion();
         if stash.dirty {
             let revision = self.engine.world().revision();
             if revision == 0 {
@@ -951,6 +983,27 @@ impl Editor {
         self.show_joint_debug = saved.joints;
         self.show_all_joints = saved.all_joints && saved.joints;
         self.show_joint_limits = saved.limits;
+        self.folder_expansion = saved.folders.clone();
+    }
+
+    /// After adopt and workspace restore. The first tree must not write the file.
+    fn seal_folder_expansion(&mut self) {
+        self.folder_expansion_ready = true;
+        if self.land_mode || self.character_workspace || self.session_active() {
+            return;
+        }
+        self.install_saved_folder_expansion();
+    }
+
+    fn install_saved_folder_expansion(&mut self) {
+        if self.folder_expansion_applied {
+            return;
+        }
+        self.folder_expansion_applied = true;
+        let Some(level) = self.level_uuid else { return };
+        let Some(record) = self.folder_expansion.iter().find(|row| row.level == level).cloned() else { return };
+        self.outliner.apply_folder_expansion(&record.known, &record.open);
+        self.realize_outliner();
     }
 
     fn finish_workspace_restore(&mut self) {
@@ -1139,8 +1192,17 @@ fn json_bool(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+/// One level's folder rows. `known` has been seen. `open` is the expanded subset.
+/// A folder id that is not in `known` starts expanded.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct FolderOpenRecord {
+    pub(super) level: jarvig_core::EntityId,
+    pub(super) known: Vec<u32>,
+    pub(super) open: Vec<u32>,
+}
+
 /// Editor view over one project. The level file does not store this.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct EditorWorkspace {
     mode: super::chrome::WorkspaceMode,
     grid: bool,
@@ -1165,6 +1227,7 @@ struct EditorWorkspace {
     joints: bool,
     all_joints: bool,
     limits: bool,
+    folders: Vec<FolderOpenRecord>,
 }
 
 impl EditorWorkspace {
@@ -1193,6 +1256,7 @@ impl EditorWorkspace {
             joints: editor.show_joint_debug,
             all_joints: editor.show_all_joints,
             limits: editor.show_joint_limits,
+            folders: editor.folder_expansion.clone(),
         }
     }
 }
@@ -1203,8 +1267,8 @@ fn format_workspace(saved: &EditorWorkspace) -> String {
         super::chrome::WorkspaceMode::Land => "land",
         super::chrome::WorkspaceMode::Character => "character",
     };
-    format!(
-        "{{\n  \"schema\": \"jarvig.editor-workspace\",\n  \"format_version\": 1,\n  \"mode\": \"{mode}\",\n  \"grid\": {grid},\n  \"minor\": {minor},\n  \"major\": {major},\n  \"snap\": {snap},\n  \"world\": {world},\n  \"vertices\": {vertices},\n  \"chunks\": {chunks},\n  \"lod\": {lod},\n  \"show_terrain\": {show_terrain},\n  \"show_helpers\": {show_helpers},\n  \"show_lighting\": {show_lighting},\n  \"show_characters\": {show_characters},\n  \"show_props\": {show_props},\n  \"show_gameplay\": {show_gameplay},\n  \"show_full\": {show_full},\n  \"radius\": {radius},\n  \"strength\": {strength},\n  \"falloff\": \"{falloff}\",\n  \"tool\": \"{tool}\",\n  \"joints\": {joints},\n  \"all_joints\": {all_joints},\n  \"limits\": {limits}\n}}\n",
+    let mut text = format!(
+        "{{\n  \"schema\": \"jarvig.editor-workspace\",\n  \"format_version\": 1,\n  \"mode\": \"{mode}\",\n  \"grid\": {grid},\n  \"minor\": {minor},\n  \"major\": {major},\n  \"snap\": {snap},\n  \"world\": {world},\n  \"vertices\": {vertices},\n  \"chunks\": {chunks},\n  \"lod\": {lod},\n  \"show_terrain\": {show_terrain},\n  \"show_helpers\": {show_helpers},\n  \"show_lighting\": {show_lighting},\n  \"show_characters\": {show_characters},\n  \"show_props\": {show_props},\n  \"show_gameplay\": {show_gameplay},\n  \"show_full\": {show_full},\n  \"radius\": {radius},\n  \"strength\": {strength},\n  \"falloff\": \"{falloff}\",\n  \"tool\": \"{tool}\",\n  \"joints\": {joints},\n  \"all_joints\": {all_joints},\n  \"limits\": {limits}",
         grid = json_bool(saved.grid),
         minor = saved.minor,
         major = saved.major,
@@ -1227,7 +1291,28 @@ fn format_workspace(saved: &EditorWorkspace) -> String {
         joints = json_bool(saved.joints),
         all_joints = json_bool(saved.all_joints),
         limits = json_bool(saved.limits),
-    )
+    );
+    if !saved.folders.is_empty() {
+        text.push_str(",\n  \"open_folders\": [");
+        for (index, record) in saved.folders.iter().enumerate() {
+            if index > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!(
+                "\n    {{\"level\": \"{}\", \"known\": [{}], \"open\": [{}]}}",
+                record.level,
+                u32_list(&record.known),
+                u32_list(&record.open),
+            ));
+        }
+        text.push_str("\n  ]");
+    }
+    text.push_str("\n}\n");
+    text
+}
+
+fn u32_list(values: &[u32]) -> String {
+    values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 fn parse_workspace(text: &str) -> Option<EditorWorkspace> {
@@ -1279,7 +1364,37 @@ fn parse_workspace(text: &str) -> Option<EditorWorkspace> {
         joints: flag_after(text, "\"joints\"")?,
         all_joints: flag_after(text, "\"all_joints\"")?,
         limits: flag_after(text, "\"limits\"")?,
+        folders: parse_open_folders(text),
     })
+}
+
+fn parse_open_folders(text: &str) -> Vec<FolderOpenRecord> {
+    let Some(start) = text.find("\"open_folders\"") else { return Vec::new() };
+    let slice = &text[start..];
+    let Some(open) = slice.find('[') else { return Vec::new() };
+    let Some(close) = slice[open..].rfind(']') else { return Vec::new() };
+    let body = &slice[open + 1..open + close];
+    let mut records = Vec::new();
+    for object in body.split('{').skip(1) {
+        let Some(end) = object.find('}') else { continue };
+        let piece = &object[..end];
+        let Some(level_word) = word_after(piece, "\"level\"") else { continue };
+        let Some(level) = jarvig_core::EntityId::parse(&level_word) else { continue };
+        records.push(FolderOpenRecord {
+            level,
+            known: u32s_after(piece, "\"known\""),
+            open: u32s_after(piece, "\"open\""),
+        });
+    }
+    records
+}
+
+fn u32s_after(text: &str, key: &str) -> Vec<u32> {
+    let Some(start) = text.find(key) else { return Vec::new() };
+    let slice = &text[start + key.len()..];
+    let Some(open) = slice.find('[') else { return Vec::new() };
+    let Some(close) = slice[open..].find(']') else { return Vec::new() };
+    slice[open + 1..open + close].split(',').filter_map(|part| part.trim().parse::<u32>().ok()).collect()
 }
 
 fn open_dialog(owner: windows_sys::Win32::Foundation::HWND, title: &str, filter: &str) -> Option<PathBuf> {
@@ -1314,7 +1429,7 @@ fn dialog(owner: windows_sys::Win32::Foundation::HWND, title: &str, filter: &str
 
 #[cfg(test)]
 mod tests {
-    use super::{format_workspace, parse_workspace, EditorWorkspace};
+    use super::{format_workspace, parse_workspace, EditorWorkspace, FolderOpenRecord};
 
     #[test]
     fn workspace_file_roundtrips_and_rejects_a_bad_schema() {
@@ -1342,6 +1457,7 @@ mod tests {
             joints: true,
             all_joints: false,
             limits: true,
+            folders: Vec::new(),
         };
         let text = format_workspace(&saved);
         let parsed = parse_workspace(&text).expect("workspace");
@@ -1359,6 +1475,17 @@ mod tests {
         assert!((parsed.major - saved.major).abs() < 1.0e-5);
         assert!((parsed.radius - saved.radius).abs() < 1.0e-5);
         assert!((parsed.strength - saved.strength).abs() < 1.0e-5);
+        assert!(parsed.folders.is_empty());
+        assert!(!text.contains("open_folders"));
+        let level = jarvig_core::EntityId::parse("11111111-1111-4111-8111-111111111111").expect("level");
+        let mut with_folders = saved.clone();
+        with_folders.folders.push(FolderOpenRecord { level, known: vec![1, 2], open: vec![2] });
+        let again = format_workspace(&with_folders);
+        let parsed_folders = parse_workspace(&again).expect("folders");
+        assert_eq!(parsed_folders.folders.len(), 1);
+        assert_eq!(parsed_folders.folders[0].level, level);
+        assert_eq!(parsed_folders.folders[0].known, vec![1, 2]);
+        assert_eq!(parsed_folders.folders[0].open, vec![2]);
         assert!(parse_workspace(&text.replace("jarvig.editor-workspace", "jarvig.other")).is_none());
         assert!(parse_workspace(&text.replace("\"tool\": \"sculpt\"", "\"tool\": \"nope\"")).is_none());
         assert!(parse_workspace(&text.replace("  \"mode\": \"land\",\n", "")).is_none());

@@ -51,6 +51,10 @@ pub struct EngineSession {
     mesh_assets: jarvig_core::MeshAssetLibrary,
     /// Standard master from the bootstrap scene. Empty worlds have no mesh to rediscover it.
     standard_master: Option<jarvig_material::MasterMaterialId>,
+    /// Runtime only. Default off. Not written into the level file. Load and capture follow it.
+    intent_authority_experiment: bool,
+    /// Snapshot-only draw override. The world object keeps its mesh. Empty means the extracted mesh.
+    frame_mesh_rebind: Option<(jarvig_core::EntityId, jarvig_core::MeshId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +101,8 @@ impl EngineSession {
             imported: std::collections::HashMap::new(),
             mesh_assets: jarvig_core::MeshAssetLibrary::default(),
             standard_master: None,
+            intent_authority_experiment: false,
+            frame_mesh_rebind: None,
         };
         if profile.renders() {
             if let Ok(master) = session.current_material_master() {
@@ -108,6 +114,27 @@ impl EngineSession {
 
     pub fn mesh_asset_library(&self) -> &jarvig_core::MeshAssetLibrary {
         &self.mesh_assets
+    }
+
+    pub fn intent_authority_experiment(&self) -> bool {
+        self.intent_authority_experiment
+    }
+
+    /// The next load realizes an eligible body-less solid, and capture omits that body.
+    /// The current world is updated too, so a save before the next load follows the switch.
+    pub fn set_intent_authority_experiment(&mut self, enabled: bool) {
+        self.intent_authority_experiment = enabled;
+        self.world.set_intent_authority_experiment(enabled);
+    }
+
+    /// Later presented frames draw `entity` with `mesh` until [`Self::clear_frame_mesh_rebind`].
+    /// The stored object mesh is not changed, and the override is not written into the level.
+    pub fn set_frame_mesh_rebind(&mut self, entity: jarvig_core::EntityId, mesh: jarvig_core::MeshId) {
+        self.frame_mesh_rebind = Some((entity, mesh));
+    }
+
+    pub fn clear_frame_mesh_rebind(&mut self) {
+        self.frame_mesh_rebind = None;
     }
 
     /// Cluster bounds for one entity. An imported asset uses its sidecar. A parametric solid uses the clusters built from its derived surface. Does not copy vertices.
@@ -285,7 +312,7 @@ impl EngineSession {
     pub fn load_level(&mut self, document: &LevelDocument) -> Result<(), String> {
         document.validate().map_err(|error| error.to_string())?;
         let master = if self.runtime.profile().renders() { Some(self.current_material_master()?) } else { None };
-        let mut world = document.instantiate_with(&self.mesh_assets).map_err(|error| error.to_string())?;
+        let mut world = document.instantiate_with_experiment(&self.mesh_assets, self.intent_authority_experiment).map_err(|error| error.to_string())?;
         if let Some(master) = master {
             self.bind_level_materials(&mut world, master)?;
         }
@@ -334,13 +361,11 @@ impl EngineSession {
         let objects: Vec<_> = world.objects().collect();
         for object in objects {
             let entity = world.entity(object).map_err(|error| error.to_string())?;
-            let material = if let Some((_, _, _, _, _, _, _, material)) = world.authored_mesh(entity) {
-                material
-            } else if let Some(block) = world.authored_block(entity) {
-                block.material
-            } else {
+            if let Some(block) = world.authored_block(entity) {
+                self.bind_block_materials(world, object, &block, master, near_color, far_color)?;
                 continue;
-            };
+            }
+            let Some((_, _, _, _, _, _, _, material)) = world.authored_mesh(entity) else { continue };
             let asset = object_asset_id(world, object);
             let (base, orm_tex, normal_tex) = self.textures_for(asset, &material, white, orm, normal, near_color, far_color)?;
             self.bind_resolved(world, object, master, base, orm_tex, normal_tex, white, sampler, &material)?;
@@ -356,9 +381,32 @@ impl EngineSession {
     }
 
     fn bind_entity_material(&mut self, entity: jarvig_core::EntityId, master: jarvig_material::MasterMaterialId) -> Result<(), String> {
-        let material = if let Some(block) = self.world.authored_block(entity) {
-            block.material
-        } else if let Some((_, _, _, _, _, _, _, material)) = self.world.authored_mesh(entity) {
+        if let Some(block) = self.world.authored_block(entity) {
+            let white = self.textures.white_srgb().ok_or("white texture missing")?;
+            let objects: Vec<_> = self.world.objects().filter(|object| self.world.entity(*object).ok() == Some(entity)).collect();
+            if objects.is_empty() {
+                return Err("entity has no drawable".into());
+            }
+            for object in objects {
+                let mut slots = self.world.mesh_material_slots(object);
+                if slots.is_empty() {
+                    slots.push(0);
+                }
+                let asset = object_asset_id(&self.world, object);
+                let instances = self.block_slot_instances(&slots, &block, asset, master, white, white)?;
+                for (slot, instance) in instances {
+                    self.world.bind_material(object, slot, instance).map_err(|error| error.to_string())?;
+                }
+                let bound = self.world.bound_material_slots(object);
+                for slot in bound {
+                    if !slots.contains(&slot) {
+                        self.world.clear_material_slot(object, slot).map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let material = if let Some((_, _, _, _, _, _, _, material)) = self.world.authored_mesh(entity) {
             material
         } else {
             return Err("entity has no material".into());
@@ -371,6 +419,75 @@ impl EngineSession {
             self.bind_object(object, &material, master)?;
         }
         Ok(())
+    }
+
+    fn bind_block_materials(
+        &mut self,
+        world: &mut jarvig_core::SceneWorld,
+        object: jarvig_core::ObjectId,
+        block: &jarvig_core::BlockRecord,
+        master: jarvig_material::MasterMaterialId,
+        near_color: jarvig_material::TextureId,
+        far_color: jarvig_material::TextureId,
+    ) -> Result<(), String> {
+        let mut slots = world.mesh_material_slots(object);
+        if slots.is_empty() {
+            slots.push(0);
+        }
+        let asset = object_asset_id(world, object);
+        let instances = self.block_slot_instances(&slots, block, asset, master, near_color, far_color)?;
+        for (slot, instance) in instances {
+            world.bind_material(object, slot, instance).map_err(|error| error.to_string())?;
+        }
+        let bound = world.bound_material_slots(object);
+        for slot in bound {
+            if !slots.contains(&slot) {
+                world.clear_material_slot(object, slot).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn block_slot_instances(
+        &mut self,
+        slots: &[u32],
+        block: &jarvig_core::BlockRecord,
+        asset: Option<jarvig_core::AssetId>,
+        master: jarvig_material::MasterMaterialId,
+        near_color: jarvig_material::TextureId,
+        far_color: jarvig_material::TextureId,
+    ) -> Result<Vec<(u32, jarvig_material::MaterialInstanceId)>, String> {
+        let white = self.textures.white_srgb().ok_or("white texture missing")?;
+        let orm = self.textures.neutral_orm().ok_or("orm texture missing")?;
+        let normal = self.textures.flat_normal().ok_or("normal texture missing")?;
+        let sampler = self.level_sampler.ok_or("material sampler missing")?;
+        let mut created = Vec::new();
+        for slot in slots {
+            let material = block.material_slot(*slot).cloned().unwrap_or_else(|| block.material.clone());
+            let (base, orm_tex, normal_tex) = self.textures_for(asset, &material, white, orm, normal, near_color, far_color)?;
+            let instance = self
+                .materials
+                .create_instance(
+                    master,
+                    &[
+                        ("BaseColor", ParameterValue::Texture(base)),
+                        ("Orm", ParameterValue::Texture(orm_tex)),
+                        ("Normal", ParameterValue::Texture(normal_tex)),
+                        ("Emissive", ParameterValue::Texture(white)),
+                        ("MaterialSampler", ParameterValue::Sampler(sampler)),
+                        ("BaseColorFactor", ParameterValue::Float4(material.base_color)),
+                        ("MetallicFactor", ParameterValue::Float(material.metallic)),
+                        ("RoughnessFactor", ParameterValue::Float(material.roughness)),
+                        ("EmissiveFactor", ParameterValue::Float4(material.emissive)),
+                        ("NormalScale", ParameterValue::Float(material.normal_scale)),
+                        ("UvScale", ParameterValue::Float(material.uv_scale)),
+                        ("OcclusionStrength", ParameterValue::Float(1.0)),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            created.push((*slot, instance));
+        }
+        Ok(created)
     }
 
     fn bind_object(&mut self, object: jarvig_core::ObjectId, material: &jarvig_core::MaterialAssetRef, master: jarvig_material::MasterMaterialId) -> Result<(), String> {
@@ -669,7 +786,10 @@ impl EngineSession {
         if tick.render_executed {
             self.world.set_simulation_tick(tick.frame);
             self.render_frame = self.render_frame.saturating_add(1);
-            let snapshot = self.world.extract(RenderFrameId(self.render_frame)).map_err(FrameError::Scene)?;
+            let mut snapshot = self.world.extract(RenderFrameId(self.render_frame)).map_err(FrameError::Scene)?;
+            if let Some((entity, mesh)) = self.frame_mesh_rebind {
+                snapshot.rebind_instance_mesh(entity, mesh);
+            }
             self.extractions = self.extractions.saturating_add(1);
             self.extracted_this_frame = true;
             self.last_instance_count = snapshot.instance_count() as u32;
@@ -778,6 +898,54 @@ fn install_bootstrap_materials(world: &mut SceneWorld) -> (MaterialLibrary, Text
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_rebind_draws_another_mesh_without_changing_the_object() {
+        let mut editor = EngineSession::editor().unwrap();
+        editor.load_level(&jarvig_core::empty_world_level()).unwrap();
+        let created = editor
+            .execute_authoring(AuthoringCommand::CreateBlock { local: jarvig_core::Vec3::new(0.0, 1.0, -4.0) })
+            .unwrap();
+        let jarvig_core::AuthoringResult::Created(id) = created else { panic!("block was not created") };
+        let object_mesh = editor.world().object_mesh(id).unwrap();
+        let revision = editor.world().revision();
+        let orphan = editor.world_mut().add_mesh(jarvig_core::cube_mesh(0.25));
+        assert_ne!(orphan, object_mesh);
+        editor.set_frame_mesh_rebind(id, orphan);
+        let mut seen = false;
+        let tick = editor
+            .run_frame(1.0 / 60.0, |snapshot, meshes, _, _| {
+                let instance = snapshot.instances().iter().find(|item| item.entity == id).unwrap();
+                assert_eq!(instance.mesh, orphan);
+                assert!(meshes.get(orphan).is_some());
+                assert!(meshes.get(object_mesh).is_some());
+                seen = true;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert!(tick.render_executed && seen);
+        assert_eq!(editor.world().object_mesh(id), Some(object_mesh));
+        editor
+            .run_frame(1.0 / 60.0, |snapshot, _, _, _| {
+                assert_eq!(snapshot.instances().iter().find(|item| item.entity == id).unwrap().mesh, orphan);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        editor.clear_frame_mesh_rebind();
+        editor
+            .run_frame(1.0 / 60.0, |snapshot, _, _, _| {
+                assert_eq!(snapshot.instances().iter().find(|item| item.entity == id).unwrap().mesh, object_mesh);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert!(!editor.world_mut().retire_unreferenced_mesh(object_mesh));
+        assert!(editor.world_mut().retire_unreferenced_mesh(orphan));
+        assert_eq!(editor.world().object_mesh(id), Some(object_mesh));
+        assert!(editor.world().meshes().get(object_mesh).is_some());
+        assert!(editor.world().meshes().get(orphan).is_none());
+        assert!(editor.world_mut().take_retired_meshes().contains(&orphan));
+        assert_eq!(editor.world().revision(), revision);
+    }
 
     #[test]
     fn server_loads_the_lighting_lab_without_a_gpu_and_the_editor_round_trips_a_move() {
